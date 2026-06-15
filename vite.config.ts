@@ -6,7 +6,7 @@ import { VitePWA } from 'vite-plugin-pwa';
 
 export default defineConfig(() => {
   return {
-    base: /Upeb/',
+    base: '/Upeb/',
     plugins: [
       react(), 
       tailwindcss(),

@@ -5,7 +5,7 @@
 
 import React, { useState, useMemo, useEffect, useRef, useCallback } from 'react';
 import { PieChart, Pie, Cell, ResponsiveContainer, Tooltip as RechartsTooltip, Legend, BarChart, Bar, XAxis, YAxis, CartesianGrid, LineChart, Line } from 'recharts';
-import { Canvas, useThree } from '@react-three/fiber';
+import { Canvas, useThree, useFrame } from '@react-three/fiber';
 import { OrbitControls, Environment, ContactShadows, Center, Text, Line as DreiLine, Bounds, useBounds } from '@react-three/drei';
 import * as THREE from 'three';
 import {
@@ -62,8 +62,16 @@ import {
   ScanLine,
   Share2,
   Minimize,
+  UploadCloud,
+  CloudRain,
+  Snowflake,
+  Volume2,
+  VolumeX,
 } from 'lucide-react';
+import { rainSynthesizer } from './utils/rainAudio';
 import { ProfileDiagram } from './components/ProfileDiagram';
+import { ProfileSheetWaterSimulator } from './components/ProfileSheetWaterSimulator';
+import { StructuralLoadOptimizer } from './components/StructuralLoadOptimizer';
 import { InstallPWA } from './components/InstallPWA';
 import { jsPDF } from 'jspdf';
 import autoTable from 'jspdf-autotable';
@@ -79,7 +87,7 @@ interface ProjectSpecs {
   roofType: 'Single Slope' | 'Hut-shaped' | 'Multi-Sloped Hut' | 'Curved';
   roofProfile?: '7v Profile' | '6v Profile' | 'Standard';
   wallProfile?: '7v Profile' | '6v Profile' | 'Standard';
-  frameType: 'Clear Span' | 'Multi-Span';
+  frameType: 'Clear Span' | 'Multi-Span' | 'Truss';
   roofColor?: string;
   wallColor?: string;
   hasRoof?: boolean;
@@ -259,7 +267,7 @@ export const getPanelColor = (key: string, baseColor: string, type: 'roof' | 'wa
         isAlt = (segIndex % ratio) === (ratio - 1);
       } else if (pattern === 'edges' || pattern === 'center') {
         const profile = type === 'roof' ? specs.roofProfile : specs.wallProfile;
-        const effWidth = profile === '6v Profile' ? 1.0 : (profile === '7v Profile' ? 1.2 : 1.0);
+        const effWidth = profile === '6v Profile' ? 0.99 : (profile === '7v Profile' ? 1.188 : 1.0);
         const blockLen = sideStr === 'f' || sideStr === 'b' ? specs.width : specs.length;
         const numSheets = Math.ceil(blockLen / effWidth - 0.001);
         
@@ -312,10 +320,349 @@ function CameraManager({ isInside, specs }: { isInside: boolean, specs: ProjectS
   return null;
 }
 
-function Building3DModel({ specs, panelColors, setPanelColors }: { specs: ProjectSpecs, panelColors: Record<string, string>, setPanelColors: React.Dispatch<React.SetStateAction<Record<string, string>>> }) {
+function SpinningTurboVent({ position, weatherType }: { position: [number, number, number]; weatherType: string }) {
+  const groupRef = useRef<THREE.Group>(null);
+  
+  useFrame((state, delta) => {
+    if (groupRef.current) {
+      let speed = 1.0;
+      if (weatherType === 'storm') {
+        speed = 12.0;
+      } else if (weatherType === 'rain') {
+        speed = 4.0;
+      } else if (weatherType === 'snow') {
+        speed = 0.2;
+      } else {
+        speed = 1.0;
+      }
+      groupRef.current.rotation.y += speed * delta;
+    }
+  });
+
+  return (
+    <group position={position}>
+      {/* Base: cylinder */}
+      <mesh receiveShadow position={[0, 0, 0]}>
+        <cylinderGeometry args={[0.2, 0.25, 0.2, 16]} />
+        <meshStandardMaterial color="#94a3b8" metalness={0.7} roughness={0.3} />
+      </mesh>
+      
+      {/* Spinning dome */}
+      <group ref={groupRef}>
+        <mesh receiveShadow position={[0, 0.1, 0]}>
+          <sphereGeometry args={[0.3, 16, 16, 0, Math.PI * 2, 0, Math.PI / 2]} />
+          <meshStandardMaterial color="#cbd5e1" metalness={0.8} roughness={0.2} />
+        </mesh>
+        {/* Fins */}
+        {Array.from({ length: 8 }).map((_, idx) => {
+          const angle = (idx * Math.PI) / 4;
+          return (
+            <mesh key={idx} position={[0.2 * Math.cos(angle), 0.15, 0.2 * Math.sin(angle)]} rotation={[0, -angle, 0.3]}>
+              <boxGeometry args={[0.02, 0.15, 0.08]} />
+              <meshStandardMaterial color="#64748b" metalness={0.8} roughness={0.2} />
+            </mesh>
+          );
+        })}
+      </group>
+    </group>
+  );
+}
+
+function LightningController() {
+  const [intensity, setIntensity] = useState(0);
+  useFrame((state) => {
+    const elapsed = state.clock.getElapsedTime();
+    const check = Math.sin(elapsed * 0.3) + Math.cos(elapsed * 0.85);
+    if (check > 1.85 && Math.random() < 0.1) {
+      setIntensity(4.5);
+      // Trigger rolling thunder rumble with a realistic speed-of-sound delay
+      const delay = 0.6 + Math.random() * 1.2;
+      rainSynthesizer.triggerThunder(delay);
+    } else if (intensity > 0) {
+      setIntensity(prev => prev * 0.78);
+    }
+  });
+  if (intensity < 0.1) return null;
+  return (
+    <directionalLight
+      position={[-10, 35, -5]}
+      intensity={intensity}
+      color="#e0f2fe"
+    />
+  );
+}
+
+function ForceVectorArrows({ specs, weatherType }: { specs: ProjectSpecs; weatherType: string }) {
+  if (weatherType === 'clear' || weatherType === 'rain') return null;
+
+  const w = specs.width;
+  const l = specs.length;
+  const h = specs.eaveHeight;
+
+  return (
+    <group>
+      {/* Snow Load Downward Force Vectors */}
+      {weatherType === 'snow' && (
+        <group>
+          {Array.from({ length: 5 }).map((_, idx) => {
+            const z = -l / 2 + (idx / 4) * l;
+            return (
+              <React.Fragment key={`snow_force_${idx}`}>
+                <group position={[-w / 4, h + (w / 4) * (specs.roofSlope / 100) + 1.2, z]}>
+                  <mesh>
+                    <cylinderGeometry args={[0.03, 0.03, 0.8, 8]} />
+                    <meshBasicMaterial color="#ef4444" />
+                  </mesh>
+                  <mesh position={[0, -0.4, 0]}>
+                    <coneGeometry args={[0.08, 0.2, 8]} />
+                    <meshBasicMaterial color="#ef4444" />
+                  </mesh>
+                </group>
+                <group position={[w / 4, h + (w / 4) * (specs.roofSlope / 100) + 1.2, z]}>
+                  <mesh>
+                    <cylinderGeometry args={[0.03, 0.03, 0.8, 8]} />
+                    <meshBasicMaterial color="#ef4444" />
+                  </mesh>
+                  <mesh position={[0, -0.4, 0]}>
+                    <coneGeometry args={[0.08, 0.2, 8]} />
+                    <meshBasicMaterial color="#ef4444" />
+                  </mesh>
+                </group>
+              </React.Fragment>
+            );
+          })}
+        </group>
+      )}
+
+      {/* Wind Load Uplift and Lateral Force Vectors */}
+      {weatherType === 'storm' && (
+        <group>
+          {Array.from({ length: 5 }).map((_, idx) => {
+            const z = -l / 2 + (idx / 4) * l;
+            return (
+              <React.Fragment key={`wind_force_${idx}`}>
+                {/* Uplift Arrow Left */}
+                <group position={[-w / 4, h + (w / 4) * (specs.roofSlope / 100) + 0.6, z]} rotation={[0, 0, Math.PI / 6]}>
+                  <mesh position={[0, 0.4, 0]}>
+                    <cylinderGeometry args={[0.03, 0.03, 0.8, 8]} />
+                    <meshBasicMaterial color="#06b6d4" />
+                  </mesh>
+                  <mesh position={[0, 0.8, 0]}>
+                    <coneGeometry args={[0.08, 0.2, 8]} />
+                    <meshBasicMaterial color="#06b6d4" />
+                  </mesh>
+                </group>
+                {/* Uplift Arrow Right */}
+                <group position={[w / 4, h + (w / 4) * (specs.roofSlope / 100) + 0.6, z]} rotation={[0, 0, -Math.PI / 6]}>
+                  <mesh position={[0, 0.4, 0]}>
+                    <cylinderGeometry args={[0.03, 0.03, 0.8, 8]} />
+                    <meshBasicMaterial color="#06b6d4" />
+                  </mesh>
+                  <mesh position={[0, 0.8, 0]}>
+                    <coneGeometry args={[0.08, 0.2, 8]} />
+                    <meshBasicMaterial color="#06b6d4" />
+                  </mesh>
+                </group>
+                {/* Lateral Wind Force (Windward Wall) */}
+                <group position={[-w / 2 - 1.2, h / 2, z]} rotation={[0, 0, -Math.PI / 2]}>
+                  <mesh>
+                    <cylinderGeometry args={[0.03, 0.03, 0.8, 8]} />
+                    <meshBasicMaterial color="#06b6d4" />
+                  </mesh>
+                  <mesh position={[0, -0.4, 0]}>
+                    <coneGeometry args={[0.08, 0.2, 8]} />
+                    <meshBasicMaterial color="#06b6d4" />
+                  </mesh>
+                </group>
+              </React.Fragment>
+            );
+          })}
+        </group>
+      )}
+    </group>
+  );
+}
+
+function WeatherEffects({ weatherType, specs }: { weatherType: string; specs: ProjectSpecs }) {
+  const rainRef = useRef<THREE.Points>(null);
+  const snowRef = useRef<THREE.Points>(null);
+  const windRef = useRef<THREE.Group>(null);
+
+  const particleCount = 600;
+
+  // Rain initialization
+  const rainPositions = useMemo(() => {
+    const arr = new Float32Array(particleCount * 3);
+    for (let i = 0; i < particleCount; i++) {
+      arr[i * 3] = (Math.random() - 0.5) * specs.width * 3.0;
+      arr[i * 3 + 1] = Math.random() * specs.eaveHeight * 3.5;
+      arr[i * 3 + 2] = (Math.random() - 0.5) * specs.length * 2.5;
+    }
+    return arr;
+  }, [specs.width, specs.length, specs.eaveHeight]);
+
+  const rainVelocities = useMemo(() => {
+    const arr = new Float32Array(particleCount);
+    for (let i = 0; i < particleCount; i++) {
+      arr[i] = 12.0 + Math.random() * 8.0;
+    }
+    return arr;
+  }, []);
+
+  // Snow initialization
+  const snowPositions = useMemo(() => {
+    const arr = new Float32Array(particleCount * 3);
+    for (let i = 0; i < particleCount; i++) {
+      arr[i * 3] = (Math.random() - 0.5) * specs.width * 3.0;
+      arr[i * 3 + 1] = Math.random() * specs.eaveHeight * 3.5;
+      arr[i * 3 + 2] = (Math.random() - 0.5) * specs.length * 2.5;
+    }
+    return arr;
+  }, [specs.width, specs.length, specs.eaveHeight]);
+
+  const snowVelocities = useMemo(() => {
+    const arr = new Float32Array(particleCount);
+    for (let i = 0; i < particleCount; i++) {
+      arr[i] = 1.2 + Math.random() * 1.5;
+    }
+    return arr;
+  }, []);
+
+  useFrame((state, delta) => {
+    const time = state.clock.getElapsedTime();
+
+    // Rain Animation
+    if (weatherType === 'rain' || weatherType === 'storm') {
+      if (rainRef.current) {
+        const geo = rainRef.current.geometry;
+        const posAttr = geo.attributes.position;
+        const arr = posAttr.array as Float32Array;
+        const speedMultiplier = weatherType === 'storm' ? 1.8 : 1.0;
+        const windDrift = weatherType === 'storm' ? 4.0 : 0.5;
+
+        for (let i = 0; i < particleCount; i++) {
+          arr[i * 3 + 1] -= rainVelocities[i] * delta * speedMultiplier; // Fall downward
+          arr[i * 3] += windDrift * delta; // Wind drift
+
+          // Reset when hitting ground
+          if (arr[i * 3 + 1] < -0.1) {
+            arr[i * 3 + 1] = specs.eaveHeight * 3.0 + Math.random() * 5.0;
+            arr[i * 3] = (Math.random() - 0.5) * specs.width * 3.0 - (weatherType === 'storm' ? 4.0 : 0.0);
+            arr[i * 3 + 2] = (Math.random() - 0.5) * specs.length * 2.5;
+          }
+        }
+        posAttr.needsUpdate = true;
+      }
+    }
+
+    // Snow Animation
+    if (weatherType === 'snow') {
+      if (snowRef.current) {
+        const geo = snowRef.current.geometry;
+        const posAttr = geo.attributes.position;
+        const arr = posAttr.array as Float32Array;
+
+        for (let i = 0; i < particleCount; i++) {
+          arr[i * 3 + 1] -= snowVelocities[i] * delta; // Fall slower
+          arr[i * 3] += Math.sin(time + i) * delta * 0.4; // Soft floating drift
+          arr[i * 3 + 2] += Math.cos(time * 0.5 + i) * delta * 0.2;
+
+          // Reset when hitting ground
+          if (arr[i * 3 + 1] < -0.1) {
+            arr[i * 3 + 1] = specs.eaveHeight * 3.0 + Math.random() * 3.0;
+            arr[i * 3] = (Math.random() - 0.5) * specs.width * 3.0;
+            arr[i * 3 + 2] = (Math.random() - 0.5) * specs.length * 2.5;
+          }
+        }
+        posAttr.needsUpdate = true;
+      }
+    }
+
+    // Wind streaks rotation and drift (Storm)
+    if (weatherType === 'storm' && windRef.current) {
+      windRef.current.position.x += delta * 25.0;
+      if (windRef.current.position.x > specs.width * 1.5) {
+        windRef.current.position.x = -specs.width * 1.5;
+      }
+    }
+  });
+
+  return (
+    <group>
+      {/* Rain Particle System */}
+      {(weatherType === 'rain' || weatherType === 'storm') && (
+        <points ref={rainRef}>
+          <bufferGeometry>
+            <bufferAttribute
+              attach="attributes-position"
+              args={[rainPositions, 3]}
+            />
+          </bufferGeometry>
+          <pointsMaterial
+            color="#a5f3fc"
+            size={0.12}
+            transparent
+            opacity={weatherType === 'storm' ? 0.75 : 0.5}
+            sizeAttenuation
+            depthWrite={false}
+          />
+        </points>
+      )}
+
+      {/* Snow Particle System */}
+      {weatherType === 'snow' && (
+        <points ref={snowRef}>
+          <bufferGeometry>
+            <bufferAttribute
+              attach="attributes-position"
+              args={[snowPositions, 3]}
+            />
+          </bufferGeometry>
+          <pointsMaterial
+            color="#ffffff"
+            size={0.2}
+            transparent
+            opacity={0.8}
+            sizeAttenuation
+            depthWrite={false}
+          />
+        </points>
+      )}
+
+      {/* Wind Streaks (Storm) */}
+      {weatherType === 'storm' && (
+        <group ref={windRef} position={[-specs.width, specs.eaveHeight, 0]}>
+          {Array.from({ length: 8 }).map((_, i) => {
+            const rx = (Math.random() - 0.5) * specs.width;
+            const ry = Math.random() * specs.eaveHeight;
+            const rz = (Math.random() - 0.5) * specs.length;
+            const len = 4 + Math.random() * 6;
+            return (
+              <mesh key={i} position={[rx, ry, rz]} rotation={[0, 0, 0.1]}>
+                <boxGeometry args={[len, 0.02, 0.02]} />
+                <meshBasicMaterial color="#ffffff" transparent opacity={0.25} />
+              </mesh>
+            );
+          })}
+        </group>
+      )}
+    </group>
+  );
+}
+
+function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = false, weatherType = 'clear' }: { specs: ProjectSpecs, panelColors: Record<string, string>, setPanelColors: React.Dispatch<React.SetStateAction<Record<string, string>>>, framingOnly?: boolean, weatherType?: string }) {
   const w = specs.width;
   const l = Math.max(specs.length, 1);
   const h = specs.eaveHeight;
+
+  if (!w || !l || !h || isNaN(w) || isNaN(l) || isNaN(h) || w <= 0 || l <= 0 || h <= 0) {
+    return null;
+  }
+
+  const isTrussModel = specs.frameType === 'Truss';
+  const modelPurlinYOffset = isTrussModel
+    ? (specs.roofType === 'Curved' ? 0.255 : specs.roofType === 'Multi-Sloped Hut' ? 0.235 : 0.25)
+    : (specs.roofType === 'Curved' ? 0.325 : 0.5);
 
   const panelCanvasH = useMemo(() => {
     const canvas = document.createElement('canvas');
@@ -326,21 +673,21 @@ function Building3DModel({ specs, panelColors, setPanelColors }: { specs: Projec
       ctx.fillStyle = '#111111';
       ctx.fillRect(0, 0, 256, 256);
 
-      const toPx = (val: number) => Math.round((val / 200) * 256);
+      const toPx = (val: number) => Math.round((val / 198) * 256);
       const sections = [
-        { width: 12, startColor: '#ffffff', endColor: '#ffffff' }, // half main crest
-        { width: 18, startColor: '#ffffff', endColor: '#111111' }, // main slope down
-        { width: 37, startColor: '#111111', endColor: '#111111' }, // flat
-        { width: 6,  startColor: '#111111', endColor: '#777777' }, // minor slope up
-        { width: 6,  startColor: '#777777', endColor: '#777777' }, // minor crest
-        { width: 6,  startColor: '#777777', endColor: '#111111' }, // minor slope down
-        { width: 30, startColor: '#111111', endColor: '#111111' }, // center flat
-        { width: 6,  startColor: '#111111', endColor: '#777777' }, // minor slope up
-        { width: 6,  startColor: '#777777', endColor: '#777777' }, // minor crest
-        { width: 6,  startColor: '#777777', endColor: '#111111' }, // minor slope down
-        { width: 37, startColor: '#111111', endColor: '#111111' }, // flat
-        { width: 18, startColor: '#111111', endColor: '#ffffff' }, // main slope up
-        { width: 12, startColor: '#ffffff', endColor: '#ffffff' }  // half main crest
+        { width: 12.5, startColor: '#ffffff', endColor: '#ffffff' }, // half main crest
+        { width: 20,   startColor: '#ffffff', endColor: '#111111' }, // main slope down
+        { width: 26,   startColor: '#111111', endColor: '#111111' }, // flat
+        { width: 4,    startColor: '#111111', endColor: '#777777' }, // minor slope up
+        { width: 20,   startColor: '#777777', endColor: '#777777' }, // minor crest
+        { width: 4,    startColor: '#777777', endColor: '#111111' }, // minor slope down
+        { width: 25,   startColor: '#111111', endColor: '#111111' }, // center flat
+        { width: 4,    startColor: '#111111', endColor: '#777777' }, // minor slope up
+        { width: 20,   startColor: '#777777', endColor: '#777777' }, // minor crest
+        { width: 4,    startColor: '#777777', endColor: '#111111' }, // minor slope down
+        { width: 26,   startColor: '#111111', endColor: '#111111' }, // flat
+        { width: 20,   startColor: '#111111', endColor: '#ffffff' }, // main slope up
+        { width: 12.5, startColor: '#ffffff', endColor: '#ffffff' }  // half main crest
       ];
 
       let currentPx = 0;
@@ -371,21 +718,21 @@ function Building3DModel({ specs, panelColors, setPanelColors }: { specs: Projec
       ctx.fillStyle = '#111111';
       ctx.fillRect(0, 0, 256, 256);
 
-      const toPx = (val: number) => Math.round((val / 200) * 256);
+      const toPx = (val: number) => Math.round((val / 198) * 256);
       const sections = [
-        { width: 12, startColor: '#ffffff', endColor: '#ffffff' }, // half main crest
-        { width: 18, startColor: '#ffffff', endColor: '#111111' }, // main slope down
-        { width: 37, startColor: '#111111', endColor: '#111111' }, // flat
-        { width: 6,  startColor: '#111111', endColor: '#777777' }, // minor slope up
-        { width: 6,  startColor: '#777777', endColor: '#777777' }, // minor crest
-        { width: 6,  startColor: '#777777', endColor: '#111111' }, // minor slope down
-        { width: 30, startColor: '#111111', endColor: '#111111' }, // center flat
-        { width: 6,  startColor: '#111111', endColor: '#777777' }, // minor slope up
-        { width: 6,  startColor: '#777777', endColor: '#777777' }, // minor crest
-        { width: 6,  startColor: '#777777', endColor: '#111111' }, // minor slope down
-        { width: 37, startColor: '#111111', endColor: '#111111' }, // flat
-        { width: 18, startColor: '#111111', endColor: '#ffffff' }, // main slope up
-        { width: 12, startColor: '#ffffff', endColor: '#ffffff' }  // half main crest
+        { width: 12.5, startColor: '#ffffff', endColor: '#ffffff' }, // half main crest
+        { width: 20,   startColor: '#ffffff', endColor: '#111111' }, // main slope down
+        { width: 26,   startColor: '#111111', endColor: '#111111' }, // flat
+        { width: 4,    startColor: '#111111', endColor: '#777777' }, // minor slope up
+        { width: 20,   startColor: '#777777', endColor: '#777777' }, // minor crest
+        { width: 4,    startColor: '#777777', endColor: '#111111' }, // minor slope down
+        { width: 25,   startColor: '#111111', endColor: '#111111' }, // center flat
+        { width: 4,    startColor: '#111111', endColor: '#777777' }, // minor slope up
+        { width: 20,   startColor: '#777777', endColor: '#777777' }, // minor crest
+        { width: 4,    startColor: '#777777', endColor: '#111111' }, // minor slope down
+        { width: 26,   startColor: '#111111', endColor: '#111111' }, // flat
+        { width: 20,   startColor: '#111111', endColor: '#ffffff' }, // main slope up
+        { width: 12.5, startColor: '#ffffff', endColor: '#ffffff' }  // half main crest
       ];
 
       let currentPx = 0;
@@ -411,7 +758,7 @@ function Building3DModel({ specs, panelColors, setPanelColors }: { specs: Projec
     const tex = new THREE.CanvasTexture(panelCanvasH);
     tex.wrapS = THREE.RepeatWrapping;
     tex.wrapT = THREE.RepeatWrapping;
-    tex.repeat.set(1.0 / (specs.wallProfile === '6v Profile' ? 0.33 : specs.wallProfile === '7v Profile' ? 0.21 : 0.2), 1);
+    tex.repeat.set(1.0 / (specs.wallProfile === '6v Profile' ? 0.198 : specs.wallProfile === '7v Profile' ? 0.198 : 0.2), 1);
     return tex;
   }, [panelCanvasH, specs.wallProfile]);
 
@@ -419,9 +766,44 @@ function Building3DModel({ specs, panelColors, setPanelColors }: { specs: Projec
     const tex = new THREE.CanvasTexture(panelCanvasV);
     tex.wrapS = THREE.RepeatWrapping;
     tex.wrapT = THREE.RepeatWrapping;
-    tex.repeat.set(1, 1.0 / (specs.roofProfile === '6v Profile' ? 0.33 : specs.roofProfile === '7v Profile' ? 0.21 : 0.2));
+    tex.repeat.set(1, 1.0 / (specs.roofProfile === '6v Profile' ? 0.198 : specs.roofProfile === '7v Profile' ? 0.198 : 0.2));
     return tex;
   }, [panelCanvasV, specs.roofProfile]);
+
+  const wallTexCache = useRef<Record<string, THREE.Texture>>({});
+  const roofTexCache = useRef<Record<string, THREE.Texture>>({});
+
+  const getWallTexture = (wShape: number, startCoord: number) => {
+    const profile = specs.wallProfile || '7v Profile';
+    const pitch = (profile === '6v Profile' || profile === '7v Profile') ? 0.198 : 0.076;
+    const cacheKey = `${wShape}_${startCoord}_${profile}`;
+    if (!wallTexCache.current[cacheKey]) {
+      const cloned = panelTexH.clone();
+      cloned.repeat.set(wShape / pitch, 1);
+      cloned.offset.set((startCoord / pitch) % 1, 0);
+      cloned.wrapS = THREE.RepeatWrapping;
+      cloned.wrapT = THREE.RepeatWrapping;
+      cloned.needsUpdate = true;
+      wallTexCache.current[cacheKey] = cloned;
+    }
+    return wallTexCache.current[cacheKey];
+  };
+
+  const getRoofTexture = (wSheet: number, startZ: number) => {
+    const profile = specs.roofProfile || '7v Profile';
+    const pitch = (profile === '6v Profile' || profile === '7v Profile') ? 0.198 : 0.076;
+    const cacheKey = `${wSheet}_${startZ}_${profile}`;
+    if (!roofTexCache.current[cacheKey]) {
+      const cloned = panelTexV.clone();
+      cloned.repeat.set(1, wSheet / pitch);
+      cloned.offset.set(0, (startZ / pitch) % 1);
+      cloned.wrapS = THREE.RepeatWrapping;
+      cloned.wrapT = THREE.RepeatWrapping;
+      cloned.needsUpdate = true;
+      roofTexCache.current[cacheKey] = cloned;
+    }
+    return roofTexCache.current[cacheKey];
+  };
 
   const handlePanelClick = (e: any, key: string, baseColor: string, type: 'roof' | 'wall') => {
     e.stopPropagation();
@@ -458,7 +840,7 @@ function Building3DModel({ specs, panelColors, setPanelColors }: { specs: Projec
   const renderWallSheets = () => {
     if (specs.hasWalls === false) return null;
     const elements = [];
-    const effWidth = specs.wallProfile === '6v Profile' ? 1.0 : (specs.wallProfile === '7v Profile' ? 1.2 : 1.0);
+    const effWidth = specs.wallProfile === '6v Profile' ? 0.99 : (specs.wallProfile === '7v Profile' ? 1.188 : 1.0);
     const numZSheets = Math.ceil(l / effWidth - 0.001);
     
     for (let i = 0; i < numZSheets; i++) {
@@ -515,7 +897,7 @@ function Building3DModel({ specs, panelColors, setPanelColors }: { specs: Projec
       let cutEndZ = -1;
       const zStartX = i * effWidth;
       const zEndX = zStartX + wSheet;
-      const overlapGap = 0.02;
+      const overlapGap = 0.0;
 
       if (zEndX > gateStartZ && zStartX < gateEndZ) {
           cutStartZ = Math.max(0, gateStartZ - zStartX);
@@ -546,7 +928,7 @@ function Building3DModel({ specs, panelColors, setPanelColors }: { specs: Projec
               <group key={j}>
                 <mesh receiveShadow onClick={(e) => handlePanelClick(e, `${keyLeft}_${j}`, specs.wallColor || '#0089b6', 'wall')}>
                   <shapeGeometry args={[sShape]} />
-                  <meshStandardMaterial color={getPanelColor(`${keyLeft}_${j}`, specs.wallColor || '#0089b6', 'wall', specs, panelColors)} metalness={0.5} roughness={0.4} bumpMap={panelTexH} envMapIntensity={1.2} side={THREE.FrontSide} bumpScale={0.06}>
+                  <meshStandardMaterial color={getPanelColor(`${keyLeft}_${j}`, specs.wallColor || '#0089b6', 'wall', specs, panelColors)} metalness={0.5} roughness={0.4} bumpMap={getWallTexture(wSheet - overlapGap, i * effWidth)} envMapIntensity={1.2} side={THREE.FrontSide} bumpScale={0.025}>
                   </meshStandardMaterial>
                 </mesh>
                 <mesh receiveShadow position={[0, 0, -0.005]}>
@@ -587,7 +969,7 @@ function Building3DModel({ specs, panelColors, setPanelColors }: { specs: Projec
               <group key={j}>
                 <mesh receiveShadow onClick={(e) => handlePanelClick(e, `${keyRight}_${j}`, specs.wallColor || '#0089b6', 'wall')}>
                   <shapeGeometry args={[sShape]} />
-                  <meshStandardMaterial color={getPanelColor(`${keyRight}_${j}`, specs.wallColor || '#0089b6', 'wall', specs, panelColors)} metalness={0.5} roughness={0.4} bumpMap={panelTexH} envMapIntensity={1.2} side={THREE.FrontSide} bumpScale={0.06}>
+                  <meshStandardMaterial color={getPanelColor(`${keyRight}_${j}`, specs.wallColor || '#0089b6', 'wall', specs, panelColors)} metalness={0.5} roughness={0.4} bumpMap={getWallTexture(wSheet - overlapGap, -(i * effWidth + wSheet))} envMapIntensity={1.2} side={THREE.FrontSide} bumpScale={0.025}>
                   </meshStandardMaterial>
                 </mesh>
                 <mesh receiveShadow position={[0, 0, -0.005]}>
@@ -613,7 +995,7 @@ function Building3DModel({ specs, panelColors, setPanelColors }: { specs: Projec
       const startX = -w / 2 + i * effWidth;
       const endX = startX + wSheet;
       
-      const overlapGap = 0.02;
+      const overlapGap = 0.0;
       const wShape = Math.max(0.01, wSheet - overlapGap);
       
       let cutStartX = -1;
@@ -682,7 +1064,7 @@ function Building3DModel({ specs, panelColors, setPanelColors }: { specs: Projec
              const cx = x1 + sw / 2;
              seamMeshesFront.push(
                <mesh key={`seam_${j}_${x1}`} position={[cx, cutY, -0.01]} receiveShadow>
-                 <boxGeometry args={[sw, overlapGap, 0.01]} />
+                 <boxGeometry args={[sw, 0.005, 0.01]} />
                  <meshStandardMaterial color="#1a1a1a" roughness={0.9} />
                </mesh>
              );
@@ -706,7 +1088,7 @@ function Building3DModel({ specs, panelColors, setPanelColors }: { specs: Projec
                <group key={j}>
                  <mesh receiveShadow onClick={(e) => handlePanelClick(e, keyFront, specs.wallColor || '#0089b6', 'wall')}>
                    <shapeGeometry args={[s]} />
-                   <meshStandardMaterial color={getPanelColor(keyFront, specs.wallColor || '#0089b6', 'wall', specs, panelColors)} metalness={0.5} roughness={0.4} bumpMap={panelTexH} envMapIntensity={1.2} side={THREE.BackSide} bumpScale={0.06}>
+                   <meshStandardMaterial color={getPanelColor(keyFront, specs.wallColor || '#0089b6', 'wall', specs, panelColors)} metalness={0.5} roughness={0.4} bumpMap={getWallTexture(wShape, startX)} envMapIntensity={1.2} side={THREE.BackSide} bumpScale={0.025}>
                    </meshStandardMaterial>
                  </mesh>
                  <mesh receiveShadow position={[0, 0, 0.005]}>
@@ -747,7 +1129,7 @@ function Building3DModel({ specs, panelColors, setPanelColors }: { specs: Projec
              const cx = x1 + sw / 2;
              seamMeshesBack.push(
                <mesh key={`seam_${j}_${x1}`} position={[cx, cutY, +0.01]} receiveShadow>
-                 <boxGeometry args={[sw, overlapGap, 0.01]} />
+                 <boxGeometry args={[sw, 0.005, 0.01]} />
                  <meshStandardMaterial color="#1a1a1a" roughness={0.9} />
                </mesh>
              );
@@ -771,7 +1153,7 @@ function Building3DModel({ specs, panelColors, setPanelColors }: { specs: Projec
                <group key={j}>
                  <mesh receiveShadow onClick={(e) => handlePanelClick(e, keyBack, specs.wallColor || '#0089b6', 'wall')}>
                    <shapeGeometry args={[sBack]} />
-                   <meshStandardMaterial color={getPanelColor(keyBack, specs.wallColor || '#0089b6', 'wall', specs, panelColors)} metalness={0.5} roughness={0.4} bumpMap={panelTexH} envMapIntensity={1.2} side={THREE.FrontSide} bumpScale={0.06}>
+                   <meshStandardMaterial color={getPanelColor(keyBack, specs.wallColor || '#0089b6', 'wall', specs, panelColors)} metalness={0.5} roughness={0.4} bumpMap={getWallTexture(wShape, startX)} envMapIntensity={1.2} side={THREE.FrontSide} bumpScale={0.025}>
                    </meshStandardMaterial>
                  </mesh>
                  <mesh receiveShadow position={[0, 0, -0.005]}>
@@ -788,12 +1170,182 @@ function Building3DModel({ specs, panelColors, setPanelColors }: { specs: Projec
     return elements;
   };
 
+  const getProfilePoints = (wSheet: number, profileType: string) => {
+    const is7v = profileType === '7v Profile';
+    const is6v = profileType === '6v Profile';
+    const isStandard = profileType === 'Standard' || (!is7v && !is6v);
+
+    let numPeaks = 6;
+    let pitch = 0.198;
+    let peakHeight = 0.030;
+    let peakBaseW = 0.065;
+    let peakTopW = 0.025;
+    let edgeOffset = 0.010;
+
+    if (is7v) {
+      numPeaks = 7;
+      pitch = 0.198;
+      peakHeight = 0.030;
+      peakBaseW = 0.065;
+      peakTopW = 0.025;
+      edgeOffset = 0.010;
+    } else if (is6v) {
+      numPeaks = 6;
+      pitch = 0.198;
+      peakHeight = 0.030;
+      peakBaseW = 0.065;
+      peakTopW = 0.025;
+      edgeOffset = 0.010;
+    }
+
+    const points: { x: number; y: number }[] = [];
+    let currentX = 0;
+
+    if (isStandard) {
+      points.push({ x: 0, y: 0 });
+      currentX += 0.013;
+      points.push({ x: currentX, y: 0 });
+
+      // Standard wave profile
+      const stdPitch = 0.076;
+      const stdHeight = 0.018;
+      const totalSteps = 200;
+      for (let s = 1; s <= totalSteps; s++) {
+        const xVal = (s / totalSteps) * wSheet;
+        const yVal = ((Math.sin((xVal / stdPitch) * Math.PI * 2 - Math.PI / 2) + 1) / 2) * stdHeight;
+        points.push({ x: xVal, y: yVal });
+      }
+    } else {
+      const slopeW = (peakBaseW - peakTopW) / 2;
+      const shortLegLen = 0.0181; // 18.1mm
+      const stdLegLen = 0.0351;  // 35.1mm
+      const ratio = shortLegLen / stdLegLen;
+      const drawShortW = slopeW * ratio;
+      const drawShortH = peakHeight * ratio;
+      const stepH = 0.003; // 3mm step height
+
+      // Start at the bottom-left of the short leg
+      points.push({ x: 0, y: peakHeight - stepH - drawShortH });
+      
+      // Slant up to top-left of first peak but 3mm below topY
+      currentX = drawShortW;
+      points.push({ x: currentX, y: peakHeight - stepH });
+
+      // Vertical step UP of 3mm to peakHeight
+      points.push({ x: currentX, y: peakHeight });
+
+      for (let k = 0; k < numPeaks; k++) {
+        if (k === 0) {
+          // Top flat
+          currentX += peakTopW;
+          points.push({ x: currentX, y: peakHeight });
+
+          // Right slant down
+          currentX += slopeW;
+          points.push({ x: currentX, y: 0 });
+        } else {
+          // Left slant up
+          currentX += slopeW;
+          points.push({ x: currentX, y: peakHeight });
+
+          // Top flat
+          currentX += peakTopW;
+          points.push({ x: currentX, y: peakHeight });
+
+          // Right slant down
+          currentX += slopeW;
+          points.push({ x: currentX, y: 0 });
+        }
+
+        if (k < numPeaks - 1) {
+          // Minor ribs in the pan: 26mm flat, 28mm rib, 25mm flat, 28mm rib, 26mm flat
+          // Rib height is 3.5mm in the 3D visualizer to ensure clear visibility
+          // Rib rises over 4mm, flat for 20mm, drops over 4mm
+          const ribH3D = 0.0035;
+          
+          // First section of pan: length 26mm
+          currentX += 0.026;
+          points.push({ x: currentX, y: 0 });
+          
+          // Minor rib 1: 4mm rise, 20mm flat, 4mm drop
+          currentX += 0.004;
+          points.push({ x: currentX, y: ribH3D });
+          currentX += 0.020;
+          points.push({ x: currentX, y: ribH3D });
+          currentX += 0.004;
+          points.push({ x: currentX, y: 0 });
+          
+          // Middle flat section: length 25mm
+          currentX += 0.025;
+          points.push({ x: currentX, y: 0 });
+          
+          // Minor rib 2: 4mm rise, 20mm flat, 4mm drop
+          currentX += 0.004;
+          points.push({ x: currentX, y: ribH3D });
+          currentX += 0.020;
+          points.push({ x: currentX, y: ribH3D });
+          currentX += 0.004;
+          points.push({ x: currentX, y: 0 });
+          
+          // Last section of pan: length 26mm
+          currentX += 0.026;
+          points.push({ x: currentX, y: 0 });
+        }
+      }
+
+      currentX += edgeOffset;
+      points.push({ x: currentX, y: 0 });
+    }
+
+    const clippedPoints: { x: number; y: number }[] = [];
+    for (let k = 0; k < points.length; k++) {
+      const p = points[k];
+      if (p.x <= wSheet) {
+        clippedPoints.push(p);
+      } else {
+        const prev = points[k - 1];
+        if (prev && prev.x < wSheet) {
+          const ratio = (wSheet - prev.x) / (p.x - prev.x);
+          const intersectedY = prev.y + ratio * (p.y - prev.y);
+          clippedPoints.push({ x: wSheet, y: intersectedY });
+        }
+        break;
+      }
+    }
+
+    if (clippedPoints.length > 0 && clippedPoints[clippedPoints.length - 1].x < wSheet) {
+      const last = clippedPoints[clippedPoints.length - 1];
+      clippedPoints.push({ x: wSheet, y: last.y });
+    }
+
+    return clippedPoints;
+  };
+
+  const createTrapezoidalShape = (wSheet: number, profileType: string) => {
+    const pts = getProfilePoints(wSheet, profileType);
+    const shape = new THREE.Shape();
+    if (pts.length === 0) return shape;
+
+    shape.moveTo(pts[0].x, pts[0].y);
+    for (let k = 1; k < pts.length; k++) {
+      shape.lineTo(pts[k].x, pts[k].y);
+    }
+
+    const thickness = 0.002;
+    for (let k = pts.length - 1; k >= 0; k--) {
+      shape.lineTo(pts[k].x, pts[k].y - thickness);
+    }
+
+    shape.closePath();
+    return shape;
+  };
+
   const renderRoofPanelArea = (keyPrefix: string, cx: number, cy: number, length: number, angle: number) => {
-    const roofEffWidth = specs.roofProfile === '6v Profile' ? 1.0 : (specs.roofProfile === '7v Profile' ? 1.2 : 1.0);
+    const roofEffWidth = specs.roofProfile === '6v Profile' ? 0.99 : (specs.roofProfile === '7v Profile' ? 1.188 : 1.0);
     const numSheets = Math.ceil(l / roofEffWidth - 0.001);
     const roofSegments = Math.ceil(length / 6);
     const segLength = length / roofSegments;
-    const overlapGap = 0.02; // A small visual gap to illustrate the division
+    const overlapGap = 0.0; // A small visual gap to illustrate the division
 
     return Array.from({ length: numSheets }).map((_, i) => {
       const isLast = i === numSheets - 1;
@@ -810,35 +1362,48 @@ function Building3DModel({ specs, panelColors, setPanelColors }: { specs: Projec
             const segKey = `${key}_seg_${j}`;
             const isSkylight = isSkylightCol && (roofSegments >= 3 ? j === Math.floor(roofSegments / 2) : true);
             return (
-              <mesh key={j} receiveShadow position={[locX, 0, 0]}
-                onClick={(e) => handlePanelClick(e, segKey, isSkylight ? 'transparent' : (specs.roofColor || '#0089b6'), 'roof')}
-               
-              >
-                <boxGeometry args={[segLength - overlapGap, 0.2, wSheet - overlapGap]} />
-                {(() => {
-                  if (isSkylight) {
-                    return (
-                      <meshStandardMaterial color="#e0f2fe" roughness={0.1} metalness={0.1} transparent opacity={0.6} depthWrite={false} side={THREE.DoubleSide} />
-                    )
-                  }
-                  const outColor = getPanelColor(segKey, specs.roofColor || '#0089b6', 'roof', specs, panelColors);
+              <group key={j}>
+                <mesh receiveShadow 
+                  position={[locX - (segLength - overlapGap) / 2, 0, (wSheet - overlapGap) / 2]} 
+                  rotation={[0, Math.PI / 2, 0]}
+                  onClick={(e) => handlePanelClick(e, segKey, isSkylight ? 'transparent' : (specs.roofColor || '#0089b6'), 'roof')}
+                >
+                  <extrudeGeometry args={[
+                    createTrapezoidalShape(wSheet - overlapGap, specs.roofProfile || '7v Profile'),
+                    { depth: segLength - overlapGap, bevelEnabled: false }
+                  ]} />
+                  {isSkylight ? (
+                    <meshStandardMaterial color="#e0f2fe" roughness={0.1} metalness={0.1} transparent opacity={0.6} depthWrite={false} side={THREE.DoubleSide} />
+                  ) : (
+                    <meshStandardMaterial 
+                      color={getPanelColor(segKey, specs.roofColor || '#0089b6', 'roof', specs, panelColors)} 
+                      metalness={0.6} 
+                      roughness={0.3} 
+                      envMapIntensity={1.2} 
+                      side={THREE.DoubleSide}
+                    />
+                  )}
+                </mesh>
+                {/* Real-time Insulation layer beneath Roof Panel */}
+                {specs.hasInsulation !== false && !isSkylight && (
+                  <mesh position={[locX, -0.012, 0]}>
+                    <boxGeometry args={[segLength - overlapGap, 0.002, wSheet - overlapGap]} />
+                    <meshStandardMaterial color="#b0bec5" roughness={0.3} metalness={0.8} />
+                  </mesh>
+                )}
+                {/* Real-time Snow Accumulation layer on Roof Panel */}
+                {weatherType === 'snow' && !isSkylight && (() => {
+                  const is7v = specs.roofProfile === '7v Profile';
+                  const is6v = specs.roofProfile === '6v Profile';
+                  const peakHeight = is7v ? 0.029 : (is6v ? 0.035 : 0.018);
                   return (
-                    <React.Fragment>
-                      <meshStandardMaterial attach="material-0" color={outColor} metalness={0.6} roughness={0.3} envMapIntensity={1.2} />
-                      <meshStandardMaterial attach="material-1" color={outColor} metalness={0.6} roughness={0.3} envMapIntensity={1.2} />
-                      <meshStandardMaterial attach="material-2" color={outColor} metalness={0.6} roughness={0.3} envMapIntensity={1.2} />
-                      <meshStandardMaterial 
-                        attach="material-3" 
-                        color={specs.hasInsulation !== false ? "#b0bec5" : "#e2e8f0"} 
-                        roughness={specs.hasInsulation !== false ? 0.3 : 0.7} 
-                        metalness={specs.hasInsulation !== false ? 0.8 : 0.1}
-                      />
-                      <meshStandardMaterial attach="material-4" color={outColor} metalness={0.6} roughness={0.3} bumpMap={panelTexV} envMapIntensity={1.2} bumpScale={0.06} />
-                      <meshStandardMaterial attach="material-5" color={outColor} metalness={0.6} roughness={0.3} bumpMap={panelTexV} envMapIntensity={1.2} bumpScale={0.06} />
-                    </React.Fragment>
+                    <mesh position={[locX, peakHeight + 0.01, 0]}>
+                      <boxGeometry args={[segLength - overlapGap + 0.01, 0.02, wSheet - overlapGap + 0.01]} />
+                      <meshStandardMaterial color="#ffffff" roughness={0.9} metalness={0.0} />
+                    </mesh>
                   );
                 })()}
-              </mesh>
+              </group>
             );
           })}
         </group>
@@ -854,7 +1419,8 @@ function Building3DModel({ specs, panelColors, setPanelColors }: { specs: Projec
     const rl = base_rl + 0.5; // low eave overhang only
     // shifting left by 0.1 * sin(angle) to prevent the bottom corner of the thick roof box from poking out
     const cx = -0.25 * Math.cos(angle) - 0.1 * Math.sin(angle);
-    const cy = (h + totRoofH / 2 + 0.6) - 0.25 * Math.sin(angle);
+    const panelYOffset = modelPurlinYOffset + 0.075 + 0.1 / Math.cos(angle);
+    const cy = (h + totRoofH / 2 + panelYOffset) - 0.25 * Math.sin(angle);
     roofPanels.push(...renderRoofPanelArea('single', cx, cy, rl, angle));
   } else if (specs.roofType === 'Multi-Sloped Hut') {
     const h_steep = (w / 4) * (specs.roofSlope * 1.5 / 100);
@@ -866,14 +1432,17 @@ function Building3DModel({ specs, panelColors, setPanelColors }: { specs: Projec
     const a_steep = Math.atan(h_steep / (w / 4));
     const a_shallow = Math.atan(h_shallow / (w / 4));
 
-    roofPanels.push(...renderRoofPanelArea('m1', -w * 0.375 - 0.25 * Math.cos(a_steep), h + h_steep / 2 + 0.6 - 0.25 * Math.sin(a_steep), rl_steep + 0.5, a_steep));
-    roofPanels.push(...renderRoofPanelArea('m2', -w * 0.125, h + h_steep + h_shallow / 2 + 0.6, rl_shallow, a_shallow)); // no overhang on middle sections
-    roofPanels.push(...renderRoofPanelArea('m3', w * 0.125, h + h_steep + h_shallow / 2 + 0.6, rl_shallow, -a_shallow)); // no overhang on middle sections
-    roofPanels.push(...renderRoofPanelArea('m4', w * 0.375 + 0.25 * Math.cos(a_steep), h + h_steep / 2 + 0.6 - 0.25 * Math.sin(a_steep), rl_steep + 0.5, -a_steep));
+    const offsetSteep = modelPurlinYOffset + 0.075 + 0.1 / Math.cos(a_steep);
+    const offsetShallow = modelPurlinYOffset + 0.075 + 0.1 / Math.cos(a_shallow);
+
+    roofPanels.push(...renderRoofPanelArea('m1', -w * 0.375 - 0.25 * Math.cos(a_steep), h + h_steep / 2 + offsetSteep - 0.25 * Math.sin(a_steep), rl_steep + 0.5, a_steep));
+    roofPanels.push(...renderRoofPanelArea('m2', -w * 0.125, h + h_steep + h_shallow / 2 + offsetShallow, rl_shallow, a_shallow)); // no overhang on middle sections
+    roofPanels.push(...renderRoofPanelArea('m3', w * 0.125, h + h_steep + h_shallow / 2 + offsetShallow, rl_shallow, -a_shallow)); // no overhang on middle sections
+    roofPanels.push(...renderRoofPanelArea('m4', w * 0.375 + 0.25 * Math.cos(a_steep), h + h_steep / 2 + offsetSteep - 0.25 * Math.sin(a_steep), rl_steep + 0.5, -a_steep));
   } else if (specs.roofType === 'Curved') {
     const roofH = (w / 2) * (specs.roofSlope / 100) * 1.5;
     
-    const roofEffWidth = specs.roofProfile === '6v Profile' ? 1.0 : (specs.roofProfile === '7v Profile' ? 1.2 : 1.0);
+    const roofEffWidth = specs.roofProfile === '6v Profile' ? 0.99 : (specs.roofProfile === '7v Profile' ? 1.188 : 1.0);
     const numSheets = Math.ceil(l / roofEffWidth - 0.001);
 
     const roofSlopeFactor = Math.sqrt(1 + Math.pow(specs.roofSlope / 100, 2));
@@ -881,13 +1450,15 @@ function Building3DModel({ specs, panelColors, setPanelColors }: { specs: Projec
     const roofSegments = Math.ceil(sheetLengthRoof / 6);
     const totalSegs = roofSegments * 2; 
 
-    const I0 = {x: -w / 2 - 0.5, y: h + 0.3};
-    const I1 = {x: 0, y: h + roofH * 2 + 0.5};
-    const I2 = {x: w / 2 + 0.5, y: h + 0.3};
+    const basePurlinTopOffset = modelPurlinYOffset + 0.075;
 
-    const O0 = {x: -w / 2 - 0.5, y: h + 0.5};
-    const O1 = {x: 0, y: h + roofH * 2 + 0.7};
-    const O2 = {x: w / 2 + 0.5, y: h + 0.5};
+    const I0 = {x: -w / 2 - 0.5, y: h + basePurlinTopOffset - 0.1};
+    const I1 = {x: 0, y: h + roofH * 2 + basePurlinTopOffset + 0.1};
+    const I2 = {x: w / 2 + 0.5, y: h + basePurlinTopOffset - 0.1};
+
+    const O0 = {x: -w / 2 - 0.5, y: I0.y + 0.0005};
+    const O1 = {x: 0, y: I1.y + 0.0005};
+    const O2 = {x: w / 2 + 0.5, y: I2.y + 0.0005};
 
     const getQuadPoint = (p0: any, p1: any, p2: any, t: number) => {
       const invT = 1 - t;
@@ -912,7 +1483,7 @@ function Building3DModel({ specs, panelColors, setPanelColors }: { specs: Projec
       const wSheet = isLast ? l - (numSheets - 1) * roofEffWidth : roofEffWidth;
       const zStart = i * roofEffWidth;
       const isSkylight = specs.hasPolySheets !== false && (i % 6 === 3);
-      const overlapGap = 0.02;
+      const overlapGap = 0.0;
 
       return (
         <group key={`curved_col_${i}`} position={[0, 0, zStart]}>
@@ -946,7 +1517,7 @@ function Building3DModel({ specs, panelColors, setPanelColors }: { specs: Projec
                   {isSkylight ? (
                     <meshStandardMaterial color="#e0f2fe" roughness={0.1} metalness={0.1} transparent opacity={0.6} depthWrite={false} side={THREE.DoubleSide} />
                   ) : (
-                    <meshStandardMaterial color={getPanelColor(key, specs.roofColor || '#0089b6', 'roof', specs, panelColors)} metalness={0.6} roughness={0.3} bumpMap={panelTexV} envMapIntensity={1.2} bumpScale={0.06} />
+                    <meshStandardMaterial color={getPanelColor(key, specs.roofColor || '#0089b6', 'roof', specs, panelColors)} metalness={0.6} roughness={0.3} bumpMap={getRoofTexture(wSheet, zStart)} envMapIntensity={1.2} bumpScale={0.025} />
                   )}
                 </mesh>
                 <mesh receiveShadow position={[0, -0.01, 0]}>
@@ -976,7 +1547,8 @@ function Building3DModel({ specs, panelColors, setPanelColors }: { specs: Projec
     const base_rl = Math.sqrt((w / 2) * (w / 2) + roofH * roofH);
     const rl = base_rl + 0.5;
     const cx1 = -w / 4 - 0.25 * Math.cos(angle);
-    const cy1 = h + roofH / 2 + 0.6 - 0.25 * Math.sin(angle);
+    const panelYOffset = modelPurlinYOffset + 0.075 + 0.1 / Math.cos(angle);
+    const cy1 = h + roofH / 2 + panelYOffset - 0.25 * Math.sin(angle);
     const cx2 = w / 4 + 0.25 * Math.cos(angle);
     
     roofPanels.push(...renderRoofPanelArea('d1', cx1, cy1, rl, angle));
@@ -1223,10 +1795,26 @@ function Building3DModel({ specs, panelColors, setPanelColors }: { specs: Projec
       let py = ph / 2;
       
       ancillaryElements.push(
-        <mesh receiveShadow key={`downpipe_${idx}`} position={[px, py, pos[2]]}>
-          <cylinderGeometry args={[0.08, 0.08, ph, 8]} />
-          <meshStandardMaterial color={specs.downPipeColor || '#383e42'} roughness={0.7} />
-        </mesh>
+        <group key={`downpipe_group_${idx}`}>
+          <mesh receiveShadow position={[px, py, pos[2]]}>
+            <cylinderGeometry args={[0.08, 0.08, ph, 8]} />
+            <meshStandardMaterial color={specs.downPipeColor || '#383e42'} roughness={0.7} />
+          </mesh>
+          {(weatherType === 'rain' || weatherType === 'storm') && (
+            <group>
+              {/* Vertical running water stream on downpipe exterior */}
+              <mesh position={[px, py, pos[2] + 0.09]}>
+                <boxGeometry args={[0.04, ph, 0.01]} />
+                <meshStandardMaterial color="#38bdf8" roughness={0.1} transparent opacity={0.6} />
+              </mesh>
+              {/* Splashing water at the base of the pipe discharge */}
+              <mesh position={[px, 0.02, pos[2]]}>
+                <cylinderGeometry args={[0.15, 0.22, 0.04, 12]} />
+                <meshStandardMaterial color="#7dd3fc" roughness={0.05} transparent opacity={0.8} />
+              </mesh>
+            </group>
+          )}
+        </group>
       );
     });
   }
@@ -1283,16 +1871,7 @@ function Building3DModel({ specs, panelColors, setPanelColors }: { specs: Projec
             const vy = getRoofY(vx) + 0.2;
 
             ancillaryElements.push(
-              <group key={`vent_${i}_${vidx}`} position={[vx, vy, vz]}>
-                <mesh receiveShadow position={[0, 0, 0]}>
-                  <cylinderGeometry args={[0.2, 0.25, 0.2, 16]} />
-                  <meshStandardMaterial color="#c0c0c0" metalness={0.8} roughness={0.2} />
-                </mesh>
-                <mesh receiveShadow position={[0, 0.1, 0]}>
-                  <sphereGeometry args={[0.3, 16, 16, 0, Math.PI * 2, 0, Math.PI / 2]} />
-                  <meshStandardMaterial color="#c0c0c0" metalness={0.8} roughness={0.2} />
-                </mesh>
-              </group>
+              <SpinningTurboVent key={`vent_${i}_${vidx}`} position={[vx, vy, vz]} weatherType={weatherType} />
             );
         });
       }
@@ -1332,8 +1911,8 @@ function Building3DModel({ specs, panelColors, setPanelColors }: { specs: Projec
             );
           };
           
-          if (pos === 'Left' || pos === 'Left & Right' || pos === 'All Sides') ancillaryElements.push(renderLouver(`louver_L_${i}`, -w / 2 - 0.05, ly, vz, -Math.PI / 2));
-          if (pos === 'Right' || pos === 'Left & Right' || pos === 'All Sides') ancillaryElements.push(renderLouver(`louver_R_${i}`, w / 2 + 0.05, ly, vz, Math.PI / 2));
+          if (pos === 'Left' || pos === 'Left & Right' || pos === 'All Sides') ancillaryElements.push(renderLouver(`louver_L_${i}`, -w / 2 - 0.011, ly, vz, -Math.PI / 2));
+          if (pos === 'Right' || pos === 'Left & Right' || pos === 'All Sides') ancillaryElements.push(renderLouver(`louver_R_${i}`, w / 2 + 0.011, ly, vz, Math.PI / 2));
         }
       }
     }
@@ -1368,8 +1947,8 @@ function Building3DModel({ specs, panelColors, setPanelColors }: { specs: Projec
             );
           };
           
-          if (pos === 'Front' || pos === 'Front & Back' || pos === 'All Sides') ancillaryElements.push(renderLouver(`louver_F_${i}`, vx, ly, -0.05, Math.PI));
-          if (pos === 'Back' || pos === 'Front & Back' || pos === 'All Sides') ancillaryElements.push(renderLouver(`louver_B_${i}`, vx, ly, l + 0.05, 0));
+          if (pos === 'Front' || pos === 'Front & Back' || pos === 'All Sides') ancillaryElements.push(renderLouver(`louver_F_${i}`, vx, ly, -0.011, Math.PI));
+          if (pos === 'Back' || pos === 'Front & Back' || pos === 'All Sides') ancillaryElements.push(renderLouver(`louver_B_${i}`, vx, ly, l + 0.011, 0));
         }
       }
     }
@@ -1381,20 +1960,20 @@ function Building3DModel({ specs, panelColors, setPanelColors }: { specs: Projec
     const gateW = Math.min(4, (isFrontOrBack ? w : l) * 0.6);
     const gateH = Math.min(3, h * 0.8);
     
-    let gatePos: [number, number, number] = [0, gateH / 2, -0.05];
+    let gatePos: [number, number, number] = [0, gateH / 2, -0.011];
     let gateRot: [number, number, number] = [0, 0, 0];
     
     if (pos === 'Front') {
-        gatePos = [0, gateH / 2, -0.05];
+        gatePos = [0, gateH / 2, -0.011];
         gateRot = [0, 0, 0];
     } else if (pos === 'Back') {
-        gatePos = [0, gateH / 2, l + 0.05];
+        gatePos = [0, gateH / 2, l + 0.011];
         gateRot = [0, Math.PI, 0];
     } else if (pos === 'Left') {
-        gatePos = [-w / 2 - 0.05, gateH / 2, l / 2];
+        gatePos = [-w / 2 - 0.011, gateH / 2, l / 2];
         gateRot = [0, -Math.PI / 2, 0];
     } else if (pos === 'Right') {
-        gatePos = [w / 2 + 0.05, gateH / 2, l / 2];
+        gatePos = [w / 2 + 0.011, gateH / 2, l / 2];
         gateRot = [0, Math.PI / 2, 0];
     }
 
@@ -1407,14 +1986,44 @@ function Building3DModel({ specs, panelColors, setPanelColors }: { specs: Projec
     
     if (specs.hasCrimpedSheets !== false) {
       const awningRadius = 0.3;
-      ancillaryElements.push(
-        <group key="gate_awning" position={[gatePos[0], gateH, gatePos[2]]} rotation={gateRot}>
-           <mesh receiveShadow rotation={[0, 0, -Math.PI / 2]}>
-              <cylinderGeometry args={[awningRadius, awningRadius, gateW + 0.4, 32, 1, false, Math.PI, Math.PI / 2]} />
-              <meshStandardMaterial color={specs.crimpedSheetsColor || specs.roofColor || '#0089b6'} side={THREE.DoubleSide} />
-           </mesh>
-        </group>
-      );
+      let awningMesh = null;
+      if (pos === 'Front') {
+        awningMesh = (
+          <mesh receiveShadow position={[0, gateH, -0.011]} rotation={[0, 0, Math.PI / 2]}>
+            <cylinderGeometry args={[awningRadius, awningRadius, gateW + 0.4, 32, 1, false, -Math.PI / 2, Math.PI / 2]} />
+            <meshStandardMaterial color={specs.crimpedSheetsColor || specs.roofColor || '#0089b6'} side={THREE.DoubleSide} />
+          </mesh>
+        );
+      } else if (pos === 'Back') {
+        awningMesh = (
+          <mesh receiveShadow position={[0, gateH, l + 0.011]} rotation={[0, 0, -Math.PI / 2]}>
+            <cylinderGeometry args={[awningRadius, awningRadius, gateW + 0.4, 32, 1, false, Math.PI / 2, Math.PI / 2]} />
+            <meshStandardMaterial color={specs.crimpedSheetsColor || specs.roofColor || '#0089b6'} side={THREE.DoubleSide} />
+          </mesh>
+        );
+      } else if (pos === 'Left') {
+        awningMesh = (
+          <mesh receiveShadow position={[-w / 2 - 0.011, gateH, l / 2]} rotation={[Math.PI / 2, 0, 0]}>
+            <cylinderGeometry args={[awningRadius, awningRadius, gateW + 0.4, 32, 1, false, Math.PI / 2, Math.PI / 2]} />
+            <meshStandardMaterial color={specs.crimpedSheetsColor || specs.roofColor || '#0089b6'} side={THREE.DoubleSide} />
+          </mesh>
+        );
+      } else if (pos === 'Right') {
+        awningMesh = (
+          <mesh receiveShadow position={[w / 2 + 0.011, gateH, l / 2]} rotation={[Math.PI / 2, 0, 0]}>
+            <cylinderGeometry args={[awningRadius, awningRadius, gateW + 0.4, 32, 1, false, 0, Math.PI / 2]} />
+            <meshStandardMaterial color={specs.crimpedSheetsColor || specs.roofColor || '#0089b6'} side={THREE.DoubleSide} />
+          </mesh>
+        );
+      }
+      
+      if (awningMesh) {
+        ancillaryElements.push(
+          <group key="gate_awning">
+            {awningMesh}
+          </group>
+        );
+      }
     }
   }
 
@@ -1520,16 +2129,16 @@ function Building3DModel({ specs, panelColors, setPanelColors }: { specs: Projec
           
           if (pos === 'Left' || pos === 'Left & Right' || pos === 'All Sides') {
             ancillaryElements.push(
-              <mesh receiveShadow key={`window_L_${i}`} position={[-w / 2, wy, vz]} rotation={[0, -Math.PI/2, 0]}>
+              <mesh receiveShadow key={`window_L_${i}`} position={[-w / 2 - 0.01, wy, vz]} rotation={[0, -Math.PI/2, 0]}>
                 <boxGeometry args={[ww, wh, 0.1]} />
                 <meshStandardMaterial color="#87CEEB" roughness={0.1} metalness={0.8} />
               </mesh>
             );
             if (specs.hasCrimpedSheets !== false) {
               ancillaryElements.push(
-                <group key={`window_awning_L_${i}`} position={[-w / 2, wy + wh / 2, vz]}>
+                <group key={`window_awning_L_${i}`} position={[-w / 2 - 0.01, wy + wh / 2, vz]}>
                   <mesh receiveShadow rotation={[Math.PI / 2, 0, 0]}>
-                    <cylinderGeometry args={[awningRadius, awningRadius, ww + 0.4, 32, 1, false, Math.PI, Math.PI / 2]} />
+                    <cylinderGeometry args={[awningRadius, awningRadius, ww + 0.4, 32, 1, false, Math.PI / 2, Math.PI / 2]} />
                     <meshStandardMaterial color={specs.crimpedSheetsColor || specs.roofColor || '#0089b6'} side={THREE.DoubleSide} />
                   </mesh>
                 </group>
@@ -1539,16 +2148,16 @@ function Building3DModel({ specs, panelColors, setPanelColors }: { specs: Projec
 
           if (pos === 'Right' || pos === 'Left & Right' || pos === 'All Sides') {
             ancillaryElements.push(
-              <mesh receiveShadow key={`window_R_${i}`} position={[w / 2, wy, vz]} rotation={[0, Math.PI/2, 0]}>
+              <mesh receiveShadow key={`window_R_${i}`} position={[w / 2 + 0.01, wy, vz]} rotation={[0, Math.PI/2, 0]}>
                 <boxGeometry args={[ww, wh, 0.1]} />
                 <meshStandardMaterial color="#87CEEB" roughness={0.1} metalness={0.8} />
               </mesh>
             );
             if (specs.hasCrimpedSheets !== false) {
               ancillaryElements.push(
-                <group key={`window_awning_R_${i}`} position={[w / 2, wy + wh / 2, vz]}>
+                <group key={`window_awning_R_${i}`} position={[w / 2 + 0.01, wy + wh / 2, vz]}>
                   <mesh receiveShadow rotation={[Math.PI / 2, 0, 0]}>
-                    <cylinderGeometry args={[awningRadius, awningRadius, ww + 0.4, 32, 1, false, Math.PI / 2, Math.PI / 2]} />
+                    <cylinderGeometry args={[awningRadius, awningRadius, ww + 0.4, 32, 1, false, 0, Math.PI / 2]} />
                     <meshStandardMaterial color={specs.crimpedSheetsColor || specs.roofColor || '#0089b6'} side={THREE.DoubleSide} />
                   </mesh>
                 </group>
@@ -1569,16 +2178,16 @@ function Building3DModel({ specs, panelColors, setPanelColors }: { specs: Projec
 
           if (pos === 'Front' || pos === 'Front & Back' || pos === 'All Sides') {
             ancillaryElements.push(
-              <mesh receiveShadow key={`window_F_${i}`} position={[vx, wy, 0]} rotation={[0, 0, 0]}>
+              <mesh receiveShadow key={`window_F_${i}`} position={[vx, wy, -0.01]} rotation={[0, 0, 0]}>
                 <boxGeometry args={[ww, wh, 0.1]} />
                 <meshStandardMaterial color="#87CEEB" roughness={0.1} metalness={0.8} />
               </mesh>
             );
             if (specs.hasCrimpedSheets !== false) {
               ancillaryElements.push(
-                <group key={`window_awning_F_${i}`} position={[vx, wy + wh / 2, 0]}>
+                <group key={`window_awning_F_${i}`} position={[vx, wy + wh / 2, -0.01]}>
                   <mesh receiveShadow rotation={[0, 0, Math.PI / 2]}>
-                    <cylinderGeometry args={[awningRadius, awningRadius, ww + 0.4, 32, 1, false, -Math.PI / 4, Math.PI / 2]} />
+                    <cylinderGeometry args={[awningRadius, awningRadius, ww + 0.4, 32, 1, false, -Math.PI / 2, Math.PI / 2]} />
                     <meshStandardMaterial color={specs.crimpedSheetsColor || specs.roofColor || '#0089b6'} side={THREE.DoubleSide} />
                   </mesh>
                 </group>
@@ -1588,16 +2197,16 @@ function Building3DModel({ specs, panelColors, setPanelColors }: { specs: Projec
 
           if (pos === 'Back' || pos === 'Front & Back' || pos === 'All Sides') {
             ancillaryElements.push(
-              <mesh receiveShadow key={`window_B_${i}`} position={[vx, wy, l]} rotation={[0, Math.PI, 0]}>
+              <mesh receiveShadow key={`window_B_${i}`} position={[vx, wy, l + 0.01]} rotation={[0, Math.PI, 0]}>
                 <boxGeometry args={[ww, wh, 0.1]} />
                 <meshStandardMaterial color="#87CEEB" roughness={0.1} metalness={0.8} />
               </mesh>
             );
             if (specs.hasCrimpedSheets !== false) {
               ancillaryElements.push(
-                <group key={`window_awning_B_${i}`} position={[vx, wy + wh / 2, l]}>
+                <group key={`window_awning_B_${i}`} position={[vx, wy + wh / 2, l + 0.01]}>
                   <mesh receiveShadow rotation={[0, 0, -Math.PI / 2]}>
-                    <cylinderGeometry args={[awningRadius, awningRadius, ww + 0.4, 32, 1, false, 3 * Math.PI / 4, Math.PI / 2]} />
+                    <cylinderGeometry args={[awningRadius, awningRadius, ww + 0.4, 32, 1, false, Math.PI / 2, Math.PI / 2]} />
                     <meshStandardMaterial color={specs.crimpedSheetsColor || specs.roofColor || '#0089b6'} side={THREE.DoubleSide} />
                   </mesh>
                 </group>
@@ -1612,10 +2221,23 @@ function Building3DModel({ specs, panelColors, setPanelColors }: { specs: Projec
   const structuralElements = [];
   const baySpacing = 6;
   const numFrames = Math.ceil(l / baySpacing) + 1;
-  const colMaterial = <meshStandardMaterial color="#1e293b" roughness={0.5} metalness={0.7} envMapIntensity={0.8} />;
-  const rafterMaterial = <meshStandardMaterial color="#334155" roughness={0.5} metalness={0.7} envMapIntensity={0.8} />;
-  const purlinMaterial = <meshStandardMaterial color="#475569" roughness={0.4} metalness={0.8} envMapIntensity={1.0} />;
-  const girtMaterial = <meshStandardMaterial color="#475569" roughness={0.3} metalness={0.9} envMapIntensity={1.2} />;
+  let colColor = "#1e293b";
+  let rafterColor = "#334155";
+  let purlinColor = "#475569";
+  let girtColor = "#475569";
+
+  if (weatherType === 'snow') {
+    rafterColor = "#ef4444"; // high downward compression stress (red)
+    purlinColor = "#f97316"; // high bending stress (orange)
+  } else if (weatherType === 'storm') {
+    rafterColor = "#06b6d4"; // high uplift tension stress (cyan)
+    purlinColor = "#0ea5e9"; // high suction shear (light blue)
+  }
+
+  const colMaterial = <meshStandardMaterial color={colColor} roughness={0.5} metalness={0.7} envMapIntensity={0.8} />;
+  const rafterMaterial = <meshStandardMaterial color={rafterColor} roughness={0.5} metalness={0.7} envMapIntensity={0.8} />;
+  const purlinMaterial = <meshStandardMaterial color={purlinColor} roughness={0.4} metalness={0.8} envMapIntensity={1.0} />;
+  const girtMaterial = <meshStandardMaterial color={girtColor} roughness={0.3} metalness={0.9} envMapIntensity={1.2} />;
 
   const renderBasePlate = (x: number, y: number, z: number, keyStr: string) => (
     <group key={keyStr} position={[x, y, z]}>
@@ -1693,7 +2315,372 @@ function Building3DModel({ specs, panelColors, setPanelColors }: { specs: Projec
         }
       }
       
-      if (specs.roofType === 'Single Slope') {
+      if (specs.frameType === 'Truss') {
+        const isSingle = specs.roofType === 'Single Slope';
+        const isCurved = specs.roofType === 'Curved';
+        const isMulti = specs.roofType === 'Multi-Sloped Hut';
+
+        // Proportion chord sizing and web profiles based on overall truss span w
+        const chordSize = Math.min(0.25, 0.15 + (w > 12 ? (w - 12) * 0.005 : 0));
+        const webWidth = chordSize * 0.4;
+        const webDepth = chordSize * 0.67;
+
+        // Mathematical helper to calculate the exact inner bottom Y of the top chord at any x-position
+        const getTopChordBottomY = (xVal: number) => {
+          if (isSingle) {
+            const totRoofH = w * (specs.roofSlope / 100);
+            const angle = Math.atan(totRoofH / w);
+            const rx = xVal; // x ranges from -w/2 to w/2
+            const slopeY = h + (rx - (-w/2)) * Math.tan(angle) + 0.1;
+            return slopeY - (chordSize / 2) / Math.cos(angle);
+          } else if (isCurved) {
+            const roofH = (w / 2) * (specs.roofSlope / 100) * 1.5;
+            const tVal = (xVal + w / 2) / w;
+            const curveY = h + 0.1 + 4 * roofH * tVal * (1 - tVal);
+            return curveY - chordSize * 0.53;
+          } else if (isMulti) {
+            const h_steep = (w / 4) * (specs.roofSlope * 1.5 / 100);
+            const h_shallow = (w / 4) * (specs.roofSlope * 0.5 / 100);
+            const a_steep = Math.atan(h_steep / (w / 4));
+            const a_shallow = Math.atan(h_shallow / (w / 4));
+            const absX = Math.abs(xVal);
+            let topChordCenterY = h + 0.1;
+            let activeAngle = 0;
+            if (absX >= w / 4) {
+              topChordCenterY = h + (w / 2 - absX) * Math.tan(a_steep) + 0.1;
+              activeAngle = a_steep;
+            } else {
+              topChordCenterY = h + h_steep + (w / 4 - absX) * Math.tan(a_shallow) + 0.1;
+              activeAngle = a_shallow;
+            }
+            return topChordCenterY - (chordSize / 2) / Math.cos(activeAngle);
+          } else {
+            // Standard Gable
+            const roofH = (w / 2) * (specs.roofSlope / 100);
+            const angle = Math.atan(roofH / (w / 2));
+            const absX = Math.abs(xVal);
+            const topChordCenterY = h + (w / 2 - absX) * Math.tan(angle) + 0.1;
+            return topChordCenterY - (chordSize / 2) / Math.cos(angle);
+          }
+        };
+
+        if (isSingle) {
+          const totRoofH = w * (specs.roofSlope / 100);
+          const rl = Math.sqrt(w * w + totRoofH * totRoofH);
+          const angle = Math.atan(totRoofH / w);
+
+          structuralElements.push(
+            <mesh receiveShadow key={`truss_top_${i}`} position={[0, h + totRoofH / 2 + 0.1, z]} rotation={[0, 0, angle]}>
+              <boxGeometry args={[rl, chordSize, chordSize]} />
+              {rafterMaterial}
+            </mesh>
+          );
+
+          structuralElements.push(
+            <mesh receiveShadow key={`truss_bot_${i}`} position={[0, h + chordSize / 2, z]}>
+              <boxGeometry args={[w, chordSize, chordSize]} />
+              {rafterMaterial}
+            </mesh>
+          );
+
+          const numWebs = Math.max(3, Math.round(w / 1.8));
+          const step = w / numWebs;
+          const bottomChordTopY = h + chordSize;
+
+          for (let j = 1; j < numWebs; j++) {
+            const x = -w / 2 + j * step;
+            const y_bottom = bottomChordTopY;
+            const y_top = getTopChordBottomY(x);
+            const v_length = y_top - y_bottom;
+            const v_y_pos = (y_bottom + y_top) / 2;
+
+            if (v_length > 0.05) {
+              structuralElements.push(
+                <mesh receiveShadow key={`truss_v_${j}_${i}`} position={[x, v_y_pos, z]}>
+                  <boxGeometry args={[webWidth, v_length, webDepth]} />
+                  {rafterMaterial}
+                </mesh>
+              );
+            }
+
+            // Diagonal
+            const nextX = -w / 2 + (j + 1) * step;
+            const y_top_next = getTopChordBottomY(nextX);
+            const dx = nextX - x;
+            const dy = y_top_next - y_bottom;
+            const diagL = Math.sqrt(dx * dx + dy * dy);
+            const diagAngle = Math.atan2(dy, dx);
+
+            structuralElements.push(
+              <mesh receiveShadow key={`truss_d_${j}_${i}`} position={[x + dx / 2, y_bottom + dy / 2, z]} rotation={[0, 0, diagAngle]}>
+                <boxGeometry args={[diagL, webWidth * 0.8, webDepth * 0.8]} />
+                {rafterMaterial}
+              </mesh>
+            );
+          }
+
+          // End Vertical
+          const xEnd = w / 2 - chordSize / 2;
+          const y_bottom_end = bottomChordTopY;
+          const y_top_end = getTopChordBottomY(xEnd);
+          const end_v_length = y_top_end - y_bottom_end;
+          const end_v_y_pos = (y_bottom_end + y_top_end) / 2;
+          if (end_v_length > 0.05) {
+            structuralElements.push(
+              <mesh receiveShadow key={`truss_vert_end_${i}`} position={[xEnd, end_v_y_pos, z]}>
+                <boxGeometry args={[webWidth * 1.2, end_v_length, webDepth * 1.2]} />
+                {rafterMaterial}
+              </mesh>
+            );
+          }
+        } else if (isCurved) {
+          const roofH = (w / 2) * (specs.roofSlope / 100) * 1.5;
+          const curvePath = new THREE.QuadraticBezierCurve3(
+            new THREE.Vector3(-w/2, h + 0.1, z),
+            new THREE.Vector3(0, h + roofH * 2 + 0.1, z),
+            new THREE.Vector3(w/2, h + 0.1, z)
+          );
+          const tubeGeo = new THREE.TubeGeometry(curvePath, 16, chordSize / 2, 8, false);
+
+          structuralElements.push(
+            <mesh receiveShadow key={`truss_curved_top_${i}`} geometry={tubeGeo}>
+              {rafterMaterial}
+            </mesh>
+          );
+
+          structuralElements.push(
+            <mesh receiveShadow key={`truss_curved_bot_${i}`} position={[0, h + chordSize / 2, z]}>
+              <boxGeometry args={[w, chordSize, chordSize]} />
+              {rafterMaterial}
+            </mesh>
+          );
+
+          const numWebs = Math.max(4, Math.round(w / 1.5));
+          const step = w / numWebs;
+          const bottomChordTopY = h + chordSize;
+
+          for (let j = 1; j < numWebs; j++) {
+            const t = j / numWebs;
+            const x = -w / 2 + t * w;
+            const y_bottom = bottomChordTopY;
+            const y_top = getTopChordBottomY(x);
+            const v_length = y_top - y_bottom;
+            const v_y_pos = (y_bottom + y_top) / 2;
+
+            if (v_length > 0.05) {
+              structuralElements.push(
+                <mesh receiveShadow key={`truss_curv_v_${j}_${i}`} position={[x, v_y_pos, z]}>
+                  <boxGeometry args={[webWidth, v_length, webDepth]} />
+                  {rafterMaterial}
+                </mesh>
+              );
+            }
+
+            if (j < numWebs - 1) {
+              const nextT = (j + 1) / numWebs;
+              const nextX = -w / 2 + nextT * w;
+              const y_top_next = getTopChordBottomY(nextX);
+              const dx = nextX - x;
+              const dy = y_top_next - y_bottom;
+              const diagL = Math.sqrt(dx * dx + dy * dy);
+              const diagAngle = Math.atan2(dy, dx);
+
+              structuralElements.push(
+                <mesh receiveShadow key={`truss_curv_d_${j}_${i}`} position={[x + dx / 2, y_bottom + dy / 2, z]} rotation={[0, 0, diagAngle]}>
+                  <boxGeometry args={[diagL, webWidth * 0.8, webDepth * 0.8]} />
+                  {rafterMaterial}
+                </mesh>
+              );
+            }
+          }
+        } else if (isMulti) {
+          const h_steep = (w / 4) * (specs.roofSlope * 1.5 / 100);
+          const h_shallow = (w / 4) * (specs.roofSlope * 0.5 / 100);
+          const rl_steep = Math.sqrt((w / 4) * (w / 4) + h_steep * h_steep);
+          const rl_shallow = Math.sqrt((w / 4) * (w / 4) + h_shallow * h_shallow);
+          const a_steep = Math.atan(h_steep / (w / 4));
+          const a_shallow = Math.atan(h_shallow / (w / 4));
+
+          structuralElements.push(
+            <mesh receiveShadow key={`truss_m1_${i}`} position={[-w * 0.375, h + h_steep / 2 + 0.1, z]} rotation={[0, 0, a_steep]}>
+              <boxGeometry args={[rl_steep, chordSize, chordSize]} />
+              {rafterMaterial}
+            </mesh>
+          );
+          structuralElements.push(
+            <mesh receiveShadow key={`truss_m2_${i}`} position={[-w * 0.125, h + h_steep + h_shallow / 2 + 0.1, z]} rotation={[0, 0, a_shallow]}>
+              <boxGeometry args={[rl_shallow, chordSize, chordSize]} />
+              {rafterMaterial}
+            </mesh>
+          );
+          structuralElements.push(
+            <mesh receiveShadow key={`truss_m3_${i}`} position={[w * 0.125, h + h_steep + h_shallow / 2 + 0.1, z]} rotation={[0, 0, -a_shallow]}>
+              <boxGeometry args={[rl_shallow, chordSize, chordSize]} />
+              {rafterMaterial}
+            </mesh>
+          );
+          structuralElements.push(
+            <mesh receiveShadow key={`truss_m4_${i}`} position={[w * 0.375, h + h_steep / 2 + 0.1, z]} rotation={[0, 0, -a_steep]}>
+              <boxGeometry args={[rl_steep, chordSize, chordSize]} />
+              {rafterMaterial}
+            </mesh>
+          );
+
+          structuralElements.push(
+            <mesh receiveShadow key={`truss_bot_m_${i}`} position={[0, h + chordSize / 2, z]}>
+              <boxGeometry args={[w, chordSize, chordSize]} />
+              {rafterMaterial}
+            </mesh>
+          );
+
+          const numPanelsHalf = Math.max(2, Math.round((w / 2) / 1.8));
+          const step = (w / 2) / numPanelsHalf;
+          const bottomChordTopY = h + chordSize;
+
+          // Verticals
+          for (let j = 1; j < 2 * numPanelsHalf; j++) {
+            const x = -w / 2 + j * step;
+            const y_bottom = bottomChordTopY;
+            const y_top = getTopChordBottomY(x);
+            const v_length = y_top - y_bottom;
+            const v_y_pos = (y_bottom + y_top) / 2;
+
+            if (v_length > 0.05) {
+              structuralElements.push(
+                <mesh receiveShadow key={`truss_m_v_${j}_${i}`} position={[x, v_y_pos, z]}>
+                  <boxGeometry args={[webWidth, v_length, webDepth]} />
+                  {rafterMaterial}
+                </mesh>
+              );
+            }
+          }
+
+          // Diagonals: Left half
+          for (let j = 0; j < numPanelsHalf; j++) {
+            const x_start = -w / 2 + j * step;
+            const x_end = -w / 2 + (j + 1) * step;
+            const y_start = bottomChordTopY;
+            const y_end = getTopChordBottomY(x_end);
+            const dx = x_end - x_start;
+            const dy = y_end - y_start;
+            const diagL = Math.sqrt(dx * dx + dy * dy);
+            const diagAngle = Math.atan2(dy, dx);
+
+            structuralElements.push(
+              <mesh receiveShadow key={`truss_m_d_l_${j}_${i}`} position={[x_start + dx / 2, y_start + dy / 2, z]} rotation={[0, 0, diagAngle]}>
+                <boxGeometry args={[diagL, webWidth * 0.8, webDepth * 0.8]} />
+                {rafterMaterial}
+              </mesh>
+            );
+          }
+
+          // Diagonals: Right half
+          for (let j = numPanelsHalf; j < 2 * numPanelsHalf; j++) {
+            const x_start = -w / 2 + (j + 1) * step;
+            const x_end = -w / 2 + j * step;
+            const y_start = bottomChordTopY;
+            const y_end = getTopChordBottomY(x_end);
+            const dx = x_end - x_start;
+            const dy = y_end - y_start;
+            const diagL = Math.sqrt(dx * dx + dy * dy);
+            const diagAngle = Math.atan2(dy, dx);
+
+            structuralElements.push(
+              <mesh receiveShadow key={`truss_m_d_r_${j}_${i}`} position={[x_start + dx / 2, y_start + dy / 2, z]} rotation={[0, 0, diagAngle]}>
+                <boxGeometry args={[diagL, webWidth * 0.8, webDepth * 0.8]} />
+                {rafterMaterial}
+              </mesh>
+            );
+          }
+        } else {
+          // Standard Gable Truss (Fink / Howe Pratt-Optimized Design)
+          const roofH = (w / 2) * (specs.roofSlope / 100);
+          const rl = Math.sqrt((w / 2) * (w / 2) + roofH * roofH);
+          const angle = Math.atan(roofH / (w / 2));
+
+          // Top Chords
+          structuralElements.push(
+            <mesh receiveShadow key={`truss_topL_${i}`} position={[-w / 4, h + roofH / 2 + 0.1, z]} rotation={[0, 0, angle]}>
+              <boxGeometry args={[rl, chordSize, chordSize]} />
+              {rafterMaterial}
+            </mesh>
+          );
+          structuralElements.push(
+            <mesh receiveShadow key={`truss_topR_${i}`} position={[w / 4, h + roofH / 2 + 0.1, z]} rotation={[0, 0, -angle]}>
+              <boxGeometry args={[rl, chordSize, chordSize]} />
+              {rafterMaterial}
+            </mesh>
+          );
+
+          // Bottom Chord
+          structuralElements.push(
+            <mesh receiveShadow key={`truss_botG_${i}`} position={[0, h + chordSize / 2, z]}>
+              <boxGeometry args={[w, chordSize, chordSize]} />
+              {rafterMaterial}
+            </mesh>
+          );
+
+          const numPanelsHalf = Math.max(2, Math.round((w / 2) / 1.8));
+          const step = (w / 2) / numPanelsHalf;
+          const bottomChordTopY = h + chordSize;
+
+          // Verticals
+          for (let j = 1; j < 2 * numPanelsHalf; j++) {
+            const x = -w / 2 + j * step;
+            const y_bottom = bottomChordTopY;
+            const y_top = getTopChordBottomY(x);
+            const v_length = y_top - y_bottom;
+            const v_y_pos = (y_bottom + y_top) / 2;
+
+            if (v_length > 0.05) {
+              structuralElements.push(
+                <mesh receiveShadow key={`truss_v_${j}_${i}`} position={[x, v_y_pos, z]}>
+                  <boxGeometry args={[webWidth, v_length, webDepth]} />
+                  {rafterMaterial}
+                </mesh>
+              );
+            }
+          }
+
+          // Diagonals: Left half
+          for (let j = 0; j < numPanelsHalf; j++) {
+            const x_start = -w / 2 + j * step;
+            const x_end = -w / 2 + (j + 1) * step;
+            const y_start = bottomChordTopY;
+            const y_end = getTopChordBottomY(x_end);
+            const dx = x_end - x_start;
+            const dy = y_end - y_start;
+            const diagL = Math.sqrt(dx * dx + dy * dy);
+            const diagAngle = Math.atan2(dy, dx);
+
+            structuralElements.push(
+              <mesh receiveShadow key={`truss_diagL_${j}_${i}`} position={[x_start + dx / 2, y_start + dy / 2, z]} rotation={[0, 0, diagAngle]}>
+                <boxGeometry args={[diagL, webWidth * 0.8, webDepth * 0.8]} />
+                {rafterMaterial}
+              </mesh>
+            );
+          }
+
+          // Diagonals: Right half
+          for (let j = numPanelsHalf; j < 2 * numPanelsHalf; j++) {
+            const x_start = -w / 2 + (j + 1) * step;
+            const x_end = -w / 2 + j * step;
+            const y_start = bottomChordTopY;
+            const y_end = getTopChordBottomY(x_end);
+            const dx = x_end - x_start;
+            const dy = y_end - y_start;
+            const diagL = Math.sqrt(dx * dx + dy * dy);
+            const diagAngle = Math.atan2(dy, dx);
+
+            structuralElements.push(
+              <mesh receiveShadow key={`truss_diagR_${j}_${i}`} position={[x_start + dx / 2, y_start + dy / 2, z]} rotation={[0, 0, diagAngle]}>
+                <boxGeometry args={[diagL, webWidth * 0.8, webDepth * 0.8]} />
+                {rafterMaterial}
+              </mesh>
+            );
+          }
+        }
+      } else if (specs.roofType === 'Single Slope') {
         const totRoofH = w * (specs.roofSlope / 100);
         const rl = Math.sqrt(w * w + totRoofH * totRoofH);
         const angle = Math.atan(totRoofH / w);
@@ -1769,33 +2756,92 @@ function Building3DModel({ specs, panelColors, setPanelColors }: { specs: Projec
   }
 
   if (specs.hasSecondarySteel !== false) {
+    const isTruss = specs.frameType === 'Truss';
+    let purlinYOffset = 0.5;
+    let cleatYOffset = 0.425;
+
+    if (isTruss) {
+      if (specs.roofType === 'Curved') {
+        purlinYOffset = 0.255;
+        cleatYOffset = 0.18;
+      } else if (specs.roofType === 'Multi-Sloped Hut') {
+        purlinYOffset = 0.235;
+        cleatYOffset = 0.16;
+      } else {
+        // Standard Gable and Single Slope
+        purlinYOffset = 0.25;
+        cleatYOffset = 0.175;
+      }
+    } else {
+      if (specs.roofType === 'Curved') {
+        purlinYOffset = 0.325;
+        cleatYOffset = 0.25;
+      } else {
+        purlinYOffset = 0.5;
+        cleatYOffset = 0.425;
+      }
+    }
+
     const addPurlinWithCleats = (px: number, py: number, angle: number, keyStr: string) => {
+      // 1. Purlin Beam aligned with slope
       structuralElements.push(
-        <mesh receiveShadow key={keyStr} position={[px, py + 0.5, l/2]}>
-          <boxGeometry args={[0.15, 0.15, l]} />
-          {purlinMaterial}
-        </mesh>
+        <group key={`${keyStr}_purlin_grp`} position={[px, py, l/2]} rotation={[0, 0, angle]}>
+          <mesh receiveShadow key={keyStr} position={[0, purlinYOffset, 0]}>
+            <boxGeometry args={[0.15, 0.15, l]} />
+            {purlinMaterial}
+          </mesh>
+        </group>
       );
+
+      // 2. Cleats aligned with slope
+      const cleatOffsetX = px > 0 ? -0.05 : 0.05;
       for (let i = 0; i < numFrames; i++) {
         let z = (i / (numFrames - 1)) * l;
         if (i === 0) z = 0.35;
         else if (i === numFrames - 1) z = l - 0.35;
         structuralElements.push(
-          <group key={`${keyStr}_cleat_grp_${i}`} position={[px + (px > 0 ? -0.05 : 0.05), py + 0.425, z]} rotation={[0, 0, angle]}>
-            <mesh receiveShadow>
-               <boxGeometry args={[0.02, 0.15, 0.15]} />
-               <meshStandardMaterial color="#94a3b8" roughness={0.6} metalness={0.8} />
-            </mesh>
-            <mesh position={[0, -0.03, -0.04]} rotation={[0, 0, Math.PI / 2]}>
-               <cylinderGeometry args={[0.012, 0.012, 0.06]} />
-               <meshStandardMaterial color="#1e293b" metalness={0.9} roughness={0.5} />
-            </mesh>
-            <mesh position={[0, -0.03, 0.04]} rotation={[0, 0, Math.PI / 2]}>
-               <cylinderGeometry args={[0.012, 0.012, 0.06]} />
-               <meshStandardMaterial color="#1e293b" metalness={0.9} roughness={0.5} />
-            </mesh>
+          <group key={`${keyStr}_cleat_grp_${i}`} position={[px, py, z]} rotation={[0, 0, angle]}>
+            <group position={[cleatOffsetX, cleatYOffset, 0]}>
+              <mesh receiveShadow>
+                 <boxGeometry args={[0.02, 0.15, 0.15]} />
+                 <meshStandardMaterial color="#94a3b8" roughness={0.6} metalness={0.8} />
+              </mesh>
+              <mesh position={[0, -0.03, -0.04]} rotation={[0, 0, Math.PI / 2]}>
+                 <cylinderGeometry args={[0.012, 0.012, 0.06]} />
+                 <meshStandardMaterial color="#1e293b" metalness={0.9} roughness={0.5} />
+              </mesh>
+              <mesh position={[0, -0.03, 0.04]} rotation={[0, 0, Math.PI / 2]}>
+                 <cylinderGeometry args={[0.012, 0.012, 0.06]} />
+                 <meshStandardMaterial color="#1e293b" metalness={0.9} roughness={0.5} />
+              </mesh>
+            </group>
           </group>
         );
+      }
+
+      // 3. SDScrews (Roof) aligned with slope
+      if (specs.hasSDScrews !== false && specs.hasRoof !== false) {
+        const hasCaps = specs.hasPVCCaps !== false;
+        const r = hasCaps ? 0.015 : 0.0075;
+        const d = hasCaps ? 0.01 : 0.005;
+        const sdMat = hasCaps ? (
+          <meshStandardMaterial color={specs.pvcCapColor || "#383e42"} roughness={0.8} />
+        ) : (
+          <meshStandardMaterial color="#cbd5e1" roughness={0.2} metalness={0.9} />
+        );
+        const screwYOffset = purlinYOffset + 0.275 + d/2;
+        const stepZ = 0.33; // Approx pitch distance along panels
+
+        for (let pz = stepZ; pz <= l; pz += stepZ) {
+          ancillaryElements.push(
+            <group key={`${keyStr}_screw_grp_${pz}`} position={[px, py, pz]} rotation={[0, 0, angle]}>
+              <mesh receiveShadow position={[0, screwYOffset, 0]}>
+                <cylinderGeometry args={[r, r, d, 8]} />
+                {sdMat}
+              </mesh>
+            </group>
+          );
+        }
       }
     };
     const purlinSpacing = specs.highWindVelocity || specs.snowLoad ? 1.0 : 1.5;
@@ -1839,13 +2885,13 @@ function Building3DModel({ specs, panelColors, setPanelColors }: { specs: Projec
         for (let p = 0; p < runsSteep; p++) {
           const px = side * (w/2 - (w/4 * (p / runsSteep)));
           const py = h + (h_steep * (p / runsSteep));
-          addPurlinWithCleats(px, py, side * a_steep, `purlin_steep_${side}_${p}`);
+          addPurlinWithCleats(px, py, side * -a_steep, `purlin_steep_${side}_${p}`);
         }
         // Shallow portion purlins
         for (let p = 0; p < runsShallow; p++) {
           const px = side * (w/4 - (w/4 * (p / runsShallow)));
           const py = h + h_steep + (h_shallow * (p / runsShallow));
-          addPurlinWithCleats(px, py, side * a_shallow, `purlin_shallow_${side}_${p}`);
+          addPurlinWithCleats(px, py, side * -a_shallow, `purlin_shallow_${side}_${p}`);
         }
       }
       addPurlinWithCleats(0, h + h_steep + h_shallow, 0, `purlin_ridge`);
@@ -2024,7 +3070,7 @@ function Building3DModel({ specs, panelColors, setPanelColors }: { specs: Projec
     
     // Roof Screws Geometry
     const sdGeoRoofL = new THREE.CylinderGeometry(r, r, d, 8);
-    const roofAngle = specs.roofType === 'Single Slope' ? Math.atan(specs.roofSlope / 100) : Math.atan((w/2 * specs.roofSlope/100) / (w/2));
+    const roofAngle = Math.atan((specs.roofSlope || 0) / 100);
     sdGeoRoofL.rotateZ(-roofAngle);
     
     const sdGeoRoofR = new THREE.CylinderGeometry(r, r, d, 8);
@@ -2120,45 +3166,7 @@ function Building3DModel({ specs, panelColors, setPanelColors }: { specs: Projec
       }
     }
 
-    // Roof
-    if (specs.hasRoof !== false) {
-      const purlinSpacing = specs.highWindVelocity || specs.snowLoad ? 1.0 : 1.5;
-      const roofSpan = specs.roofType === 'Single Slope' ? w : w/2;
-      const tRuns = Math.max(1, Math.round(roofSpan / purlinSpacing));
-      
-      for (let p = 0; p <= tRuns; p++) {
-        // Left side or full for Single Slope
-        const pxL = -w/2 + (roofSpan * (p / tRuns));
-        const pyL = h + (pxL - (-w/2)) * Math.tan(roofAngle) + 0.72 + (0.1 * Math.tan(roofAngle));
-        
-        if (specs.roofType === 'Single Slope' || pxL <= 0) {
-          for (let pz = stepZ; pz <= l; pz += stepZ) {
-            sdElements.push(
-              <mesh receiveShadow key={`sd_Roof_L_${p}_${pz}`} position={[pxL, pyL, pz]}>
-                <primitive object={sdGeoRoofL} />
-                {sdMat}
-              </mesh>
-            );
-          }
-        }
-        
-        // Right side for double slope
-        if (specs.roofType !== 'Single Slope') {
-          const pxR = (w/2) - ((w/2) * (p / tRuns));
-          const pyR = h + (w/2 - pxR) * Math.tan(roofAngle) + 0.72 + (0.1 * Math.tan(roofAngle));
-          if (pxR >= 0) {
-            for (let pz = stepZ; pz <= l; pz += stepZ) {
-              sdElements.push(
-                <mesh receiveShadow key={`sd_Roof_R_${p}_${pz}`} position={[pxR, pyR, pz]}>
-                  <primitive object={sdGeoRoofR} />
-                  {sdMat}
-                </mesh>
-              );
-            }
-          }
-        }
-      }
-    }
+
     
     ancillaryElements.push(<group key="sd_screws_group">{sdElements}</group>);
   }
@@ -2219,16 +3227,16 @@ function Building3DModel({ specs, panelColors, setPanelColors }: { specs: Projec
         );
       })()}\n\n      {/* Wall Sheets */}
 
-      {renderWallSheets()}
+      {!framingOnly && renderWallSheets()}
 
       {/* Roof Panels */}
-      {specs.hasRoof !== false && roofPanels}
+      {!framingOnly && specs.hasRoof !== false && roofPanels}
       
       {/* Structural Elements */}
       {structuralElements}
 
       {/* Ancillary Elements */}
-      {ancillaryElements}
+      {!framingOnly && ancillaryElements}
     </group>
   );
 }
@@ -2243,10 +3251,14 @@ function UpdateBounds({ specs }: { specs: ProjectSpecs }) {
   return null;
 }
 
-function Building3DVisualizer({ specs, dimensionUnit, panelColors, setPanelColors }: { specs: ProjectSpecs, dimensionUnit: 'm' | 'ft', panelColors: Record<string, string>, setPanelColors: React.Dispatch<React.SetStateAction<Record<string, string>>> }) {
+function Building3DVisualizer({ specs, dimensionUnit, panelColors, setPanelColors, framingOnly = false, weatherType = 'clear' }: { specs: ProjectSpecs, dimensionUnit: 'm' | 'ft', panelColors: Record<string, string>, setPanelColors: React.Dispatch<React.SetStateAction<Record<string, string>>>, framingOnly?: boolean, weatherType?: string }) {
   const [isInside, setIsInside] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    rainSynthesizer.setInside(isInside);
+  }, [isInside]);
 
   const toggleFullscreen = () => {
     if (!document.fullscreenElement) {
@@ -2366,21 +3378,25 @@ function Building3DVisualizer({ specs, dimensionUnit, panelColors, setPanelColor
 
       <Canvas id="peb-3d-canvas" shadows gl={{ preserveDrawingBuffer: true }} camera={{ position: [specs.width * 1.5, specs.eaveHeight * 2, specs.length * 1.5], fov: 45 }}>
         <CameraManager isInside={isInside} specs={specs} />
-        <ambientLight intensity={isInside ? 0.8 : 0.7} />
+        <ambientLight intensity={weatherType === 'storm' ? 0.3 : (weatherType === 'rain' ? 0.5 : (isInside ? 0.8 : 0.7))} />
         {isInside && <pointLight position={[0, specs.eaveHeight / 2, specs.length / 2]} intensity={2.0} distance={Math.max(specs.width, specs.length) * 2} decay={1.5} />}
-        <directionalLight position={[20, 30, 20]} intensity={1.2} castShadow shadow-bias={-0.0005} shadow-mapSize={[2048, 2048]}>
+        <directionalLight position={[20, 30, 20]} intensity={weatherType === 'storm' ? 0.4 : (weatherType === 'rain' ? 0.6 : 1.2)} castShadow shadow-bias={-0.0005} shadow-mapSize={[2048, 2048]}>
           <orthographicCamera attach="shadow-camera" args={[-Math.max(specs.width, specs.length, 20), Math.max(specs.width, specs.length, 20), Math.max(specs.width, specs.length, 20), -Math.max(specs.width, specs.length, 20), 0.1, 100]} />
         </directionalLight>
-        <directionalLight position={[-10, 10, -10]} intensity={0.5} />
-        <Environment preset="city" environmentIntensity={1.0} />
+        <directionalLight position={[-10, 10, -10]} intensity={weatherType === 'storm' ? 0.2 : (weatherType === 'rain' ? 0.3 : 0.5)} />
+        <Environment preset={weatherType === 'storm' || weatherType === 'rain' ? "night" : "city"} environmentIntensity={weatherType === 'storm' ? 0.3 : (weatherType === 'rain' ? 0.5 : 1.0)} />
+
+        {weatherType === 'storm' && <LightningController />}
+        <WeatherEffects weatherType={weatherType} specs={specs} />
+        {!isInside && <ForceVectorArrows weatherType={weatherType} specs={specs} />}
 
         {!isInside ? (
           <Bounds margin={1.2}>
             <UpdateBounds specs={specs} />
-            <Building3DModel specs={specs} panelColors={panelColors} setPanelColors={setPanelColors} />
+            <Building3DModel specs={specs} panelColors={panelColors} setPanelColors={setPanelColors} framingOnly={framingOnly} weatherType={weatherType} />
           </Bounds>
         ) : (
-          <Building3DModel specs={specs} panelColors={panelColors} setPanelColors={setPanelColors} />
+          <Building3DModel specs={specs} panelColors={panelColors} setPanelColors={setPanelColors} framingOnly={framingOnly} weatherType={weatherType} />
         )}
 
         {/* Precision Guidelines / Dimensions */}
@@ -2422,7 +3438,296 @@ function Building3DVisualizer({ specs, dimensionUnit, panelColors, setPanelColor
   );
 }
 
-function BuildingVisualizer({ specs, dimensionUnit }: { specs: ProjectSpecs, dimensionUnit: 'm' | 'ft' }) {
+function TrussForceAnalyzer({ specs, dimensionUnit }: { specs: ProjectSpecs; dimensionUnit: string }) {
+  const [pointLoad, setPointLoad] = useState<number>(50); // in kN
+  const [selectedMember, setSelectedMember] = useState<string>('top_chord');
+
+  const width = specs.width;
+  const slopePercent = specs.roofSlope;
+  const roofH = (width / 2) * (slopePercent / 100);
+  const theta = Math.atan(roofH / (width / 2)); // angle in radians
+  const thetaDeg = (theta * 180) / Math.PI;
+
+  // Calculatings
+  const sinTheta = Math.sin(theta);
+  const cosTheta = Math.cos(theta);
+  const tanTheta = Math.tan(theta);
+
+  // Top Chord Compression force (kN)
+  // C = P / (2 * sin(theta))
+  const topChordForce = sinTheta > 0 ? -pointLoad / (2 * sinTheta) : 0;
+
+  // Bottom Chord Tension force (kN)
+  // T = P / (2 * tan(theta))
+  const bottomChordForce = tanTheta > 0 ? pointLoad / (2 * tanTheta) : 0;
+
+  // King Post Force
+  const kingPostForce = pointLoad * 0.5;
+
+  // Diagonal Struts force
+  const diagonalForce = sinTheta > 0 ? -pointLoad * 0.35 / sinTheta : 0;
+
+  const memberData: { [key: string]: { name: string; type: 'Compression' | 'Tension' | 'Mixed'; force: number; description: string; formula: string } } = {
+    top_chord: {
+      name: "Top Chord (Rafters)",
+      type: "Compression",
+      force: topChordForce,
+      formula: "-P / (2 * sin(θ))",
+      description: "Carries the major compressive loads directed downwards along the roof slope. Channels forces from the peak and intermediate purlins directly into the heels/bearing points.",
+    },
+    bottom_chord: {
+      name: "Bottom Chord (Tie Runner)",
+      type: "Tension",
+      force: bottomChordForce,
+      formula: "P / (2 * tan(θ))",
+      description: "Acts as a primary tension tie, preventing the outward thrust of the sloping rafters. Keeps the vertical support columns from bowing outward.",
+    },
+    king_post: {
+      name: "King Post (Central Strut)",
+      type: "Tension",
+      force: kingPostForce,
+      formula: "P * 0.5",
+      description: "A vertical member supporting the center of the bottom chord, preventing it from sagging under its own weight or carrying suspended loads.",
+    },
+    diagonals: {
+      name: "Web Diagonals (Struts)",
+      type: "Compression",
+      force: diagonalForce,
+      formula: "-0.35 * P / sin(θ)",
+      description: "Triangular brace elements transferring intermediate shear forces between the top and bottom chords, preventing rafter bending.",
+    },
+  };
+
+  return (
+    <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-6 flex flex-col gap-6">
+      <div className="flex flex-col md:flex-row justify-between items-start md:items-center border-b border-slate-100 pb-4 gap-4">
+        <div>
+          <h3 className="font-bold text-slate-800 text-lg flex items-center gap-2">
+            <Activity className="w-5 h-5 text-indigo-500 animate-pulse" />
+            Truss Axial Forces & Stress Analyzer
+          </h3>
+          <p className="text-xs text-slate-500 mt-1">
+            Visualizing tensile and compressive forces distributed through triangular structural units (Howe / Fink truss design).
+          </p>
+        </div>
+        <div className="flex items-center gap-2 bg-indigo-50 px-3 py-1.5 rounded-lg text-indigo-700 text-xs font-semibold">
+          Roof Pitch: {thetaDeg.toFixed(1)}° ({slopePercent}% slope)
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
+        {/* Truss stress visualization SVG */}
+        <div className="lg:col-span-7 flex flex-col items-center justify-center bg-slate-50 rounded-xl p-4 border border-slate-100 relative min-h-[220px]">
+          <span className="absolute top-3 left-3 text-[10px] font-bold text-slate-400 uppercase tracking-wider">Stress Diagram</span>
+          
+          <svg viewBox="0 0 400 180" className="w-full max-h-52">
+            {/* Legend inside SVG */}
+            <g transform="translate(15, 15)">
+              <rect x="0" y="0" width="10" height="4" fill="#ef4444" />
+              <text x="14" y="5" fontSize="8" className="fill-slate-500 font-medium">Compression (Red)</text>
+              <rect x="0" y="10" width="10" height="4" fill="#3b82f6" />
+              <text x="14" y="15" fontSize="8" className="fill-slate-500 font-medium">Tension (Blue)</text>
+            </g>
+
+            {/* Support Columns */}
+            <line x1="50" y1="130" x2="50" y2="160" stroke="#94a3b8" strokeWidth="4" />
+            <line x1="350" y1="130" x2="350" y2="160" stroke="#94a3b8" strokeWidth="4" />
+
+            {/* Truss Bottom Chord */}
+            <line 
+              x1="50" y1="130" x2="350" y2="130" 
+              className="cursor-pointer transition-all hover:stroke-indigo-600" 
+              stroke={selectedMember === 'bottom_chord' ? '#4f46e5' : '#3b82f6'} 
+              strokeWidth={selectedMember === 'bottom_chord' ? '5' : '3.5'} 
+              onClick={() => setSelectedMember('bottom_chord')}
+            />
+
+            {/* Left Top Chord */}
+            <line 
+              x1="50" y1="130" x2="200" y2="50" 
+              className="cursor-pointer transition-all hover:stroke-indigo-600" 
+              stroke={selectedMember === 'top_chord' ? '#4f46e5' : '#ef4444'} 
+              strokeWidth={selectedMember === 'top_chord' ? '5' : '3.5'} 
+              onClick={() => setSelectedMember('top_chord')}
+            />
+
+            {/* Right Top Chord */}
+            <line 
+              x1="200" y1="50" x2="350" y2="130" 
+              className="cursor-pointer transition-all hover:stroke-indigo-600" 
+              stroke={selectedMember === 'top_chord' ? '#4f46e5' : '#ef4444'} 
+              strokeWidth={selectedMember === 'top_chord' ? '5' : '3.5'} 
+              onClick={() => setSelectedMember('top_chord')}
+            />
+
+            {/* King Post (vertical center) */}
+            <line 
+              x1="200" y1="130" x2="200" y2="50" 
+              className="cursor-pointer transition-all hover:stroke-indigo-600" 
+              stroke={selectedMember === 'king_post' ? '#4f46e5' : '#3b82f6'} 
+              strokeWidth={selectedMember === 'king_post' ? '4' : '2.5'} 
+              onClick={() => setSelectedMember('king_post')}
+            />
+
+            {/* Left Diagonals */}
+            <line 
+              x1="125" y1="130" x2="200" y2="50" 
+              className="cursor-pointer transition-all hover:stroke-indigo-600" 
+              stroke={selectedMember === 'diagonals' ? '#4f46e5' : '#ef4444'} 
+              strokeWidth={selectedMember === 'diagonals' ? '3.5' : '2'} 
+              onClick={() => setSelectedMember('diagonals')}
+            />
+            <line 
+              x1="125" y1="130" x2="125" y2="90" 
+              className="cursor-pointer transition-all hover:stroke-indigo-600" 
+              stroke={selectedMember === 'diagonals' ? '#4f46e5' : '#ef4444'} 
+              strokeWidth={selectedMember === 'diagonals' ? '3.5' : '2'} 
+              onClick={() => setSelectedMember('diagonals')}
+            />
+
+            {/* Right Diagonals */}
+            <line 
+              x1="275" y1="130" x2="200" y2="50" 
+              className="cursor-pointer transition-all hover:stroke-indigo-600" 
+              stroke={selectedMember === 'diagonals' ? '#4f46e5' : '#ef4444'} 
+              strokeWidth={selectedMember === 'diagonals' ? '3.5' : '2'} 
+              onClick={() => setSelectedMember('diagonals')}
+            />
+            <line 
+              x1="275" y1="130" x2="275" y2="90" 
+              className="cursor-pointer transition-all hover:stroke-indigo-600" 
+              stroke={selectedMember === 'diagonals' ? '#4f46e5' : '#ef4444'} 
+              strokeWidth={selectedMember === 'diagonals' ? '3.5' : '2'} 
+              onClick={() => setSelectedMember('diagonals')}
+            />
+
+            {/* Peak Applied Load Arrow */}
+            <line x1="200" y1="15" x2="200" y2="40" stroke="#dc2626" strokeWidth="2.5" />
+            <polygon points="196,40 204,40 200,46" fill="#dc2626" />
+            <text x="210" y="30" fill="#dc2626" fontSize="10" fontWeight="bold">P = {pointLoad} kN</text>
+
+            {/* Reactions */}
+            <polygon points="46,160 54,160 50,154" fill="#16a34a" />
+            <text x="35" y="172" fill="#16a34a" fontSize="8" fontWeight="bold">R = {(pointLoad / 2).toFixed(1)} kN</text>
+            <polygon points="346,160 354,160 350,154" fill="#16a34a" />
+            <text x="335" y="172" fill="#16a34a" fontSize="8" fontWeight="bold">R = {(pointLoad / 2).toFixed(1)} kN</text>
+
+            {/* Node markers */}
+            <circle cx="50" cy="130" r="3" fill="#cbd5e1" stroke="#475569" strokeWidth="1" />
+            <circle cx="350" cy="130" r="3" fill="#cbd5e1" stroke="#475569" strokeWidth="1" />
+            <circle cx="200" cy="50" r="3.5" fill="#cbd5e1" stroke="#475569" strokeWidth="1" />
+            <circle cx="200" cy="130" r="3" fill="#cbd5e1" stroke="#475569" strokeWidth="1" />
+            <circle cx="125" cy="130" r="3" fill="#cbd5e1" stroke="#475569" strokeWidth="1" />
+            <circle cx="275" cy="130" r="3" fill="#cbd5e1" stroke="#475569" strokeWidth="1" />
+
+            {/* Text labels on diagram matching user upload */}
+            <text x="200" y="145" fill="#475569" fontSize="8" textAnchor="middle" fontWeight="bold">Bottom Chord</text>
+            <text x="95" y="80" fill="#475569" fontSize="8" textAnchor="middle" fontWeight="bold" transform="rotate(-28, 95, 80)">Top Chord</text>
+            <text x="305" y="80" fill="#475569" fontSize="8" textAnchor="middle" fontWeight="bold" transform="rotate(28, 305, 80)">Top Chord</text>
+            <text x="175" y="105" fill="#475569" fontSize="7" textAnchor="end">King Post</text>
+            <text x="50" y="122" fill="#475569" fontSize="7" textAnchor="middle" fontWeight="bold">Heel</text>
+            <text x="350" y="122" fill="#475569" fontSize="7" textAnchor="middle" fontWeight="bold">Heel</text>
+            <text x="200" y="62" fill="#475569" fontSize="7" textAnchor="middle" fontWeight="bold">Peak</text>
+          </svg>
+
+          <p className="text-[10px] text-slate-400 mt-2 text-center">
+            💡 Click on any truss member above to view its axial stress, formulas, and structural behavior.
+          </p>
+        </div>
+
+        {/* Applied load slider & member description */}
+        <div className="lg:col-span-5 flex flex-col justify-between gap-4">
+          <div className="bg-slate-50 rounded-xl p-4 border border-slate-100">
+            <label className="text-xs font-bold text-slate-600 uppercase tracking-wider block mb-2">
+              Peak Point Load (P): <span className="font-mono text-indigo-600 text-sm">{pointLoad} kN</span>
+            </label>
+            <input 
+              type="range" 
+              min="10" 
+              max="200" 
+              step="5" 
+              value={pointLoad} 
+              onChange={(e) => setPointLoad(Number(e.target.value))} 
+              className="w-full accent-indigo-600 cursor-pointer"
+            />
+            <div className="flex justify-between text-[10px] text-slate-400 mt-1 font-mono">
+              <span>10 kN (Light load)</span>
+              <span>200 kN (High load)</span>
+            </div>
+          </div>
+
+          {/* Selected Member Detail Card */}
+          <div className="border border-indigo-100 rounded-xl bg-indigo-50/40 p-4 flex flex-col gap-3">
+            <div className="flex justify-between items-center">
+              <span className="text-xs font-bold text-indigo-700 uppercase tracking-wider">Active Element Details</span>
+              <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold uppercase ${
+                memberData[selectedMember].type === 'Compression' ? 'bg-red-100 text-red-700' : 'bg-blue-100 text-blue-700'
+              }`}>
+                {memberData[selectedMember].type}
+              </span>
+            </div>
+            
+            <div>
+              <h4 className="font-bold text-slate-800 text-base">{memberData[selectedMember].name}</h4>
+              <p className="text-xs text-slate-600 mt-1 leading-relaxed">
+                {memberData[selectedMember].description}
+              </p>
+            </div>
+
+            <div className="grid grid-cols-2 gap-3 mt-1 pt-3 border-t border-indigo-100/60">
+              <div>
+                <span className="text-[10px] text-slate-400 font-bold uppercase block">Formula (Longitudinal)</span>
+                <code className="text-xs font-mono font-bold text-indigo-600">{memberData[selectedMember].formula}</code>
+              </div>
+              <div>
+                <span className="text-[10px] text-slate-400 font-bold uppercase block">Calculated Stress Force</span>
+                <span className={`text-sm font-bold font-mono ${
+                  memberData[selectedMember].type === 'Compression' ? 'text-red-600' : 'text-blue-600'
+                }`}>
+                  {memberData[selectedMember].force.toFixed(1)} kN
+                </span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Anatomy checklist representing the user uploaded diagram */}
+      <div className="bg-slate-50 rounded-xl p-4 border border-slate-200/60 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mt-2">
+        <div className="flex items-start gap-2.5">
+          <div className="w-5 h-5 rounded-full bg-indigo-100 flex items-center justify-center text-[10px] font-bold text-indigo-700 mt-0.5 flex-shrink-0">1</div>
+          <div>
+            <h5 className="font-bold text-xs text-slate-800">Heel (Support Pivot)</h5>
+            <p className="text-[10px] text-slate-500 mt-0.5">The point where the top and bottom chords meet directly above the support column.</p>
+          </div>
+        </div>
+        <div className="flex items-start gap-2.5">
+          <div className="w-5 h-5 rounded-full bg-indigo-100 flex items-center justify-center text-[10px] font-bold text-indigo-700 mt-0.5 flex-shrink-0">2</div>
+          <div>
+            <h5 className="font-bold text-xs text-slate-800">Truss Plates (Joint Connectors)</h5>
+            <p className="text-[10px] text-slate-500 mt-0.5">Serrated galvanized steel plates pressed into timber/steel joints to transfer stress lines.</p>
+          </div>
+        </div>
+        <div className="flex items-start gap-2.5">
+          <div className="w-5 h-5 rounded-full bg-indigo-100 flex items-center justify-center text-[10px] font-bold text-indigo-700 mt-0.5 flex-shrink-0">3</div>
+          <div>
+            <h5 className="font-bold text-xs text-slate-800">Panel Points</h5>
+            <p className="text-[10px] text-slate-500 mt-0.5">Points where web struts intersect chords, forming structural hinge points.</p>
+          </div>
+        </div>
+        <div className="flex items-start gap-2.5">
+          <div className="w-5 h-5 rounded-full bg-indigo-100 flex items-center justify-center text-[10px] font-bold text-indigo-700 mt-0.5 flex-shrink-0">4</div>
+          <div>
+            <h5 className="font-bold text-xs text-slate-800">Longitudinal Chords</h5>
+            <p className="text-[10px] text-slate-500 mt-0.5">Elements along the outer boundaries (top/bottom) resisting global bending moment.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function BuildingVisualizer({ specs, dimensionUnit, view = 'front' }: { specs: ProjectSpecs, dimensionUnit: 'm' | 'ft', view?: 'front' | 'side' | 'top' }) {
   const svgRef = useRef<SVGSVGElement>(null);
 
   const handleShare = async () => {
@@ -2430,19 +3735,19 @@ function BuildingVisualizer({ specs, dimensionUnit }: { specs: ProjectSpecs, dim
     try {
       const svgData = new XMLSerializer().serializeToString(svgRef.current);
       const blob = new Blob([svgData], { type: "image/svg+xml;charset=utf-8" });
-      const file = new File([blob], 'structure-visualization.svg', { type: 'image/svg+xml' });
+      const file = new File([blob], `structure-visualization-${view}.svg`, { type: 'image/svg+xml' });
       
       if (navigator.canShare && navigator.canShare({ files: [file] })) {
         await navigator.share({
-          title: 'Structure Visualization (2D)',
-          text: 'Here is the 2D SVG visualization of the proposed structure.',
+          title: `Structure Visualization (${view.toUpperCase()})`,
+          text: `Here is the ${view} elevation SVG visualization of the proposed structure.`,
           files: [file]
         });
       } else {
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;
-        a.download = 'structure-visualization.svg';
+        a.download = `structure-visualization-${view}.svg`;
         a.click();
         URL.revokeObjectURL(url);
       }
@@ -2452,6 +3757,334 @@ function BuildingVisualizer({ specs, dimensionUnit }: { specs: ProjectSpecs, dim
       }
     }
   };
+
+  if (view === 'side') {
+    const lVal = Math.max(specs.length, 1);
+    const maxW = Math.max(lVal, 10);
+    const maxH = Math.max(specs.eaveHeight + (specs.width / 2) * (specs.roofSlope / 100) + 1, 5);
+
+    const paddingX = 85;
+    const paddingY = 60;
+    const canvasW = 800;
+    const canvasH = 400;
+
+    const scaleX = (canvasW - 2 * paddingX) / maxW;
+    const scaleY = (canvasH - 2 * paddingY) / maxH;
+    const scale = Math.min(scaleX, scaleY);
+
+    const drawL = lVal * scale;
+    const drawEave = specs.eaveHeight * scale;
+
+    const isSingle = specs.roofType === 'Single Slope';
+    const isMulti = specs.roofType === 'Multi-Sloped Hut';
+    const isCurved = specs.roofType === 'Curved';
+
+    const h_steep = (specs.width / 4) * (specs.roofSlope * 1.5 / 100);
+    const h_shallow = (specs.width / 4) * (specs.roofSlope * 0.5 / 100);
+    const h_curved = (specs.width / 2) * (specs.roofSlope / 100) * 1.5;
+
+    const totalRoofH = isSingle ? specs.width * (specs.roofSlope / 100) : (isMulti ? h_steep + h_shallow : (isCurved ? h_curved : (specs.width / 2) * (specs.roofSlope / 100)));
+    const ridgeHeight = specs.eaveHeight + totalRoofH;
+
+    const drawRidge = ridgeHeight * scale;
+
+    const centerX = canvasW / 2;
+    const groundY = canvasH - paddingY;
+
+    const startX = centerX - drawL / 2;
+    const endX = centerX + drawL / 2;
+
+    const baySpacing = 6;
+    const numFrames = Math.ceil(lVal / baySpacing) + 1;
+    const fDepth = Math.max(0.6, Math.round(specs.eaveHeight * 0.2 * 10) / 10);
+    const fDepthPx = fDepth * scale;
+
+    const columns = [];
+    for (let i = 0; i < numFrames; i++) {
+      let frameZ = (i / (numFrames - 1)) * lVal;
+      if (i === 0) frameZ = 0.35;
+      else if (i === numFrames - 1) frameZ = lVal - 0.35;
+      
+      const colX = startX + frameZ * scale;
+      columns.push(
+        <g key={`side_col_${i}`}>
+          {/* Foundation Pit */}
+          {specs.hasPrimarySteel !== false && (
+            <>
+              <rect x={colX - 8} y={groundY} width="16" height={fDepthPx} fill="#94a3b8" opacity="0.6" />
+              <rect x={colX - 14} y={groundY + fDepthPx} width="28" height={0.3 * scale} fill="#64748b" opacity="0.8" />
+            </>
+          )}
+          {/* Column */}
+          {specs.hasPrimarySteel !== false && (
+            <rect x={colX - 4} y={groundY - drawEave} width="8" height={drawEave} fill="#1e293b" stroke="#334155" strokeWidth="1" />
+          )}
+          {/* Bay dimension line below (between columns) */}
+          {i < numFrames - 1 && (
+            <g>
+              <line x1={colX} y1={groundY + 15} x2={startX + ((i + 1) / (numFrames - 1)) * lVal * scale} y2={groundY + 15} stroke="#94a3b8" strokeWidth="0.5" />
+              <text x={colX + (lVal / (numFrames - 1)) * scale / 2} y={groundY + 28} fill="#94a3b8" fontSize="10" textAnchor="middle">
+                {dimensionUnit === 'ft' ? (6 * 3.28084).toFixed(1) : '6.0'}{dimensionUnit === 'ft' ? 'ft' : 'm'}
+              </text>
+            </g>
+          )}
+        </g>
+      );
+    }
+
+    // Horizontal girts
+    const girts = [];
+    if (specs.hasGirts !== false) {
+      const girtRuns = Math.max(1, Math.floor(specs.eaveHeight / 1.5));
+      for (let j = 0; j < girtRuns; j++) {
+        const gy = groundY - (j + 1) * 1.5 * scale;
+        girts.push(
+          <line key={`side_girt_${j}`} x1={startX} y1={gy} x2={endX} y2={gy} stroke="#475569" strokeWidth="1.5" strokeDasharray="4 2" />
+        );
+      }
+    }
+
+    return (
+      <div id="peb-side-container" className="w-full relative flex items-center justify-center p-6 bg-white h-[40vh] md:h-[50vh] min-h-[300px] max-h-[600px]">
+        <div className="absolute top-4 right-4 z-10 flex gap-2">
+          <button
+            onClick={handleShare}
+            className="flex items-center gap-2 px-3 py-1.5 bg-white border border-slate-200 text-slate-700 text-xs font-medium rounded-md shadow-sm hover:bg-slate-50 transition-colors"
+          >
+            <Share2 className="w-3.5 h-3.5" />
+            Share SVG
+          </button>
+        </div>
+        <svg id="peb-side-svg" ref={svgRef} width="100%" height="100%" viewBox={`0 0 ${canvasW} ${canvasH}`} className="max-h-72 w-full drop-shadow-sm bg-white" xmlns="http://www.w3.org/2000/svg">
+          {/* Ground */}
+          <line x1={0} y1={groundY} x2={canvasW} y2={groundY} stroke="#cbd5e1" strokeWidth="2" strokeDasharray="6 4" />
+          
+          {/* Wall Sheeting / Side Frame outline */}
+          {specs.hasWalls !== false ? (
+            <rect x={startX} y={groundY - drawEave} width={drawL} height={drawEave} fill={specs.wallColor || '#f8fafc'} opacity="0.8" stroke="#334155" strokeWidth="2" />
+          ) : (
+            <rect x={startX} y={groundY - drawEave} width={drawL} height={drawEave} fill="none" stroke="#94a3b8" strokeWidth="1" strokeDasharray="4 4" />
+          )}
+
+          {/* Render columns and foundations */}
+          {columns}
+
+          {/* Render girts */}
+          {girts}
+
+          {/* Roof Profile Outline seen from the side */}
+          {specs.hasRoof !== false && (
+            <g>
+              {isSingle ? (
+                // Slanted side roof line representation
+                <line x1={startX - 10} y1={groundY - drawEave - 3} x2={endX + 10} y2={groundY - drawRidge - 3} stroke={specs.roofColor || '#0ea5e9'} strokeWidth="5" strokeLinecap="round" />
+              ) : (
+                // Standard gable roof seen from side: eave line and ridge line
+                <>
+                  {/* Roof ridge cap line */}
+                  <line x1={startX - 10} y1={groundY - drawRidge} x2={endX + 10} y2={groundY - drawRidge} stroke={specs.roofColor || '#0ea5e9'} strokeWidth="3" strokeDasharray="3 3" opacity="0.5" />
+                  {/* Outer roof boundary projection */}
+                  <rect x={startX - 5} y={groundY - drawRidge} width={drawL + 10} height={drawRidge - drawEave} fill="rgba(14, 165, 233, 0.04)" stroke="none" />
+                  {/* Roof eave sheet line */}
+                  <line x1={startX - 10} y1={groundY - drawEave - 3} x2={endX + 10} y2={groundY - drawEave - 3} stroke={specs.roofColor || '#0ea5e9'} strokeWidth="5" strokeLinecap="round" />
+                  {/* Hatch lines to show slanted roof slope facet */}
+                  <line x1={startX} y1={groundY - drawEave} x2={startX} y2={groundY - drawRidge} stroke="#cbd5e1" strokeWidth="1" opacity="0.4" />
+                  <line x1={endX} y1={groundY - drawEave} x2={endX} y2={groundY - drawRidge} stroke="#cbd5e1" strokeWidth="1" opacity="0.4" />
+                </>
+              )}
+            </g>
+          )}
+
+          {/* Overall Dimensions */}
+          {/* Length */}
+          <text x={centerX} y={groundY + 45} fill="#1e293b" fontSize="14" textAnchor="middle" fontWeight="600">Total Length: {dimensionUnit === 'ft' ? (specs.length * 3.28084).toFixed(2) : specs.length}{dimensionUnit === 'ft' ? 'ft' : 'm'}</text>
+          <line x1={startX} y1={groundY + 35} x2={endX} y2={groundY + 35} stroke="#1e293b" strokeWidth="1" />
+          <line x1={startX} y1={groundY + 30} x2={startX} y2={groundY + 40} stroke="#1e293b" strokeWidth="1" />
+          <line x1={endX} y1={groundY + 30} x2={endX} y2={groundY + 40} stroke="#1e293b" strokeWidth="1" />
+
+          {/* Height */}
+          <text x={startX - 20} y={groundY - drawEave / 2} fill="#1e293b" fontSize="14" textAnchor="end" dominantBaseline="middle" fontWeight="600">Eave Height: {dimensionUnit === 'ft' ? (specs.eaveHeight * 3.28084).toFixed(2) : specs.eaveHeight}{dimensionUnit === 'ft' ? 'ft' : 'm'}</text>
+          <line x1={startX - 12} y1={groundY} x2={startX - 12} y2={groundY - drawEave} stroke="#1e293b" strokeWidth="1" />
+          <line x1={startX - 17} y1={groundY} x2={startX - 7} y2={groundY} stroke="#1e293b" strokeWidth="1" />
+          <line x1={startX - 17} y1={groundY - drawEave} x2={startX - 7} y2={groundY - drawEave} stroke="#1e293b" strokeWidth="1" />
+        </svg>
+      </div>
+    );
+  }
+
+  if (view === 'top') {
+    const lVal = Math.max(specs.length, 1);
+    const wVal = Math.max(specs.width, 1);
+    const maxW = Math.max(lVal, 10);
+    const maxH = Math.max(wVal, 10);
+
+    const paddingX = 85;
+    const paddingY = 60;
+    const canvasW = 800;
+    const canvasH = 400;
+
+    const scaleX = (canvasW - 2 * paddingX) / maxW;
+    const scaleY = (canvasH - 2 * paddingY) / maxH;
+    const scale = Math.min(scaleX, scaleY);
+
+    const drawL = lVal * scale;
+    const drawW = wVal * scale;
+
+    const centerX = canvasW / 2;
+    const centerY = canvasH / 2;
+
+    const startX = centerX - drawL / 2;
+    const endX = centerX + drawL / 2;
+    const startY = centerY - drawW / 2;
+    const endY = centerY + drawW / 2;
+
+    const baySpacing = 6;
+    const numFrames = Math.ceil(lVal / baySpacing) + 1;
+
+    const isSingle = specs.roofType === 'Single Slope';
+    const isMulti = specs.roofType === 'Multi-Sloped Hut';
+    const purlinSpacing = specs.highWindVelocity || specs.snowLoad ? 1.0 : 1.5;
+
+    const frameLines = [];
+    const purlinLines = [];
+
+    // Columns and Main Rafter Frame lines
+    for (let i = 0; i < numFrames; i++) {
+      let frameZ = (i / (numFrames - 1)) * lVal;
+      if (i === 0) frameZ = 0.35;
+      else if (i === numFrames - 1) frameZ = lVal - 0.35;
+
+      const frameX = startX + frameZ * scale;
+      frameLines.push(
+        <g key={`top_frame_${i}`}>
+          {/* Main Rafter Frame Line */}
+          <line x1={frameX} y1={startY} x2={frameX} y2={endY} stroke="#1e293b" strokeWidth="2.5" />
+          
+          {/* Column Footing Boxes on ends */}
+          <rect x={frameX - 4} y={startY - 4} width="8" height="8" fill="#10b981" rx="1" />
+          <rect x={frameX - 4} y={endY - 4} width="8" height="8" fill="#10b981" rx="1" />
+          
+          {/* Inner multi-span column */}
+          {specs.frameType === 'Multi-Span' && (
+            <circle cx={frameX} cy={centerY} r="4" fill="#ef4444" />
+          )}
+
+          {/* Dimension Line below */}
+          {i < numFrames - 1 && (
+            <g>
+              <line x1={frameX} y1={endY + 15} x2={startX + ((i + 1) / (numFrames - 1)) * lVal * scale} y2={endY + 15} stroke="#94a3b8" strokeWidth="0.5" />
+              <text x={frameX + (lVal / (numFrames - 1)) * scale / 2} y={endY + 28} fill="#94a3b8" fontSize="10" textAnchor="middle">
+                {dimensionUnit === 'ft' ? (6 * 3.28084).toFixed(1) : '6.0'}{dimensionUnit === 'ft' ? 'ft' : 'm'}
+              </text>
+            </g>
+          )}
+        </g>
+      );
+    }
+
+    // Purlin lines running horizontally across length
+    if (specs.hasSecondarySteel !== false) {
+      const ps = purlinSpacing * scale;
+      const offset = 8; // Inboard offset in pixels
+
+      const drawSlopePurlins = (y1: number, y2: number, slopeSlope: number) => {
+        const flatW = Math.abs(y2 - y1);
+        const slopedW = flatW * Math.sqrt(1 + Math.pow(slopeSlope / 100, 2));
+        const runs = Math.max(1, Math.round(slopedW / ps));
+        
+        if (flatW > 2 * offset) {
+          const startY_p = y1 + offset;
+          const endY_p = y2 - offset;
+          for (let k = 0; k <= runs; k++) {
+            const t = runs > 0 ? k / runs : 0.5;
+            const py = startY_p + (endY_p - startY_p) * t;
+            purlinLines.push(
+              <line key={`top_purlin_${y1}_${k}`} x1={startX} y1={py} x2={endX} y2={py} stroke="#475569" strokeWidth="1" strokeDasharray="3 3" opacity="0.7" />
+            );
+          }
+        } else {
+          for (let k = 0; k <= runs; k++) {
+            const py = y1 + (y2 - y1) * (k / (runs || 1));
+            purlinLines.push(
+              <line key={`top_purlin_${y1}_${k}`} x1={startX} y1={py} x2={endX} y2={py} stroke="#475569" strokeWidth="1" strokeDasharray="3 3" opacity="0.7" />
+            );
+          }
+        }
+      };
+
+      if (isSingle) {
+        drawSlopePurlins(startY, endY, specs.roofSlope);
+      } else if (isMulti) {
+        // Multi-slope has 4 segments
+        const quarter1 = startY + drawW / 4;
+        const quarter3 = startY + 3 * drawW / 4;
+        drawSlopePurlins(startY, quarter1, specs.roofSlope * 1.5);
+        drawSlopePurlins(quarter1, centerY, specs.roofSlope * 0.5);
+        drawSlopePurlins(centerY, quarter3, specs.roofSlope * 0.5);
+        drawSlopePurlins(quarter3, endY, specs.roofSlope * 1.5);
+      } else {
+        // Standard gable or curved
+        drawSlopePurlins(startY, centerY, specs.roofSlope);
+        drawSlopePurlins(centerY, endY, specs.roofSlope);
+      }
+    }
+
+    return (
+      <div id="peb-top-container" className="w-full relative flex items-center justify-center p-6 bg-white h-[40vh] md:h-[50vh] min-h-[300px] max-h-[600px]">
+        <div className="absolute top-4 right-4 z-10 flex gap-2">
+          <button
+            onClick={handleShare}
+            className="flex items-center gap-2 px-3 py-1.5 bg-white border border-slate-200 text-slate-700 text-xs font-medium rounded-md shadow-sm hover:bg-slate-50 transition-colors"
+          >
+            <Share2 className="w-3.5 h-3.5" />
+            Share SVG
+          </button>
+        </div>
+        <svg id="peb-top-svg" ref={svgRef} width="100%" height="100%" viewBox={`0 0 ${canvasW} ${canvasH}`} className="max-h-72 w-full drop-shadow-sm bg-white" xmlns="http://www.w3.org/2000/svg">
+          {/* Outline boundary of roof */}
+          <rect x={startX - 5} y={startY - 5} width={drawL + 10} height={drawW + 10} fill="none" stroke="#0ea5e9" strokeWidth="2" strokeDasharray="5 3" opacity="0.6" />
+          
+          {/* Building Slab/Base outline */}
+          <rect x={startX} y={startY} width={drawL} height={drawW} fill="#f8fafc" stroke="#94a3b8" strokeWidth="1.5" />
+
+          {/* Purlins */}
+          {purlinLines}
+
+          {/* Frames and Column Markers */}
+          {frameLines}
+
+          {/* Legends */}
+          <g transform={`translate(${startX}, ${startY - 25})`}>
+            <rect x="0" y="0" width="8" height="8" fill="#10b981" rx="1" />
+            <text x="12" y="8" fontSize="10" fill="#475569" fontWeight="500">Columns (Primary Frame)</text>
+
+            <rect x="150" y="0" width="8" height="8" fill="none" stroke="#0ea5e9" strokeWidth="1" strokeDasharray="2 2" />
+            <text x="162" y="8" fontSize="10" fill="#475569" fontWeight="500">Roof Overhang (Eave Line)</text>
+
+            {specs.frameType === 'Multi-Span' && (
+              <>
+                <circle cx="310" cy="4" r="3" fill="#ef4444" />
+                <text x="318" y="8" fontSize="10" fill="#475569" fontWeight="500">Mid-Span Columns</text>
+              </>
+            )}
+          </g>
+
+          {/* Overall Dimensions */}
+          {/* Length (Horizontal) */}
+          <text x={centerX} y={endY + 45} fill="#1e293b" fontSize="14" textAnchor="middle" fontWeight="600">Total Length: {dimensionUnit === 'ft' ? (specs.length * 3.28084).toFixed(2) : specs.length}{dimensionUnit === 'ft' ? 'ft' : 'm'}</text>
+          <line x1={startX} y1={endY + 35} x2={endX} y2={endY + 35} stroke="#1e293b" strokeWidth="1" />
+          <line x1={startX} y1={endY + 30} x2={startX} y2={endY + 40} stroke="#1e293b" strokeWidth="1" />
+          <line x1={endX} y1={endY + 30} x2={endX} y2={endY + 40} stroke="#1e293b" strokeWidth="1" />
+
+          {/* Width (Vertical) */}
+          <text x={startX - 20} y={centerY} fill="#1e293b" fontSize="14" textAnchor="end" dominantBaseline="middle" fontWeight="600" transform={`rotate(-90, ${startX - 20}, ${centerY})`}>Total Width: {dimensionUnit === 'ft' ? (specs.width * 3.28084).toFixed(2) : specs.width}{dimensionUnit === 'ft' ? 'ft' : 'm'}</text>
+          <line x1={startX - 12} y1={startY} x2={startX - 12} y2={endY} stroke="#1e293b" strokeWidth="1" />
+          <line x1={startX - 17} y1={startY} x2={startX - 7} y2={startY} stroke="#1e293b" strokeWidth="1" />
+          <line x1={startX - 17} y1={endY} x2={startX - 7} y2={endY} stroke="#1e293b" strokeWidth="1" />
+        </svg>
+      </div>
+    );
+  }
 
   const maxW = Math.max(specs.width, 10);
   
@@ -2492,6 +4125,99 @@ function BuildingVisualizer({ specs, dimensionUnit }: { specs: ProjectSpecs, dim
   
   let dPath = '';
   let dRoof = '';
+
+  const fmtLen = (lenM: number) => {
+    return dimensionUnit === 'ft' 
+      ? (lenM * 3.28084).toFixed(1) + ' ft' 
+      : lenM.toFixed(1) + ' m';
+  };
+
+  const renderDimensionLine = (
+    x1: number,
+    y1: number,
+    x2: number,
+    y2: number,
+    offset: number,
+    label: string,
+    key: string
+  ) => {
+    if (
+      x1 === undefined || y1 === undefined || x2 === undefined || y2 === undefined ||
+      isNaN(x1) || isNaN(y1) || isNaN(x2) || isNaN(y2)
+    ) {
+      return null;
+    }
+
+    const dx = x2 - x1;
+    const dy = y2 - y1;
+    const len = Math.sqrt(dx * dx + dy * dy);
+    if (len === 0 || isNaN(len)) return null;
+
+    const dirX = dx / len;
+    const dirY = dy / len;
+
+    const px = -dirY;
+    const py = dirX;
+
+    const ox1 = x1 + px * offset;
+    const oy1 = y1 + py * offset;
+    const ox2 = x2 + px * offset;
+    const oy2 = y2 + py * offset;
+
+    if (isNaN(ox1) || isNaN(oy1) || isNaN(ox2) || isNaN(oy2)) {
+      return null;
+    }
+
+    const mx = (ox1 + ox2) / 2;
+    const my = (oy1 + oy2) / 2;
+
+    let angle = Math.atan2(dy, dx) * 180 / Math.PI;
+    if (angle > 90) angle -= 180;
+    if (angle < -90) angle += 180;
+
+    const rectWidth = Math.max(35, label.length * 5.5);
+
+    return (
+      <g key={key} className="select-none pointer-events-none">
+        {/* Witness / Extension lines */}
+        <line x1={x1 + px * 2} y1={y1 + py * 2} x2={ox1 + px * 3} y2={oy1 + py * 3} stroke="#94a3b8" strokeWidth="0.75" strokeDasharray="2 2" />
+        <line x1={x2 + px * 2} y1={y2 + py * 2} x2={ox2 + px * 3} y2={oy2 + py * 3} stroke="#94a3b8" strokeWidth="0.75" strokeDasharray="2 2" />
+
+        {/* Dimension line */}
+        <line x1={ox1} y1={oy1} x2={ox2} y2={oy2} stroke="#4f46e5" strokeWidth="1" />
+
+        {/* Tick marks (architectural slashes) */}
+        <line x1={ox1 - dirX * 3 - px * 3} y1={oy1 - dirY * 3 - py * 3} x2={ox1 + dirX * 3 + px * 3} y2={oy1 + dirY * 3 + py * 3} stroke="#4f46e5" strokeWidth="1.25" />
+        <line x1={ox2 - dirX * 3 - px * 3} y1={oy2 - dirY * 3 - py * 3} x2={ox2 + dirX * 3 + px * 3} y2={oy2 + dirY * 3 + py * 3} stroke="#4f46e5" strokeWidth="1.25" />
+
+        {/* Text mask (white background) */}
+        <rect
+          x={mx - rectWidth / 2}
+          y={my - 6}
+          width={rectWidth}
+          height={12}
+          fill="#ffffff"
+          rx="2"
+          opacity="0.95"
+          transform={`rotate(${angle}, ${mx}, ${my})`}
+        />
+        
+        {/* Dimension text */}
+        <text
+          x={mx}
+          y={my}
+          transform={`rotate(${angle}, ${mx}, ${my})`}
+          fill="#4f46e5"
+          fontSize="8"
+          fontWeight="700"
+          textAnchor="middle"
+          dominantBaseline="middle"
+        >
+          {label}
+        </text>
+      </g>
+    );
+  };
   
   if (isSingle) {
     pRightTop.y = groundY - (specs.eaveHeight + totalRoofH) * scale;
@@ -2571,14 +4297,344 @@ function BuildingVisualizer({ specs, dimensionUnit }: { specs: ProjectSpecs, dim
         
         {/* Building Inner Fill and Primary Frame */}
         {specs.hasPrimarySteel !== false && (
-          <path
-            d={dPath}
-            fill="rgba(59, 130, 246, 0.05)"
-            stroke="#1e293b"
-            strokeWidth="4"
-            strokeLinecap="square"
-            strokeLinejoin="miter"
-          />
+          specs.frameType === 'Truss' ? (
+            <g id="truss-frame-2d">
+              {/* Columns */}
+              <line x1={pLeftGround.x} y1={pLeftGround.y} x2={pLeftEave.x} y2={pLeftEave.y} stroke="#1e293b" strokeWidth="5" />
+              <line x1={pRightGround.x} y1={pRightGround.y} x2={pRightTop.x} y2={pRightTop.y} stroke="#1e293b" strokeWidth="5" />
+
+              {/* Bottom Chord (Tie Runner) */}
+              <line x1={pLeftEave.x} y1={pLeftEave.y} x2={pRightTop.x} y2={pLeftEave.y} stroke="#1e293b" strokeWidth="4" />
+
+              {/* Top Chords & Webs */}
+              {(() => {
+                const ridgeY = groundY - ridgeHeight * scale;
+                const eaveY = pLeftEave.y;
+
+                if (isSingle) {
+                  // Single Slope Truss
+                  // Top Chord
+                  const slopeY = pRightTop.y;
+                  const numWebs2D = Math.max(3, Math.round(specs.width / 1.8));
+                  const step2D = drawW / numWebs2D;
+
+                  const webs2D = [];
+                  for (let j = 1; j < numWebs2D; j++) {
+                    const x = pLeftEave.x + j * step2D;
+                    const topY = eaveY - (j / numWebs2D) * (eaveY - slopeY);
+                    webs2D.push(
+                      <line key={`web_v_${j}`} x1={x} y1={eaveY} x2={x} y2={topY} stroke="#334155" strokeWidth="2.5" />
+                    );
+
+                    // Diagonal
+                    const nextX = pLeftEave.x + (j + 1) * step2D;
+                    const nextTopY = eaveY - ((j + 1) / numWebs2D) * (eaveY - slopeY);
+                    webs2D.push(
+                      <line key={`web_d_${j}`} x1={x} y1={eaveY} x2={nextX} y2={nextTopY} stroke="#334155" strokeWidth="2" />
+                    );
+                  }
+
+                  // 1. Top Chord (Rafter) Length
+                  const tcLen = Math.sqrt(Math.pow(specs.width, 2) + Math.pow(totalRoofH, 2));
+                  const tcDim = renderDimensionLine(pLeftEave.x, eaveY, pRightTop.x, slopeY, -25, fmtLen(tcLen), 'tc_dim');
+
+                  // 2. Truss Rise Height (offset negative to place inside the building, avoiding the outer High Eave dimension)
+                  const riseDim = renderDimensionLine(pRightTop.x, eaveY, pRightTop.x, slopeY, -25, fmtLen(totalRoofH) + ' Rise', 'rise_dim');
+
+                  // 3. Panel spacing chain (offset positive to place below the bottom chord, avoiding overlapping with the webs)
+                  const panelWReal = specs.width / numWebs2D;
+                  const panelDims = [];
+                  for (let j = 0; j < numWebs2D; j++) {
+                    const x1 = pLeftEave.x + j * step2D;
+                    const x2 = pLeftEave.x + (j + 1) * step2D;
+                    panelDims.push(
+                      renderDimensionLine(x1, eaveY, x2, eaveY, 18, fmtLen(panelWReal), `panel_dim_${j}`)
+                    );
+                  }
+
+                  return (
+                    <>
+                      <line x1={pLeftEave.x} y1={eaveY} x2={pRightTop.x} y2={slopeY} stroke="#1e293b" strokeWidth="4" />
+                      <line x1={pRightTop.x} y1={eaveY} x2={pRightTop.x} y2={slopeY} stroke="#1e293b" strokeWidth="3" />
+                      {webs2D}
+                      {/* Truss Plates */}
+                      <rect x={pLeftEave.x - 4} y={eaveY - 4} width="8" height="8" rx="1" fill="#cbd5e1" stroke="#475569" strokeWidth="1" />
+                      <rect x={pRightTop.x - 4} y={slopeY - 4} width="8" height="8" rx="1" fill="#cbd5e1" stroke="#475569" strokeWidth="1" />
+                      <rect x={pRightTop.x - 4} y={eaveY - 4} width="8" height="8" rx="1" fill="#cbd5e1" stroke="#475569" strokeWidth="1" />
+
+                      {/* Truss Labeled Dimensions */}
+                      {tcDim}
+                      {riseDim}
+                      {panelDims}
+                    </>
+                  );
+                } else if (isCurved) {
+                  // Curved bowstring truss
+                  const cpY = groundY - (specs.eaveHeight + totalRoofH * 2) * scale;
+                  const getPt = (t: number) => ({
+                     x: Math.pow(1-t, 2)*pLeftEave.x + 2*(1-t)*t*centerX + Math.pow(t, 2)*pRightTop.x,
+                     y: Math.pow(1-t, 2)*pLeftEave.y + 2*(1-t)*t*cpY + Math.pow(t, 2)*pRightTop.y
+                  });
+                  const lines = [];
+                  let ptPrev = getPt(0);
+                  const segments = 16;
+                  for (let j = 1; j <= segments; j++) {
+                    const ptNext = getPt(j / segments);
+                    lines.push(
+                      <line key={`curv_chord_${j}`} x1={ptPrev.x} y1={ptPrev.y} x2={ptNext.x} y2={ptNext.y} stroke="#1e293b" strokeWidth="4" />
+                    );
+                    ptPrev = ptNext;
+                  }
+
+                  // Webbing
+                  const numWebs2D = Math.max(4, Math.round(specs.width / 1.5));
+                  const webs = [];
+                  for (let j = 1; j < numWebs2D; j++) {
+                    const t = j / numWebs2D;
+                    const pt = getPt(t);
+                    webs.push(
+                      <line key={`curv_web_v_${j}`} x1={pt.x} y1={eaveY} x2={pt.x} y2={pt.y} stroke="#334155" strokeWidth="2.5" />
+                    );
+                    if (j < numWebs2D - 1) {
+                      const nextPt = getPt((j + 1) / numWebs2D);
+                      webs.push(
+                        <line key={`curv_web_d_${j}`} x1={pt.x} y1={eaveY} x2={nextPt.x} y2={nextPt.y} stroke="#334155" strokeWidth="2" />
+                      );
+                    }
+                  }
+
+                  // 1. Truss Rise Height (offset negative to place on the left of the center-line, avoiding the centered ridge line)
+                  const peakY = eaveY - totalRoofH * scale;
+                  const riseDim = renderDimensionLine(centerX, eaveY, centerX, peakY, -25, fmtLen(totalRoofH) + ' Rise', 'curved_rise_dim');
+
+                  // 2. Panel spacing chain (offset positive to place below bottom chord, avoiding webs)
+                  const step2D = drawW / numWebs2D;
+                  const panelWReal = specs.width / numWebs2D;
+                  const panelDims = [];
+                  for (let j = 0; j < numWebs2D; j++) {
+                    const x1 = pLeftEave.x + j * step2D;
+                    const x2 = pLeftEave.x + (j + 1) * step2D;
+                    panelDims.push(
+                      renderDimensionLine(x1, eaveY, x2, eaveY, 18, fmtLen(panelWReal), 'curved_panel_dim_' + j)
+                    );
+                  }
+
+                  return (
+                    <>
+                      {lines}
+                      {webs}
+                      {/* Truss Plates */}
+                      <rect x={pLeftEave.x - 4} y={eaveY - 4} width="8" height="8" rx="1" fill="#cbd5e1" stroke="#475569" strokeWidth="1" />
+                      <rect x={pRightTop.x - 4} y={eaveY - 4} width="8" height="8" rx="1" fill="#cbd5e1" stroke="#475569" strokeWidth="1" />
+
+                      {/* Truss Labeled Dimensions */}
+                      {riseDim}
+                      {panelDims}
+                    </>
+                  );
+                } else if (isMulti) {
+                  // Multi slope truss - Pratt optimized 2D layout to match 3D perfectly
+                  const h_steep_px = h_steep * scale;
+                  const h_shallow_px = h_shallow * scale;
+                  const h1Y = groundY - (specs.eaveHeight + h_steep) * scale;
+                  const quarter1 = centerX - drawW / 4;
+                  const quarter3 = centerX + drawW / 4;
+
+                  const getTopChordY = (xVal: number) => {
+                    const distFromCenter = Math.abs(xVal - centerX);
+                    const halfW = drawW / 2;
+                    if (distFromCenter >= drawW / 4) {
+                      const ratio = (halfW - distFromCenter) / (drawW / 4);
+                      return eaveY - ratio * h_steep_px;
+                    } else {
+                      const ratio = (drawW / 4 - distFromCenter) / (drawW / 4);
+                      return h1Y - ratio * h_shallow_px;
+                    }
+                  };
+
+                  const numPanelsHalf = Math.max(2, Math.round(specs.width / 3.6));
+                  const step2D = (drawW / 2) / numPanelsHalf;
+
+                  const webs2D = [];
+                  // Verticals
+                  for (let j = 1; j < 2 * numPanelsHalf; j++) {
+                    const x = pLeftEave.x + j * step2D;
+                    const topY = getTopChordY(x);
+                    webs2D.push(
+                      <line key={`multi_web_v_${j}`} x1={x} y1={eaveY} x2={x} y2={topY} stroke="#334155" strokeWidth="2.5" />
+                    );
+                  }
+
+                  // Diagonals Left
+                  for (let j = 0; j < numPanelsHalf; j++) {
+                    const x_start = pLeftEave.x + j * step2D;
+                    const x_end = pLeftEave.x + (j + 1) * step2D;
+                    const y_end = getTopChordY(x_end);
+                    webs2D.push(
+                      <line key={`multi_web_d_l_${j}`} x1={x_start} y1={eaveY} x2={x_end} y2={y_end} stroke="#334155" strokeWidth="2" />
+                    );
+                  }
+
+                  // Diagonals Right
+                  for (let j = numPanelsHalf; j < 2 * numPanelsHalf; j++) {
+                    const x_start = pLeftEave.x + (j + 1) * step2D;
+                    const x_end = pLeftEave.x + j * step2D;
+                    const y_end = getTopChordY(x_end);
+                    webs2D.push(
+                      <line key={`multi_web_d_r_${j}`} x1={x_start} y1={eaveY} x2={x_end} y2={y_end} stroke="#334155" strokeWidth="2" />
+                    );
+                  }
+
+                  // 1. Lower Left Top Chord Length
+                  const lowerLenReal = Math.sqrt(Math.pow(specs.width / 4, 2) + Math.pow(h_steep, 2));
+                  const lowerChordDim = renderDimensionLine(pLeftEave.x, eaveY, quarter1, h1Y, -20, fmtLen(lowerLenReal), 'multi_lower_chord_dim');
+
+                  // 2. Upper Left Top Chord Length
+                  const upperLenReal = Math.sqrt(Math.pow(specs.width / 4, 2) + Math.pow(h_shallow, 2));
+                  const upperChordDim = renderDimensionLine(quarter1, h1Y, centerX, ridgeY, -20, fmtLen(upperLenReal), 'multi_upper_chord_dim');
+
+                  // 3. Truss Rise Height (offset negative to place on the left of the center-line, avoiding the centered ridge line)
+                  const riseDim = renderDimensionLine(centerX, eaveY, centerX, ridgeY, -25, fmtLen(totalRoofH) + ' Rise', 'multi_rise_dim');
+
+                  // 4. Panel spacing chain (offset positive to place below bottom chord, avoiding webs)
+                  const panelWReal = (specs.width / 2) / numPanelsHalf;
+                  const panelDims = [];
+                  for (let j = 0; j < 2 * numPanelsHalf; j++) {
+                    const x1 = pLeftEave.x + j * step2D;
+                    const x2 = pLeftEave.x + (j + 1) * step2D;
+                    panelDims.push(
+                      renderDimensionLine(x1, eaveY, x2, eaveY, 18, fmtLen(panelWReal), 'multi_panel_dim_' + j)
+                    );
+                  }
+
+                  return (
+                    <>
+                      {/* Top Chord lines */}
+                      <line x1={pLeftEave.x} y1={eaveY} x2={quarter1} y2={h1Y} stroke="#1e293b" strokeWidth="4" />
+                      <line x1={quarter1} y1={h1Y} x2={centerX} y2={ridgeY} stroke="#1e293b" strokeWidth="4" />
+                      <line x1={centerX} y1={ridgeY} x2={quarter3} y2={h1Y} stroke="#1e293b" strokeWidth="4" />
+                      <line x1={quarter3} y1={h1Y} x2={pRightTop.x} y2={eaveY} stroke="#1e293b" strokeWidth="4" />
+
+                      {webs2D}
+
+                      {/* Truss Plates */}
+                      <rect x={pLeftEave.x - 4} y={eaveY - 4} width="8" height="8" rx="1" fill="#cbd5e1" stroke="#475569" strokeWidth="1" />
+                      <rect x={pRightTop.x - 4} y={eaveY - 4} width="8" height="8" rx="1" fill="#cbd5e1" stroke="#475569" strokeWidth="1" />
+                      <rect x={centerX - 5} y={ridgeY - 5} width="10" height="10" rx="1.5" fill="#cbd5e1" stroke="#475569" strokeWidth="1" />
+
+                      {/* Truss Labeled Dimensions */}
+                      {lowerChordDim}
+                      {upperChordDim}
+                      {riseDim}
+                      {panelDims}
+                    </>
+                  );
+                } else {
+                  // Standard Gable Truss (Fink / Howe Pratt-Optimized 2D design)
+                  const numPanelsHalf = Math.max(2, Math.round(specs.width / 3.6));
+                  const step2D = (drawW / 2) / numPanelsHalf;
+
+                  const getTopChordY = (x: number) => {
+                    const distFromCenter = Math.abs(x - centerX);
+                    const ratio = distFromCenter / (drawW / 2);
+                    return ridgeY + ratio * (eaveY - ridgeY);
+                  };
+
+                  const webs2D = [];
+                  // Verticals
+                  for (let j = 1; j < 2 * numPanelsHalf; j++) {
+                    const x = pLeftEave.x + j * step2D;
+                    const topY = getTopChordY(x);
+                    webs2D.push(
+                      <line key={`gable_web_v_${j}`} x1={x} y1={eaveY} x2={x} y2={topY} stroke="#334155" strokeWidth="2.5" />
+                    );
+                  }
+
+                  // Diagonals Left
+                  for (let j = 0; j < numPanelsHalf; j++) {
+                    const x_start = pLeftEave.x + j * step2D;
+                    const x_end = pLeftEave.x + (j + 1) * step2D;
+                    const y_end = getTopChordY(x_end);
+                    webs2D.push(
+                      <line key={`gable_web_d_l_${j}`} x1={x_start} y1={eaveY} x2={x_end} y2={y_end} stroke="#334155" strokeWidth="2" />
+                    );
+                  }
+
+                  // Diagonals Right
+                  for (let j = numPanelsHalf; j < 2 * numPanelsHalf; j++) {
+                    const x_start = pLeftEave.x + (j + 1) * step2D;
+                    const x_end = pLeftEave.x + j * step2D;
+                    const y_end = getTopChordY(x_end);
+                    webs2D.push(
+                      <line key={`gable_web_d_r_${j}`} x1={x_start} y1={eaveY} x2={x_end} y2={y_end} stroke="#334155" strokeWidth="2" />
+                    );
+                  }
+
+                  // 1. Top Chord (Rafter) Length
+                  const tcLen = Math.sqrt(Math.pow(specs.width / 2, 2) + Math.pow(totalRoofH, 2));
+                  const tcDim = renderDimensionLine(pLeftEave.x, eaveY, centerX, ridgeY, -25, fmtLen(tcLen), 'gable_tc_dim');
+
+                  // 2. Truss Rise Height (offset negative to place on the left of the center-line, avoiding the centered ridge line)
+                  const riseDim = renderDimensionLine(centerX, eaveY, centerX, ridgeY, -25, fmtLen(totalRoofH) + ' Rise', 'gable_rise_dim');
+
+                  // 3. Panel spacing chain (offset positive to place below bottom chord, avoiding webs)
+                  const panelWReal = (specs.width / 2) / numPanelsHalf;
+                  const panelDims = [];
+                  for (let j = 0; j < 2 * numPanelsHalf; j++) {
+                    const x1 = pLeftEave.x + j * step2D;
+                    const x2 = pLeftEave.x + (j + 1) * step2D;
+                    panelDims.push(
+                      renderDimensionLine(x1, eaveY, x2, eaveY, 18, fmtLen(panelWReal), 'gable_panel_dim_' + j)
+                    );
+                  }
+
+                  return (
+                    <>
+                      {/* Top Chords */}
+                      <line x1={pLeftEave.x} y1={eaveY} x2={centerX} y2={ridgeY} stroke="#1e293b" strokeWidth="4" />
+                      <line x1={centerX} y1={ridgeY} x2={pRightTop.x} y2={eaveY} stroke="#1e293b" strokeWidth="4" />
+
+                      {webs2D}
+
+                      {/* Truss Plates (Metal Connector plates) at Panel Points */}
+                      <rect x={pLeftEave.x - 4} y={eaveY - 4} width="12" height="8" rx="1" fill="#94a3b8" stroke="#475569" strokeWidth="0.7" />
+                      <rect x={pRightTop.x - 8} y={eaveY - 4} width="12" height="8" rx="1" fill="#94a3b8" stroke="#475569" strokeWidth="0.7" />
+                      
+                      {/* Peak joint */}
+                      <polygon points={`${centerX - 6},${ridgeY + 8} ${centerX + 6},${ridgeY + 8} ${centerX},${ridgeY - 2}`} fill="#94a3b8" stroke="#475569" strokeWidth="0.7" />
+
+                      {/* Bottom Chord Panel Points */}
+                      <rect x={centerX - 5} y={eaveY - 4} width="10" height="8" rx="1" fill="#94a3b8" stroke="#475569" strokeWidth="0.7" />
+                      {Array.from({ length: numPanelsHalf - 1 }).map((_, j) => {
+                        const xL = pLeftEave.x + (j + 1) * step2D;
+                        const xR = centerX + (j + 1) * step2D;
+                        return (
+                          <g key={`panel_pts_${j}`}>
+                            <rect x={xL - 5} y={eaveY - 4} width="10" height="8" rx="1" fill="#94a3b8" stroke="#475569" strokeWidth="0.7" />
+                            <rect x={xR - 5} y={eaveY - 4} width="10" height="8" rx="1" fill="#94a3b8" stroke="#475569" strokeWidth="0.7" />
+                          </g>
+                        );
+                      })}
+
+                      {/* Truss Labeled Dimensions */}
+                      {tcDim}
+                      {riseDim}
+                      {panelDims}
+                    </>
+                  );
+                }
+              })()}
+            </g>
+          ) : (
+            <path
+              d={dPath}
+              fill="rgba(59, 130, 246, 0.05)"
+              stroke="#1e293b"
+              strokeWidth="4"
+              strokeLinecap="square"
+              strokeLinejoin="miter"
+            />
+          )
         )}
 
         {/* Secondary Members (Girts) */}
@@ -2618,16 +4674,41 @@ function BuildingVisualizer({ specs, dimensionUnit }: { specs: ProjectSpecs, dim
                   const l = Math.sqrt(dx*dx + dy*dy);
                   const runs = Math.max(1, Math.round(l / ps));
                   const a = Math.atan2(dy, dx);
-                  for (let i=0; i<=runs; i++) {
-                     const rx = p1x + dx * (i/runs);
-                     const ry = p1y + dy * (i/runs);
-                     cleats.push(
-                       <g key={`p_cleat_${keyIdx++}`} transform={`translate(${rx}, ${ry}) rotate(${a * 180 / Math.PI})`}>
-                         <rect x="-2" y="-12" width="4" height="12" fill="#94a3b8" />
-                         <rect x="-5" y="-20" width="10" height="8" fill="#475569" />
-                         <circle cx="0" cy="-16" r="1.5" fill="#1e293b" />
-                       </g>
-                     );
+                  
+                  // Inboard offset to position purlins properly relative to edges (e.g. eave and ridge)
+                  const offset = 12;
+                  if (l > 2 * offset) {
+                     const startX = p1x + (dx / l) * offset;
+                     const startY = p1y + (dy / l) * offset;
+                     const endX = p2x - (dx / l) * offset;
+                     const endY = p2y - (dy / l) * offset;
+                     const newDx = endX - startX;
+                     const newDy = endY - startY;
+                     
+                     for (let i = 0; i <= runs; i++) {
+                        const t = runs > 0 ? i / runs : 0.5;
+                        const rx = startX + newDx * t;
+                        const ry = startY + newDy * t;
+                        cleats.push(
+                          <g key={`p_cleat_${keyIdx++}`} transform={`translate(${rx}, ${ry}) rotate(${a * 180 / Math.PI})`}>
+                            <rect x="-2" y="-12" width="4" height="12" fill="#94a3b8" />
+                            <rect x="-5" y="-20" width="10" height="8" fill="#475569" />
+                            <circle cx="0" cy="-16" r="1.5" fill="#1e293b" />
+                          </g>
+                        );
+                     }
+                  } else {
+                     for (let i = 0; i <= runs; i++) {
+                        const rx = p1x + dx * (i / (runs || 1));
+                        const ry = p1y + dy * (i / (runs || 1));
+                        cleats.push(
+                          <g key={`p_cleat_${keyIdx++}`} transform={`translate(${rx}, ${ry}) rotate(${a * 180 / Math.PI})`}>
+                            <rect x="-2" y="-12" width="4" height="12" fill="#94a3b8" />
+                            <rect x="-5" y="-20" width="10" height="8" fill="#475569" />
+                            <circle cx="0" cy="-16" r="1.5" fill="#1e293b" />
+                          </g>
+                        );
+                     }
                   }
                };
                
@@ -2674,7 +4755,7 @@ function BuildingVisualizer({ specs, dimensionUnit }: { specs: ProjectSpecs, dim
 
         {/* Roof Sheeting */}
         {specs.hasRoof !== false && (
-          <>
+          <g transform="translate(0, -14)">
             <path
               d={dRoof}
               fill="none"
@@ -2696,7 +4777,7 @@ function BuildingVisualizer({ specs, dimensionUnit }: { specs: ProjectSpecs, dim
                 strokeLinejoin="round"
               />
             )}
-          </>
+          </g>
         )}
 
         {/* Multi-span central column */}
@@ -3157,12 +5238,50 @@ export default function App() {
   const [showMaterialEstimate, setShowMaterialEstimate] = useState(false);
   const [selectedVisualWord, setSelectedVisualWord] = useState<string | null>(null);
   const [is3DMode, setIs3DMode] = useState(true);
+  const [visualizerTab, setVisualizerTab] = useState<'3d-model' | '3d-frame' | 'front-elevation' | 'side-elevation' | 'top-plan'>('3d-model');
   const [searchQuery, setSearchQuery] = useState('');
+  const [weatherType, setWeatherType] = useState<'clear' | 'rain' | 'snow' | 'storm'>('clear');
+  const [activeLeakSymptom, setActiveLeakSymptom] = useState<'overlap' | 'screw' | 'ridge' | 'gutter' | null>(null);
+
+  const [isAudioEnabled, setIsAudioEnabled] = useState(false);
+  const [audioVolume, setAudioVolume] = useState(0.5);
+
+  // Auto-enable audio when user activates heavy rain or high wind storm
+  useEffect(() => {
+    if (weatherType === 'rain' || weatherType === 'storm') {
+      setIsAudioEnabled(true);
+    }
+  }, [weatherType]);
+
+  // Handle playing or stopping the procedural rain sound
+  useEffect(() => {
+    if (isAudioEnabled && (weatherType === 'rain' || weatherType === 'storm')) {
+      rainSynthesizer.start(weatherType, audioVolume);
+    } else {
+      rainSynthesizer.stop();
+    }
+  }, [isAudioEnabled, weatherType]);
+
+  // Update volume smoothly when volume state changes
+  useEffect(() => {
+    rainSynthesizer.setVolume(audioVolume);
+  }, [audioVolume]);
+
+  // Clean up audio on unmount
+  useEffect(() => {
+    return () => {
+      rainSynthesizer.stop();
+    };
+  }, []);
+
+  const [isUploadingImage, setIsUploadingImage] = useState(false);
+  const [uploadError, setUploadError] = useState<string | null>(null);
+  const [extractedSummary, setExtractedSummary] = useState<string | null>(null);
 
   // Basic Engineering Estimations
   const area = specs.width * specs.length;
-  // Estimate ~35 kg/m2 for clear span, ~25 kg/m2 for multi-span (very rough conceptual metric)
-  const weightFactor = specs.frameType === 'Clear Span' ? 35 : 25;
+  // Estimate ~35 kg/m2 for clear span, ~22 kg/m2 for truss frame, ~25 kg/m2 for multi-span (very rough conceptual metric)
+  const weightFactor = specs.frameType === 'Clear Span' ? 35 : (specs.frameType === 'Truss' ? 22 : 25);
   const targetSteelWeight = (area * weightFactor) / 1000; // in metric tons
 
   const estimatedDuration = Math.ceil(area / 500) * 2 + 8; // base 8 weeks + variable
@@ -3203,14 +5322,14 @@ export default function App() {
   // Detailed Primary Elements Breakdown
   const baySpacing = 6;
   const numFrames = Math.ceil(specs.length / baySpacing) + 1;
-  const colsPerFrame = specs.frameType === 'Clear Span' ? 2 : 3;
+  const colsPerFrame = specs.frameType === 'Clear Span' || specs.frameType === 'Truss' ? 2 : 3;
   const totalColumns = numFrames * colsPerFrame;
   let totalRafters = numFrames * 2;
   const rafterLength = Math.sqrt(Math.pow(specs.width / 2, 2) + Math.pow(((specs.width / 2) * specs.roofSlope) / 100, 2)).toFixed(2);
 
   const embedmentDepth = Math.max(0.6, Math.round(specs.eaveHeight * 0.2 * 10) / 10);
   let columnLinearMeasurement = 0;
-  if (specs.frameType === 'Clear Span') {
+  if (specs.frameType === 'Clear Span' || specs.frameType === 'Truss') {
     columnLinearMeasurement = totalColumns * (specs.eaveHeight + embedmentDepth);
   } else {
     // 2 outer columns per frame
@@ -3399,7 +5518,7 @@ export default function App() {
   const wallAreaNum = parseFloat(wallArea);
 
   // Sheet individual units
-  const roofEffWidth = specs.roofProfile === '6v Profile' ? 1.0 : (specs.roofProfile === '7v Profile' ? 1.2 : 1.0);
+  const roofEffWidth = specs.roofProfile === '6v Profile' ? 0.99 : (specs.roofProfile === '7v Profile' ? 1.188 : 1.0);
   const roofSlopeFactor = Math.sqrt(1 + Math.pow(specs.roofSlope / 100, 2));
   const sheetLengthRoof = specs.roofType === 'Single Slope' ? (specs.width * roofSlopeFactor) : ((specs.width / 2) * roofSlopeFactor);
   const roofSides = specs.roofType === 'Single Slope' ? 1 : 2;
@@ -3456,7 +5575,7 @@ export default function App() {
   const costPerRoofSheet = roofAreaPerSheet * roofUnitCost;
   const laborPerRoofSheet = roofAreaPerSheet * roofLaborCost;
 
-  const wallEffWidth = specs.wallProfile === '6v Profile' ? 1.0 : (specs.wallProfile === '7v Profile' ? 1.2 : 1.0);
+  const wallEffWidth = specs.wallProfile === '6v Profile' ? 0.99 : (specs.wallProfile === '7v Profile' ? 1.188 : 1.0);
   const wallSheetsLength = Math.ceil(specs.length / wallEffWidth);
   const wallSheetsWidth = Math.ceil(specs.width / wallEffWidth);
   const numWallSheetsLength = wallSheetsLength * 2;
@@ -3512,7 +5631,7 @@ export default function App() {
     { label: 'Profile', value: specs.roofType === 'Curved' ? 'Curved & Crimped' : (specs.roofProfile === '7v Profile' ? '7v Profile (Trapezoidal)' : (specs.roofProfile === '6v Profile' ? '6v Profile (Trapezoidal)' : 'Trapezoidal Profile Sheet')), category: 'Specifications' },
     { label: 'Quantity', value: specs.alternateRoofColors ? `${numRoofSheets} individual sheets total (${numMainRoofSheets} Primary, ${numAltRoofSheets} Alternate)` : `${numRoofSheets} individual sheets required (Total area ~${dimensionUnit === 'ft' ? (parseFloat(roofArea) * 10.7639).toFixed(0) : roofArea} ${dimensionUnit === 'ft' ? 'sq.ft' : 'm²'})`, category: 'Specifications' },
     { label: 'Length', value: roofSegments > 1 ? `Cut to ${dimensionUnit === 'ft' ? (actualRoofSheetLength * 3.28084).toFixed(1) + ' ft' : actualRoofSheetLength.toFixed(1) + ' m'} (${roofSegments} joined segments with ${dimensionUnit === 'ft' ? (roofOverlap * 3.28084).toFixed(1) + ' ft' : Math.round(roofOverlap * 1000) + ' mm'} end lap)` : `Cut to ${dimensionUnit === 'ft' ? (actualRoofSheetLength * 3.28084).toFixed(1) + ' ft' : actualRoofSheetLength.toFixed(1) + ' m'}`, category: 'Specifications' },
-    { label: 'Width', value: specs.roofProfile === '7v Profile' ? 'Covered width: 1188mm / Total width: 1253mm / Required coil width: 1440mm' : (specs.roofProfile === '6v Profile' ? 'Covered width: 960mm / Total width: 1060mm / Required coil width: 1220mm' : '1060 mm (Effective Cover Width 1000 mm)'), category: 'Specifications' },
+    { label: 'Width', value: specs.roofProfile === '7v Profile' ? 'Covered width: 1188mm / Total width: 1253mm / Required coil width: 1450mm' : (specs.roofProfile === '6v Profile' ? 'Covered width: 990mm / Total width: 1055mm / Required coil width: 1250mm' : '1060 mm (Effective Cover Width 1000 mm)'), category: 'Specifications' },
     { label: 'Thickness', value: specs.highWindVelocity || specs.snowLoad ? '0.60 mm / 0.65 mm (Reinforced thick gauge)' : '0.47 mm / 0.50 mm (Bare Galvalume or Color Coated)', category: 'Specifications' },
     { label: 'Color', value: specs.alternateRoofColors ? `${roofColorName} (Primary), ${altRoofColorName} (Alternate)` : `${roofColorName} / Color Coated Galvalume`, category: 'Specifications' },
     { label: 'Installation Steps', value: 'Eave alignment → Lifting sheets to roof → Fixing with 12-14 x 55mm self-drilling screws → Applying butyl tape at overlaps → Plain ridge & flashing installation', category: 'Installation Procedures' },
@@ -3529,7 +5648,7 @@ export default function App() {
     { label: 'Profile', value: specs.wallProfile === '7v Profile' ? '7v Profile (Trapezoidal)' : (specs.wallProfile === '6v Profile' ? '6v Profile (Trapezoidal)' : 'Trapezoidal Profile Sheet'), category: 'Specifications' },
     { label: 'Quantity', value: specs.alternateWallColors ? `${totalWallSheets} individual sheets total (${numMainWallSheets} Primary, ${numAltWallSheets} Alternate)` : `${totalWallSheets} individual sheets required (Total area ~${dimensionUnit === 'ft' ? (parseFloat(wallArea) * 10.7639).toFixed(0) : wallArea} ${dimensionUnit === 'ft' ? 'sq.ft' : 'm²'})`, category: 'Specifications' },
     { label: 'Length', value: wallSegments > 1 ? `Cut to ${dimensionUnit === 'ft' ? (actualWallSheetLength * 3.28084).toFixed(1) + ' ft' : actualWallSheetLength.toFixed(1) + ' m'} (${wallSegments} joined segments with ${dimensionUnit === 'ft' ? (wallOverlap * 3.28084).toFixed(1) + ' ft' : Math.round(wallOverlap * 1000) + ' mm'} end lap)` : `Cut to ${dimensionUnit === 'ft' ? (actualWallSheetLength * 3.28084).toFixed(1) + ' ft' : actualWallSheetLength.toFixed(1) + ' m'}`, category: 'Specifications' },
-    { label: 'Width', value: specs.wallProfile === '7v Profile' ? 'Covered width: 1188mm / Total width: 1253mm / Required coil width: 1440mm' : (specs.wallProfile === '6v Profile' ? 'Covered width: 960mm / Total width: 1060mm / Required coil width: 1220mm' : '1060 mm (Effective Cover Width 1000 mm)'), category: 'Specifications' },
+    { label: 'Width', value: specs.wallProfile === '7v Profile' ? 'Covered width: 1188mm / Total width: 1253mm / Required coil width: 1450mm' : (specs.wallProfile === '6v Profile' ? 'Covered width: 990mm / Total width: 1055mm / Required coil width: 1250mm' : '1060 mm (Effective Cover Width 1000 mm)'), category: 'Specifications' },
     { label: 'Thickness', value: specs.highWindVelocity || specs.snowLoad ? '0.60 mm / 0.65 mm (Reinforced thick gauge)' : '0.47 mm / 0.50 mm (Color Coated Galvalume)', category: 'Specifications' },
     { label: 'Color', value: specs.alternateWallColors ? `${wallColorName} (Primary), ${altWallColorName} (Alternate)` : `${wallColorName} / Color Coated Galvalume`, category: 'Specifications' },
     { label: 'Installation Steps', value: 'Setting base drip angle → Plumb alignment of first sheet → Fixing with 12-14 x 25mm self-drilling screws to girts → Successive overlapping → Corner & opening flashings', category: 'Installation Procedures' },
@@ -3566,6 +5685,112 @@ export default function App() {
     { label: 'Lifecycle (Durability)', value: 'Designed for a 50+ year structural lifecycle with appropriate anti-corrosion coating maintenance.', category: 'Lifecycle Assessment' },
     { label: 'Depreciation', value: 'Accelerated depreciation potential (typically 3-10% per annum depending on regional tax codes) owing to pre-engineered steel asset classification.', category: 'Financials' },
   ];
+
+  const handleImageUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    setIsUploadingImage(true);
+    setUploadError(null);
+    setExtractedSummary(null);
+
+    const reader = new FileReader();
+    reader.onloadend = async () => {
+      const base64String = reader.result as string;
+      try {
+        const response = await fetch("/api/identify-specs", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            image: base64String,
+            mimeType: file.type,
+          }),
+        });
+
+        if (!response.ok) {
+          const errData = await response.json();
+          throw new Error(errData.error || "Failed to analyze image");
+        }
+
+        const resData = await response.json();
+        if (resData.success && resData.data) {
+          const data = resData.data;
+
+          const isFt = data.dimensionUnit === 'ft';
+          setDimensionUnit(isFt ? 'ft' : 'm');
+
+          setSpecs((prev: ProjectSpecs) => {
+            const nextSpecs = { ...prev };
+            
+            if (data.width !== undefined) {
+              nextSpecs.width = isFt ? data.width * 0.3048 : data.width;
+            }
+            if (data.length !== undefined) {
+              nextSpecs.length = isFt ? data.length * 0.3048 : data.length;
+            }
+            if (data.eaveHeight !== undefined) {
+              nextSpecs.eaveHeight = isFt ? data.eaveHeight * 0.3048 : data.eaveHeight;
+            }
+            if (data.roofSlope !== undefined) {
+              nextSpecs.roofSlope = data.roofSlope;
+            }
+            if (data.roofType !== undefined) {
+              nextSpecs.roofType = data.roofType;
+            }
+            if (data.hasWalls !== undefined) {
+              nextSpecs.hasWalls = data.hasWalls;
+            }
+            if (data.hasRoof !== undefined) {
+              nextSpecs.hasRoof = data.hasRoof;
+            }
+
+            nextSpecs.hasPrimarySteel = data.hasPrimarySteel !== false;
+            nextSpecs.hasSecondarySteel = data.hasSecondarySteel !== false;
+            nextSpecs.hasGirts = data.hasGirts !== false;
+
+            if (data.columnProfile) nextSpecs.columnProfile = data.columnProfile;
+            if (data.rafterProfile) nextSpecs.rafterProfile = data.rafterProfile;
+            if (data.purlinProfile) nextSpecs.purlinProfile = data.purlinProfile;
+            if (data.girtProfile) nextSpecs.girtProfile = data.girtProfile;
+
+            if (data.additionalItems && Array.isArray(data.additionalItems)) {
+              nextSpecs.additionalItems = data.additionalItems.map((item: any) => ({
+                id: item.id || `item_${Math.random().toString(36).substr(2, 9)}`,
+                name: item.name,
+                unit: item.unit || 'units',
+                qty: item.qty !== undefined ? item.qty : '',
+                price: item.price !== undefined ? item.price : ''
+              }));
+            }
+
+            return nextSpecs;
+          });
+
+          setExtractedSummary(data.summary || "Successfully identified specifications and updated Bill of Materials.");
+          
+          setTimeout(() => {
+            setConfigTab('takeoff');
+          }, 500);
+        } else {
+          throw new Error("Invalid response format from server");
+        }
+      } catch (error: any) {
+        console.error("Error identifying specs:", error);
+        setUploadError(error.message || "Failed to analyze image. Please try again.");
+      } finally {
+        setIsUploadingImage(false);
+      }
+    };
+
+    reader.onerror = () => {
+      setUploadError("Failed to read image file.");
+      setIsUploadingImage(false);
+    };
+
+    reader.readAsDataURL(file);
+  };
 
   const handleSpecChange = (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) => {
     const { name, value } = e.target;
@@ -3819,8 +6044,8 @@ export default function App() {
   const pvcCapsTally = useMemo(() => {
     const tallies: { [color: string]: number } = {};
 
-    const effWall = specs.wallProfile === '6v Profile' ? 1.0 : (specs.wallProfile === '7v Profile' ? 1.2 : 1.0);
-    const effRoof = specs.roofProfile === '6v Profile' ? 1.0 : (specs.roofProfile === '7v Profile' ? 1.2 : 1.0);
+    const effWall = specs.wallProfile === '6v Profile' ? 0.99 : (specs.wallProfile === '7v Profile' ? 1.188 : 1.0);
+    const effRoof = specs.roofProfile === '6v Profile' ? 0.99 : (specs.roofProfile === '7v Profile' ? 1.188 : 1.0);
 
     const getCol = (key: string, base: string, type: 'roof'|'wall') => getPanelColor(key, base, type, specs, panelColors);
 
@@ -3945,9 +6170,104 @@ export default function App() {
 
       primaryPcsForBasePlates = totalColumns;
 
-      const rafRow = formatRow('rafters_rafprofile', `Rafters (${rafProfile}) - Total: ${dimensionUnit === 'ft' ? (rafterLinearMeasurement * 3.28084).toFixed(1) : rafterLinearMeasurement.toFixed(1)}${dimensionUnit === 'ft' ? 'ft' : 'm'}`, dimensionUnit === 'ft' ? '20ft pcs' : '6m pcs', rafPcs, Math.round(rafPricePerPc));
-      if (rafRow) {
-        createSection('Rafters', [rafRow]);
+      if (specs.frameType === 'Truss') {
+        let specificTrussType = 'Fink / Howe Triangular Truss';
+        if (specs.roofType === 'Single Slope') {
+          specificTrussType = 'Mono-pitch Pratt Truss';
+        } else if (specs.roofType === 'Curved') {
+          specificTrussType = 'Bowstring / Bow-chord Truss';
+        } else if (specs.roofType === 'Multi-Sloped Hut') {
+          specificTrussType = 'Gambrel / Cambered Truss';
+        }
+
+        const trussRows: any[] = [];
+        
+        // 1. Truss Top Chords
+        const tcProfile = '2*50*50*6000mm - 18kg';
+        const tcUnitWt = 18;
+        const tcPcs = Math.ceil(rafterLinearMeasurement / 6);
+        const tcPricePerPc = (primaryUnitCost / 1000) * tcUnitWt;
+        const tcRow = formatRow('truss_top_chords', `Truss Top Chords (${tcProfile}) - Total: ${dimensionUnit === 'ft' ? (rafterLinearMeasurement * 3.28084).toFixed(1) : rafterLinearMeasurement.toFixed(1)}${dimensionUnit === 'ft' ? 'ft' : 'm'}`, dimensionUnit === 'ft' ? '20ft pcs' : '6m pcs', tcPcs, Math.round(tcPricePerPc));
+        if (tcRow) trussRows.push(tcRow);
+
+        // 2. Truss Bottom Chords
+        const bcProfile = '2*50*50*6000mm - 18kg';
+        const bcUnitWt = 18;
+        const bcLength = specs.width * numFrames;
+        const bcPcs = Math.ceil(bcLength / 6);
+        const bcPricePerPc = (primaryUnitCost / 1000) * bcUnitWt;
+        const bcRow = formatRow('truss_bottom_chords', `Truss Bottom Chords (${bcProfile}) - Total: ${dimensionUnit === 'ft' ? (bcLength * 3.28084).toFixed(1) : bcLength.toFixed(1)}${dimensionUnit === 'ft' ? 'ft' : 'm'}`, dimensionUnit === 'ft' ? '20ft pcs' : '6m pcs', bcPcs, Math.round(bcPricePerPc));
+        if (bcRow) trussRows.push(bcRow);
+
+        // 3. Truss Webbing
+        const webProfile = '2*38*38*6000mm - 14kg';
+        const webUnitWt = 14;
+        
+        let singleTrussWebLength = 0;
+        const tw = specs.width;
+        const tslope = specs.roofSlope;
+
+        if (specs.roofType === 'Single Slope') {
+          const totRoofH = tw * (tslope / 100);
+          const vertLen = 2.5 * totRoofH;
+          let diagLen = 0;
+          for (let j = 1; j <= 3; j++) {
+            const dx = tw / 4;
+            const dy = ((j + 1) / 4) * totRoofH;
+            diagLen += Math.sqrt(dx * dx + dy * dy);
+          }
+          singleTrussWebLength = vertLen + diagLen;
+        } else if (specs.roofType === 'Curved') {
+          const roofH = (tw / 2) * (tslope / 100) * 1.5;
+          const numWebs = 6;
+          let vertLen = 0;
+          let diagLen = 0;
+          for (let j = 1; j < numWebs; j++) {
+            const t = j / numWebs;
+            const topY = 2 * roofH * t * (1 - t) * 4;
+            vertLen += topY;
+            if (j < numWebs - 1) {
+              const nextT = (j + 1) / numWebs;
+              const nextTopY = 2 * roofH * nextT * (1 - nextT) * 4;
+              const dx = tw / numWebs;
+              const dy = nextTopY;
+              diagLen += Math.sqrt(dx * dx + dy * dy);
+            }
+          }
+          singleTrussWebLength = vertLen + diagLen;
+        } else if (specs.roofType === 'Multi-Sloped Hut') {
+          const h_steep = (tw / 4) * (tslope * 1.5 / 100);
+          const h_shallow = (tw / 4) * (tslope * 0.5 / 100);
+          const vertLen = (h_steep + h_shallow) + 2 * h_steep;
+          const dx = tw * 0.25;
+          const dy = h_steep + h_shallow;
+          const diagLen = 2 * Math.sqrt(dx * dx + dy * dy);
+          singleTrussWebLength = vertLen + diagLen;
+        } else {
+          const roofH = (tw / 2) * (tslope / 100);
+          const vertLen = 2 * roofH;
+          const diag1 = 2 * Math.sqrt((tw / 4) * (tw / 4) + (roofH / 2) * (roofH / 2));
+          const diag2 = 2 * Math.sqrt((tw / 4) * (tw / 4) + (roofH / 2) * (roofH / 2));
+          singleTrussWebLength = vertLen + diag1 + diag2;
+        }
+
+        const webLength = singleTrussWebLength * numFrames;
+        const webPcs = Math.ceil(webLength / 6);
+        const webPricePerPc = (primaryUnitCost / 1000) * webUnitWt;
+        const webRow = formatRow('truss_webbing', `Truss Webbing Braces (${webProfile}) - Total: ${dimensionUnit === 'ft' ? (webLength * 3.28084).toFixed(1) : webLength.toFixed(1)}${dimensionUnit === 'ft' ? 'ft' : 'm'}`, dimensionUnit === 'ft' ? '20ft pcs' : '6m pcs', webPcs, Math.round(webPricePerPc));
+        if (webRow) trussRows.push(webRow);
+
+        // 4. Gusset Plates
+        const gussetCount = numFrames * (specs.roofType === 'Single Slope' ? 6 : 8);
+        const gussetRow = formatRow('truss_gussets', `Truss Gusset Plates (6mm Steel Plate)`, 'pcs', gussetCount, 250);
+        if (gussetRow) trussRows.push(gussetRow);
+
+        createSection(`Truss Structure (${specificTrussType})`, trussRows);
+      } else {
+        const rafRow = formatRow('rafters_rafprofile', `Rafters (${rafProfile}) - Total: ${dimensionUnit === 'ft' ? (rafterLinearMeasurement * 3.28084).toFixed(1) : rafterLinearMeasurement.toFixed(1)}${dimensionUnit === 'ft' ? 'ft' : 'm'}`, dimensionUnit === 'ft' ? '20ft pcs' : '6m pcs', rafPcs, Math.round(rafPricePerPc));
+        if (rafRow) {
+          createSection('Rafters', [rafRow]);
+        }
       }
     }
 
@@ -4575,7 +6895,64 @@ export default function App() {
 
             
             {configTab === 'project' && (
-              <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+              <div className="flex flex-col gap-4 w-full">
+                {/* AI Plan Upload Card */}
+                <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+                  <div className="bg-slate-50 border-b border-slate-200 px-5 py-4">
+                    <h3 className="font-semibold text-slate-800 flex items-center gap-2">
+                      <UploadCloud className="w-4 h-4 text-blue-500" />
+                      AI Specification & Plan Parser
+                    </h3>
+                  </div>
+                  <div className="p-5 flex flex-col gap-4">
+                    <p className="text-xs text-slate-500">
+                      Have a specification sheet, blueprint, or structural plan (such as a gabled or curved shed drawing)? Upload it here. Gemini AI will automatically detect dimensions, structure configurations, and generate the complete Bill of Materials (BOM) instantly.
+                    </p>
+                    
+                    <div className="relative border-2 border-dashed border-slate-200 rounded-lg p-6 text-center hover:border-blue-400 transition-colors bg-slate-50/50">
+                      <input 
+                        type="file" 
+                        accept="image/*" 
+                        onChange={handleImageUpload} 
+                        disabled={isUploadingImage}
+                        className="absolute inset-0 w-full h-full opacity-0 cursor-pointer disabled:cursor-not-allowed" 
+                      />
+                      <div className="flex flex-col items-center justify-center gap-2">
+                        {isUploadingImage ? (
+                          <>
+                            <div className="w-8 h-8 rounded-full border-4 border-blue-200 border-t-blue-500 animate-spin" />
+                            <span className="text-xs font-semibold text-blue-600 mt-1">Analyzing drawing & identifying BOM...</span>
+                          </>
+                        ) : (
+                          <>
+                            <UploadCloud className="w-8 h-8 text-slate-400" />
+                            <span className="text-xs font-medium text-slate-700">Click or drag structure drawing here</span>
+                            <span className="text-[10px] text-slate-400">PNG, JPG or JPEG specification sheets</span>
+                          </>
+                        )}
+                      </div>
+                    </div>
+
+                    {uploadError && (
+                      <div className="text-xs bg-rose-50 text-rose-600 p-2.5 rounded-lg border border-rose-100 font-medium">
+                        {uploadError}
+                      </div>
+                    )}
+
+                    {extractedSummary && (
+                      <div className="text-xs bg-emerald-50 text-emerald-700 p-3 rounded-lg border border-emerald-100 space-y-1.5 animate-in fade-in duration-200">
+                        <div className="font-semibold flex items-center gap-1.5">
+                          <CheckCircle2 className="w-3.5 h-3.5 text-emerald-500" />
+                          Specs Identified Successfully!
+                        </div>
+                        <p className="leading-relaxed font-mono text-[10px] bg-white/50 p-2 rounded border border-emerald-50 text-slate-700">{extractedSummary}</p>
+                        <p className="text-[10px] text-emerald-600/90 font-medium italic">Applied to 3D View & complete BOM is generated.</p>
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
                 <div className="bg-slate-50 border-b border-slate-200 px-5 py-4">
                   <h3 className="font-semibold text-slate-800 flex items-center gap-2">
                     <Building className="w-4 h-4 text-slate-500" />
@@ -4695,7 +7072,8 @@ export default function App() {
                   </div>
                 </div>
               </div>
-            )}
+            </div>
+          )}
 
             {configTab === 'primary' && (
               <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
@@ -4715,12 +7093,119 @@ export default function App() {
                    </label>
                    
                    {specs.hasPrimarySteel !== false && (
-                     <div className="flex flex-col gap-1 pt-2">
-                        <label className="text-xs font-semibold text-slate-600 uppercase tracking-wider">Frame Design</label>
-                        <select className="p-2 border border-slate-300 rounded focus:ring-2 focus:ring-blue-500 focus:outline-none" value={specs.frameType} onChange={(e) => setSpecs({...specs, frameType: e.target.value as any})}>
-                          <option value="Clear Span">Clear Span</option>
-                          <option value="Multi-Span">Multi-Span (Interior Columns)</option>
-                        </select>
+                     <div className="flex flex-col gap-4">
+                       <div className="flex flex-col gap-1">
+                          <label className="text-xs font-semibold text-slate-600 uppercase tracking-wider">Frame Design</label>
+                          <select className="p-2 border border-slate-300 rounded focus:ring-2 focus:ring-blue-500 focus:outline-none" value={specs.frameType} onChange={(e) => setSpecs({...specs, frameType: e.target.value as any})}>
+                            <option value="Clear Span">Clear Span</option>
+                            <option value="Multi-Span">Multi-Span (Interior Columns)</option>
+                            <option value="Truss">Truss-Framed (Triangular Webbing)</option>
+                          </select>
+                       </div>
+
+                       {/* Truss and Span Structural Advisor Card */}
+                       {(() => {
+                         const wMeters = specs.width;
+                         const wFeet = wMeters * 3.28084;
+                         const displayWidth = dimensionUnit === 'm' ? `${wMeters.toFixed(1)} m` : `${wFeet.toFixed(0)} ft`;
+                         
+                         let recommendedFrame: 'Clear Span' | 'Truss' = 'Clear Span';
+                         let spanCategory = 'Short Span';
+                         let advisorText = '';
+                         
+                         if (wMeters < 10) {
+                           recommendedFrame = 'Clear Span';
+                           spanCategory = 'Short Span';
+                           advisorText = `Under 10m (${(10*3.28084).toFixed(0)} ft), solid-web Clear Span portals are easy to install. However, lightweight prefabricated Trusses are a highly viable alternative if heavy lifting machinery is restricted.`;
+                         } else if (wMeters >= 10 && wMeters < 18) {
+                           recommendedFrame = 'Truss';
+                           spanCategory = 'Medium Span';
+                           advisorText = `For a ${displayWidth} span, a Truss-Framed system is highly recommended. At this medium span, standard rafters begin to deflect under self-weight. Trusses distribute forces axially, maximizing stiffness while reducing total steel weight by up to 25%.`;
+                         } else {
+                           recommendedFrame = 'Truss';
+                           spanCategory = 'Large Span';
+                           advisorText = `At ${displayWidth}, a Truss-Framed configuration is the optimal, professional choice. Solid beams over 18m require extremely deep web sections, increasing material costs and transport issues. Trusses effectively channel high bending stresses into pure tension and compression.`;
+                         }
+
+                         // Get Specific Truss Type recommendation based on Roof Type
+                         let specificTrussType = 'Fink / Howe Triangular Truss';
+                         let specificTrussDesc = 'Excellent for standard gable roof lines. Diagonal web struts divide the top chord into smaller sections to resist high snow/wind loads.';
+                         
+                         if (specs.roofType === 'Single Slope') {
+                           specificTrussType = 'Mono-pitch Pratt Truss';
+                           specificTrussDesc = 'Ideal for single-slope drainage. Diagonal webs slant upwards to higher supports to act in tension under gravity load, ensuring maximum material efficiency.';
+                         } else if (specs.roofType === 'Curved') {
+                           specificTrussType = 'Bowstring / Bow-chord Truss';
+                           specificTrussDesc = 'Curved top chord matches bending moment profiles, eliminating high stress points. Visually elegant and superior for architectural open spans.';
+                         } else if (specs.roofType === 'Multi-Sloped Hut') {
+                           specificTrussType = 'Gambrel / Cambered Truss';
+                           specificTrussDesc = 'Multi-pitch design offering high interior clearance and vertical headroom. Ideal for agricultural barns and custom storage silos.';
+                         }
+
+                         const isOptimalSelected = specs.frameType === recommendedFrame || (recommendedFrame === 'Truss' && specs.frameType === 'Truss');
+
+                         return (
+                           <div className="border border-indigo-100 rounded-xl bg-indigo-50/20 p-4 flex flex-col gap-4" id="truss-span-advisor-card">
+                             <div className="flex items-center justify-between border-b border-indigo-100/60 pb-2.5">
+                               <div className="flex items-center gap-1.5">
+                                 <DraftingCompass className="w-4 h-4 text-indigo-600" />
+                                 <span className="text-xs font-bold text-slate-700 uppercase tracking-wider">Truss & Span Advisor</span>
+                               </div>
+                               <span className="px-2 py-0.5 rounded bg-indigo-50 border border-indigo-100 text-[10px] font-bold text-indigo-700">
+                                 {spanCategory} ({displayWidth})
+                               </span>
+                             </div>
+
+                             <div className="flex flex-col gap-2">
+                               <div className="text-xs text-slate-600 leading-relaxed">
+                                 {advisorText}
+                               </div>
+
+                               <div className="mt-2 bg-white rounded-lg border border-slate-200 p-3 flex flex-col gap-2">
+                                 <div className="flex justify-between items-center">
+                                   <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Necessitated Truss Type</span>
+                                   <span className="px-2 py-0.5 rounded-full text-[9px] font-bold bg-amber-50 border border-amber-200 text-amber-700 uppercase tracking-wider">
+                                     Structural Best Match
+                                   </span>
+                                 </div>
+                                 <h4 className="font-bold text-slate-800 text-xs flex items-center gap-1.5">
+                                   <Activity className="w-3.5 h-3.5 text-indigo-500" />
+                                   {specificTrussType}
+                                 </h4>
+                                 <p className="text-[10px] text-slate-500 leading-normal">
+                                   {specificTrussDesc}
+                                 </p>
+                                </div>
+                             </div>
+
+                             <div className="pt-2 border-t border-slate-100 flex flex-col sm:flex-row items-center justify-between gap-3">
+                               <div className="flex items-center gap-1.5">
+                                 {isOptimalSelected ? (
+                                   <div className="flex items-center gap-1.5">
+                                     <CheckCircle2 className="w-4 h-4 text-emerald-500" />
+                                     <span className="text-[11px] font-semibold text-emerald-700">Optimal Frame Selected</span>
+                                   </div>
+                                 ) : (
+                                   <div className="flex items-center gap-1.5">
+                                     <div className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-ping" />
+                                     <span className="text-[11px] font-semibold text-amber-700">Truss Frame Recommended</span>
+                                   </div>
+                                 )}
+                               </div>
+
+                               {!isOptimalSelected && (
+                                 <button
+                                   onClick={() => setSpecs({ ...specs, frameType: 'Truss' })}
+                                   className="w-full sm:w-auto px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-md text-xs font-semibold transition-all shadow-sm hover:shadow active:scale-[0.98] flex items-center justify-center gap-1"
+                                 >
+                                   <Wrench className="w-3 h-3" />
+                                   Optimize to Truss Design
+                                 </button>
+                               )}
+                             </div>
+                           </div>
+                         );
+                       })()}
                      </div>
                    )}
                 </div>
@@ -4802,13 +7287,102 @@ export default function App() {
                           <label className="text-xs font-semibold text-slate-600 uppercase tracking-wider">Slope / Pitch (%)</label>
                           <input type="number" value={specs.roofSlope} onChange={(e) => setSpecs({...specs, roofSlope: Number(e.target.value)})} className="p-2 border border-slate-300 rounded focus:ring-2 focus:ring-blue-500 focus:outline-none" />
                         </div>
+
+                        {/* Slope Recommendation Advisor */}
+                        {(() => {
+                          let recommendedSlope = 10;
+                          let explanation = '';
+                          let title = '';
+
+                          if (specs.roofType === 'Single Slope') {
+                            recommendedSlope = specs.width > 12 ? 12 : 10;
+                            title = 'Single Slope Drainage Recommendation';
+                            explanation = `Single slope roofs have longer continuous sheet runs. A ${recommendedSlope}% pitch (approx. 1:${Math.round(100/recommendedSlope)}) is recommended for a ${specs.width.toFixed(1)}m span to guarantee high-velocity storm water drainage and completely prevent water backup at the sheet overlaps.`;
+                          } else if (specs.roofType === 'Curved') {
+                            recommendedSlope = 10;
+                            title = 'Curved Arch Pitch Advisor';
+                            explanation = 'For curved profiles, a 10% rise-to-span ratio creates an aerodynamically stable arch. This minimizes drag forces under high wind conditions while ensuring smooth runoff of debris and rainwater.';
+                          } else if (specs.roofType === 'Multi-Sloped Hut') {
+                            recommendedSlope = 10;
+                            title = 'Monitor Multi-Pitch Advisor';
+                            explanation = 'Multi-sloped monitor configurations are best suited to a baseline 10% slope. This creates a clean structural drop at the center monitor line, optimizing natural ridge-level ventilation and daylight penetration.';
+                          } else { // Hut-shaped / Gable
+                            if (specs.snowLoad) {
+                              recommendedSlope = 15;
+                              title = 'High Snow Shedding Design';
+                              explanation = 'Under snow load conditions, a steep 15% slope is highly recommended. This promotes gravity-driven snow sliding, reducing heavy weight accumulations and protecting the primary rafters from overloading.';
+                            } else if (specs.highWindVelocity) {
+                              recommendedSlope = 8;
+                              title = 'Low-Profile Wind Resistant Design';
+                              explanation = 'For high-velocity wind zones, a lower 8% slope is optimal. This reduces the building’s frontal profile and lowers the wind drag coefficient, minimizing uplift force (suction) on the roof sheets.';
+                            } else {
+                              recommendedSlope = 10;
+                              title = 'Standard PEB Gable Standard';
+                              explanation = 'A standard 10% (1:10) slope is the optimal engineering benchmark for industrial gable sheds. It minimizes raw steel weight (shorter rafters and webs) while keeping water drainage reliable.';
+                            }
+                          }
+
+                          const isOptimal = specs.roofSlope === recommendedSlope;
+
+                          return (
+                            <div className="border border-indigo-100 rounded-xl bg-indigo-50/20 p-4 flex flex-col gap-3" id="roof-slope-advisor-card">
+                              <div className="flex items-center justify-between border-b border-indigo-100/60 pb-2">
+                                <div className="flex items-center gap-1.5">
+                                  <DraftingCompass className="w-3.5 h-3.5 text-indigo-600" />
+                                  <span className="text-[10px] font-bold text-slate-700 uppercase tracking-wider">Roof Slope Advisor</span>
+                                </div>
+                                <span className="px-2 py-0.5 rounded bg-indigo-50 border border-indigo-100 text-[9px] font-bold text-indigo-700">
+                                  Recommended: {recommendedSlope}%
+                                </span>
+                              </div>
+
+                              <div className="flex flex-col gap-1.5">
+                                <h4 className="font-bold text-slate-800 text-[11px] flex items-center gap-1">
+                                  <Activity className="w-3 h-3 text-indigo-500" />
+                                  {title}
+                                </h4>
+                                <p className="text-[10px] text-slate-500 leading-relaxed">
+                                  {explanation}
+                                </p>
+                              </div>
+
+                              <div className="pt-1.5 border-t border-slate-100 flex flex-col sm:flex-row items-center justify-between gap-2">
+                                <div className="flex items-center gap-1.5">
+                                  {isOptimal ? (
+                                    <div className="flex items-center gap-1">
+                                      <CheckCircle2 className="w-3.5 h-3.5 text-emerald-500" />
+                                      <span className="text-[10px] font-semibold text-emerald-700">Matches Best Practice</span>
+                                    </div>
+                                  ) : (
+                                    <div className="flex items-center gap-1">
+                                      <span className="w-1.5 h-1.5 rounded-full bg-amber-500" />
+                                      <span className="text-[10px] font-semibold text-amber-700">Current: {specs.roofSlope}%</span>
+                                    </div>
+                                  )}
+                                </div>
+
+                                {!isOptimal && (
+                                  <button
+                                    onClick={() => setSpecs({ ...specs, roofSlope: recommendedSlope })}
+                                    className="w-full sm:w-auto px-2.5 py-1 bg-indigo-600 hover:bg-indigo-700 text-white rounded text-[10px] font-bold transition-all shadow-sm active:scale-[0.98] flex items-center justify-center gap-1"
+                                  >
+                                    <Wrench className="w-2.5 h-2.5" />
+                                    Apply Proposed {recommendedSlope}% Slope
+                                  </button>
+                                )}
+                              </div>
+                            </div>
+                          );
+                        })()}
+
                         <div className="flex flex-col gap-1">
                           <label className="text-xs font-semibold text-slate-600 uppercase tracking-wider">Profile</label>
                           <select className="p-2 border border-slate-300 rounded focus:ring-2 focus:ring-blue-500 focus:outline-none" value={specs.roofProfile} onChange={(e) => setSpecs({...specs, roofProfile: e.target.value as any})}>
-                            <option value="7v Profile">7v Profile (210mm pitch, 28-30mm depth)</option>
-                            <option value="6v Profile">6v Profile (330mm pitch, 32-35mm depth)</option>
+                            <option value="7v Profile">7v Profile (198mm pitch, 30mm depth)</option>
+                            <option value="6v Profile">6v Profile (198mm pitch, 30mm depth)</option>
                             <option value="Standard">Standard Corrugated</option>
                           </select>
+                          <ProfileDiagram type={specs.roofProfile || '7v Profile'} />
                         </div>
                         
                         <div className="pt-2 border-t border-slate-100 flex flex-col gap-3">
@@ -4867,6 +7441,290 @@ export default function App() {
               </div>
             )}
 
+            {/* Profile Sheet Leak Diagnostics & Prevention Tool */}
+            {configTab === 'roofing' && specs.hasRoof !== false && (
+              <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden mt-6 animate-in fade-in slide-in-from-bottom-2 duration-300">
+                <div className="bg-slate-50 border-b border-slate-200 px-5 py-4">
+                  <h3 className="font-semibold text-slate-800 flex items-center gap-2">
+                    <Droplet className="w-4 h-4 text-rose-500 animate-pulse" />
+                    Profile Sheet Leak Diagnostics & Prevention
+                  </h3>
+                </div>
+                <div className="p-5 flex flex-col gap-5">
+                  <p className="text-sm text-slate-600">
+                    Profile sheets can leak under high precipitation if overlapping joints, slope thresholds, or fastener washers are improperly designed. Use our interactive simulation below to observe how water droplets traverse the cladding profiles under different engineering remedies.
+                  </p>
+
+                  {/* Symptom Selector Tabs */}
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 bg-slate-100 p-1 rounded-xl">
+                    {[
+                      { id: 'overlap', label: 'Joint Overlaps', icon: Layers },
+                      { id: 'screw', label: 'Fasteners & Screws', icon: Settings2 },
+                      { id: 'ridge', label: 'Ridge Centerline', icon: ArrowUpToLine },
+                      { id: 'gutter', label: 'Eaves & Gutters', icon: Droplet },
+                    ].map(s => {
+                      const IconComp = s.icon;
+                      const isActive = activeLeakSymptom === s.id;
+                      return (
+                        <button
+                          key={s.id}
+                          type="button"
+                          onClick={() => setActiveLeakSymptom(activeLeakSymptom === s.id ? null : s.id as any)}
+                          className={`flex flex-col items-center justify-center gap-2 py-3 px-2 text-xs font-bold rounded-lg transition-all ${
+                            isActive 
+                              ? 'bg-rose-500 text-white shadow-md scale-[1.03] font-extrabold' 
+                              : 'text-slate-600 hover:text-slate-800 hover:bg-slate-200/50 bg-white border border-slate-200'
+                          }`}
+                        >
+                          <IconComp className="w-4 h-4" />
+                          {s.label}
+                        </button>
+                      );
+                    })}
+                  </div>
+
+                  <ProfileSheetWaterSimulator 
+                    specs={specs} 
+                    setSpecs={setSpecs} 
+                    activeSymptom={activeLeakSymptom} 
+                    setActiveSymptom={setActiveLeakSymptom} 
+                  />
+
+                  {/* Legacy Symptom Detail Display (Disabled) */}
+                  {false && activeLeakSymptom ? (
+                    <div className="bg-slate-50 border border-slate-200 rounded-xl p-4 space-y-4 animate-in fade-in slide-in-from-top-1 duration-200">
+                      {activeLeakSymptom === 'overlap' && (() => {
+                        const hasGoodSlope = specs.roofSlope >= (specs.roofType === 'Single Slope' ? 12 : 10);
+                        const isFixed = hasGoodSlope && specs.hasSilicon && specs.roofProfile === '6v Profile';
+                        return (
+                          <>
+                            <div className="space-y-1.5">
+                              <div className="flex items-center justify-between">
+                                <h4 className="text-sm font-bold text-slate-800">Symptom: Capillary Overlap Leakage</h4>
+                                {isFixed ? (
+                                  <span className="flex items-center gap-1.5 text-xs font-bold text-emerald-700 bg-emerald-50 px-2.5 py-1 rounded-full border border-emerald-200">
+                                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-500" /> Fully Resolved
+                                  </span>
+                                ) : (
+                                  <span className="flex items-center gap-1.5 text-xs font-bold text-rose-700 bg-rose-50 px-2.5 py-1 rounded-full border border-rose-200 animate-pulse">
+                                    Vulnerable
+                                  </span>
+                                )}
+                              </div>
+                              <p className="text-xs text-slate-500 leading-relaxed">
+                                Rainwater is drawn inside sheet side-laps via capillary draw or backs up at horizontal sheet overlaps (end-laps) under high winds. This is extremely common on shallow roofs (under 10%) without sealant.
+                              </p>
+                            </div>
+                            <div className="bg-white border border-slate-100 p-3.5 rounded-lg space-y-2 text-xs text-slate-600">
+                              <span className="font-bold text-slate-700 block">Engineering Standard Specifications Required:</span>
+                              <ul className="space-y-1.5 pl-1">
+                                <li className="flex items-center gap-2">
+                                  <span className={`w-2 h-2 rounded-full ${hasGoodSlope ? "bg-emerald-500" : "bg-slate-300"}`} />
+                                  <span className={hasGoodSlope ? "text-emerald-700 font-medium" : ""}>Roof slope pitch &ge; {specs.roofType === 'Single Slope' ? '12%' : '10%'} (Current: {specs.roofSlope}%)</span>
+                                </li>
+                                <li className="flex items-center gap-2">
+                                  <span className={`w-2 h-2 rounded-full ${specs.hasSilicon ? "bg-emerald-500" : "bg-slate-300"}`} />
+                                  <span className={specs.hasSilicon ? "text-emerald-700 font-medium" : ""}>Dual-line silicon sealant or butyl mastic tape on overlaps (Current: {specs.hasSilicon ? "Equipped" : "Missing"})</span>
+                                </li>
+                                <li className="flex items-center gap-2">
+                                  <span className={`w-2 h-2 rounded-full ${specs.roofProfile === '6v Profile' ? "bg-emerald-500" : "bg-slate-300"}`} />
+                                  <span className={specs.roofProfile === '6v Profile' ? "text-emerald-700 font-medium" : ""}>High-Rib 6v Profile sheeting (28-30mm depth with built-in anti-capillary groove)</span>
+                                </li>
+                              </ul>
+                            </div>
+                            {!isFixed && (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setSpecs(prev => ({
+                                    ...prev,
+                                    roofSlope: Math.max(prev.roofSlope, prev.roofType === 'Single Slope' ? 12 : 10),
+                                    hasSilicon: true,
+                                    roofProfile: '6v Profile'
+                                  }));
+                                }}
+                                className="w-full py-2 bg-rose-600 hover:bg-rose-700 text-white rounded-lg font-bold text-xs transition-all shadow-sm flex items-center justify-center gap-1.5 active:scale-[0.98]"
+                              >
+                                <Wrench className="w-3.5 h-3.5" />
+                                Apply Standard Overlap Sealant & Optimize Pitch
+                              </button>
+                            )}
+                          </>
+                        );
+                      })()}
+
+                      {activeLeakSymptom === 'screw' && (() => {
+                        const isFixed = specs.hasSDScrews && specs.hasPVCCaps;
+                        return (
+                          <>
+                            <div className="space-y-1.5">
+                              <div className="flex items-center justify-between">
+                                <h4 className="text-sm font-bold text-slate-800">Symptom: Fastener Screwhole Ingress</h4>
+                                {isFixed ? (
+                                  <span className="flex items-center gap-1.5 text-xs font-bold text-emerald-700 bg-emerald-50 px-2.5 py-1 rounded-full border border-emerald-200">
+                                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-500" /> Fully Resolved
+                                  </span>
+                                ) : (
+                                  <span className="flex items-center gap-1.5 text-xs font-bold text-rose-700 bg-rose-50 px-2.5 py-1 rounded-full border border-rose-200 animate-pulse">
+                                    Vulnerable
+                                  </span>
+                                )}
+                              </div>
+                              <p className="text-xs text-slate-500 leading-relaxed">
+                                Rainwater enters through fastener drill holes. This is caused by over-tightened/skewed screws, missing or degraded EPDM rubber washers, or fastening into troughs instead of the profile crests.
+                              </p>
+                            </div>
+                            <div className="bg-white border border-slate-100 p-3.5 rounded-lg space-y-2 text-xs text-slate-600">
+                              <span className="font-bold text-slate-700 block">Engineering Standard Specifications Required:</span>
+                              <ul className="space-y-1.5 pl-1">
+                                <li className="flex items-center gap-2">
+                                  <span className={`w-2 h-2 rounded-full ${specs.hasSDScrews ? "bg-emerald-500" : "bg-slate-300"}`} />
+                                  <span className={specs.hasSDScrews ? "text-emerald-700 font-medium" : ""}>Self-Drilling Screws (SDS) with integrated EPDM washers (Current: {specs.hasSDScrews ? "Equipped" : "Missing"})</span>
+                                </li>
+                                <li className="flex items-center gap-2">
+                                  <span className={`w-2 h-2 rounded-full ${specs.hasPVCCaps ? "bg-emerald-500" : "bg-slate-300"}`} />
+                                  <span className={specs.hasPVCCaps ? "text-emerald-700 font-medium" : ""}>PVC Protective Caps matching the sheet profile color (Current: {specs.hasPVCCaps ? "Equipped" : "Missing"})</span>
+                                </li>
+                              </ul>
+                            </div>
+                            {!isFixed && (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setSpecs(prev => ({
+                                    ...prev,
+                                    hasSDScrews: true,
+                                    hasPVCCaps: true
+                                  }));
+                                }}
+                                className="w-full py-2 bg-rose-600 hover:bg-rose-700 text-white rounded-lg font-bold text-xs transition-all shadow-sm flex items-center justify-center gap-1.5 active:scale-[0.98]"
+                              >
+                                <Wrench className="w-3.5 h-3.5" />
+                                Upgrade to High-Tensile SDScrews & Protective PVC Caps
+                              </button>
+                            )}
+                          </>
+                        );
+                      })()}
+
+                      {activeLeakSymptom === 'ridge' && (() => {
+                        const isFixed = specs.roofType === 'Single Slope' || specs.hasRidgeCap;
+                        return (
+                          <>
+                            <div className="space-y-1.5">
+                              <div className="flex items-center justify-between">
+                                <h4 className="text-sm font-bold text-slate-800">Symptom: Center Ridge Backflow</h4>
+                                {isFixed ? (
+                                  <span className="flex items-center gap-1.5 text-xs font-bold text-emerald-700 bg-emerald-50 px-2.5 py-1 rounded-full border border-emerald-200">
+                                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-500" /> Fully Resolved
+                                  </span>
+                                ) : (
+                                  <span className="flex items-center gap-1.5 text-xs font-bold text-rose-700 bg-rose-50 px-2.5 py-1 rounded-full border border-rose-200 animate-pulse">
+                                    Vulnerable
+                                  </span>
+                                )}
+                              </div>
+                              <p className="text-xs text-slate-500 leading-relaxed">
+                                Heavy storms and wind-driven rain blow rainwater back up under the center ridge flashing, where it overflows the top of the sheets and runs down onto internal structural beams.
+                              </p>
+                            </div>
+                            <div className="bg-white border border-slate-100 p-3.5 rounded-lg space-y-2 text-xs text-slate-600">
+                              <span className="font-bold text-slate-700 block">Engineering Standard Specifications Required:</span>
+                              <ul className="space-y-1.5 pl-1">
+                                <li className="flex items-center gap-2">
+                                  <span className={`w-2 h-2 rounded-full ${isFixed ? "bg-emerald-500" : "bg-slate-300"}`} />
+                                  <span className={isFixed ? "text-emerald-700 font-medium" : ""}>Heavy-gauge Plain Ridge Flashing with profile-matching overlaps (Current: {specs.hasRidgeCap ? "Equipped" : "Missing"})</span>
+                                </li>
+                                <li className="flex items-center gap-2">
+                                  <span className="w-2 h-2 rounded-full bg-emerald-500" />
+                                  <span>Trough turn-up (crest-crimped sheet ends) at the ridge centerline to block high-velocity water backflow</span>
+                                </li>
+                              </ul>
+                            </div>
+                            {!isFixed && (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setSpecs(prev => ({
+                                    ...prev,
+                                    hasRidgeCap: true
+                                  }));
+                                }}
+                                className="w-full py-2 bg-rose-600 hover:bg-rose-700 text-white rounded-lg font-bold text-xs transition-all shadow-sm flex items-center justify-center gap-1.5 active:scale-[0.98]"
+                              >
+                                <Wrench className="w-3.5 h-3.5" />
+                                Equip Custom Profile Plain Ridge Flashing
+                              </button>
+                            )}
+                          </>
+                        );
+                      })()}
+
+                      {activeLeakSymptom === 'gutter' && (() => {
+                        const isFixed = specs.hasGutters && specs.hasDownPipes;
+                        return (
+                          <>
+                            <div className="space-y-1.5">
+                              <div className="flex items-center justify-between">
+                                <h4 className="text-sm font-bold text-slate-800">Symptom: Gutter & Eaves Overspill</h4>
+                                {isFixed ? (
+                                  <span className="flex items-center gap-1.5 text-xs font-bold text-emerald-700 bg-emerald-50 px-2.5 py-1 rounded-full border border-emerald-200">
+                                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-500" /> Fully Resolved
+                                  </span>
+                                ) : (
+                                  <span className="flex items-center gap-1.5 text-xs font-bold text-rose-700 bg-rose-50 px-2.5 py-1 rounded-full border border-rose-200 animate-pulse">
+                                    Vulnerable
+                                  </span>
+                                )}
+                              </div>
+                              <p className="text-xs text-slate-500 leading-relaxed">
+                                Water cascades over the eave lines of the building too fast during monsoon-level storms, overflowing basic gutters and flooding down onto wall panels and causing leaks in sidewall cladding.
+                              </p>
+                            </div>
+                            <div className="bg-white border border-slate-100 p-3.5 rounded-lg space-y-2 text-xs text-slate-600">
+                              <span className="font-bold text-slate-700 block">Engineering Standard Specifications Required:</span>
+                              <ul className="space-y-1.5 pl-1">
+                                <li className="flex items-center gap-2">
+                                  <span className={`w-2 h-2 rounded-full ${specs.hasGutters ? "bg-emerald-500" : "bg-slate-300"}`} />
+                                  <span className={specs.hasGutters ? "text-emerald-700 font-medium" : ""}>High-flow, wide eaves gutters (Current: {specs.hasGutters ? "Equipped" : "Missing"})</span>
+                                </li>
+                                <li className="flex items-center gap-2">
+                                  <span className={`w-2 h-2 rounded-full ${specs.hasDownPipes ? "bg-emerald-500" : "bg-slate-300"}`} />
+                                  <span className={specs.hasDownPipes ? "text-emerald-700 font-medium" : ""}>Custom multi-outlet Down Pipes sized for peak flow drainage (Current: {specs.hasDownPipes ? "Equipped" : "Missing"})</span>
+                                </li>
+                              </ul>
+                            </div>
+                            {!isFixed && (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setSpecs(prev => ({
+                                    ...prev,
+                                    hasGutters: true,
+                                    hasDownPipes: true
+                                  }));
+                                }}
+                                className="w-full py-2 bg-rose-600 hover:bg-rose-700 text-white rounded-lg font-bold text-xs transition-all shadow-sm flex items-center justify-center gap-1.5 active:scale-[0.98]"
+                              >
+                                <Wrench className="w-3.5 h-3.5" />
+                                Add Custom High-Flow Gutters & Downpipes
+                              </button>
+                            )}
+                          </>
+                        );
+                      })()}
+                    </div>
+                  ) : (
+                    <div className="border-2 border-dashed border-slate-200 p-5 rounded-xl text-center bg-slate-50/50">
+                      <Droplet className="w-8 h-8 text-slate-300 mx-auto mb-2 text-rose-300 animate-pulse" />
+                      <p className="text-xs font-semibold text-slate-600">Select a Leak Symptom Above to Diagnose</p>
+                      <p className="text-[10px] text-slate-400 mt-1">Our PEB engine will evaluate active specifications and recommend design corrections.</p>
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+
             {configTab === 'walling' && (
               <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
                 <div className="bg-slate-50 border-b border-slate-200 px-5 py-4">
@@ -4889,10 +7747,11 @@ export default function App() {
                         <div className="flex flex-col gap-1 pt-2">
                           <label className="text-xs font-semibold text-slate-600 uppercase tracking-wider">Profile</label>
                           <select className="p-2 border border-slate-300 rounded focus:ring-2 focus:ring-blue-500 focus:outline-none" value={specs.wallProfile} onChange={(e) => setSpecs({...specs, wallProfile: e.target.value as any})}>
-                            <option value="7v Profile">7v Profile</option>
-                            <option value="6v Profile">6v Profile</option>
+                            <option value="7v Profile">7v Profile (198mm pitch, 30mm depth)</option>
+                            <option value="6v Profile">6v Profile (198mm pitch, 30mm depth)</option>
                             <option value="Standard">Standard Corrugated</option>
                           </select>
+                          <ProfileDiagram type={specs.wallProfile || '7v Profile'} />
                         </div>
                         
                         <div className="pt-2 border-t border-slate-100 flex flex-col gap-3">
@@ -5039,22 +7898,80 @@ export default function App() {
             )}
 
             {configTab === 'takeoff' && (
-              <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
-                <div className="bg-slate-50 border-b border-slate-200 px-5 py-4 flex justify-between items-center">
-                  <h3 className="font-semibold text-slate-800 flex items-center gap-2">
-                    <ClipboardList className="w-4 h-4 text-slate-500" />
-                    Required Materials Estimate
-                  </h3>
-                  <button onClick={() => setShowMaterialEstimate(true)} className="p-2 border border-blue-200 text-blue-600 rounded-lg hover:bg-blue-50 text-xs font-semibold">View BOM</button>
+              <div className="flex flex-col gap-4 w-full">
+                {/* AI Plan Upload Card */}
+                <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+                  <div className="bg-slate-50 border-b border-slate-200 px-5 py-4">
+                    <h3 className="font-semibold text-slate-800 flex items-center gap-2">
+                      <UploadCloud className="w-4 h-4 text-blue-500" />
+                      AI Specification & Plan Parser
+                    </h3>
+                  </div>
+                  <div className="p-5 flex flex-col gap-4">
+                    <p className="text-xs text-slate-500">
+                      Upload any structural plan, drawing, or specification sheet. Gemini AI will automatically detect specifications, update the 3D model, and identify the complete Bill of Materials (BOM) instantly.
+                    </p>
+                    
+                    <div className="relative border-2 border-dashed border-slate-200 rounded-lg p-6 text-center hover:border-blue-400 transition-colors bg-slate-50/50">
+                      <input 
+                        type="file" 
+                        accept="image/*" 
+                        onChange={handleImageUpload} 
+                        disabled={isUploadingImage}
+                        className="absolute inset-0 w-full h-full opacity-0 cursor-pointer disabled:cursor-not-allowed" 
+                      />
+                      <div className="flex flex-col items-center justify-center gap-2">
+                        {isUploadingImage ? (
+                          <>
+                            <div className="w-8 h-8 rounded-full border-4 border-blue-200 border-t-blue-500 animate-spin" />
+                            <span className="text-xs font-semibold text-blue-600 mt-1">Analyzing drawing & identifying BOM...</span>
+                          </>
+                        ) : (
+                          <>
+                            <UploadCloud className="w-8 h-8 text-slate-400" />
+                            <span className="text-xs font-medium text-slate-700">Click or drag structure drawing here</span>
+                            <span className="text-[10px] text-slate-400">PNG, JPG or JPEG specification sheets</span>
+                          </>
+                        )}
+                      </div>
+                    </div>
+
+                    {uploadError && (
+                      <div className="text-xs bg-rose-50 text-rose-600 p-2.5 rounded-lg border border-rose-100 font-medium">
+                        {uploadError}
+                      </div>
+                    )}
+
+                    {extractedSummary && (
+                      <div className="text-xs bg-emerald-50 text-emerald-700 p-3 rounded-lg border border-emerald-100 space-y-1.5 animate-in fade-in duration-200">
+                        <div className="font-semibold flex items-center gap-1.5">
+                          <CheckCircle2 className="w-3.5 h-3.5 text-emerald-500" />
+                          Specs Identified Successfully!
+                        </div>
+                        <p className="leading-relaxed font-mono text-[10px] bg-white/50 p-2 rounded border border-emerald-50 text-slate-700">{extractedSummary}</p>
+                        <p className="text-[10px] text-emerald-600/90 font-medium italic">Applied to 3D View & complete BOM is generated.</p>
+                      </div>
+                    )}
+                  </div>
                 </div>
-              <div className="p-5">
-                <MaterialVisualizer 
-                  primary={parseFloat(primarySteel)} 
-                  secondary={parseFloat(secondarySteel)}
-                  hardware={parseFloat(accessories)}
-                />
+
+                <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+                  <div className="bg-slate-50 border-b border-slate-200 px-5 py-4 flex justify-between items-center">
+                    <h3 className="font-semibold text-slate-800 flex items-center gap-2">
+                      <ClipboardList className="w-4 h-4 text-slate-500" />
+                      Required Materials Estimate
+                    </h3>
+                    <button onClick={() => setShowMaterialEstimate(true)} className="p-2 border border-blue-200 text-blue-600 rounded-lg hover:bg-blue-50 text-xs font-semibold">View BOM</button>
+                  </div>
+                  <div className="p-5">
+                    <MaterialVisualizer 
+                      primary={parseFloat(primarySteel)} 
+                      secondary={parseFloat(secondarySteel)}
+                      hardware={parseFloat(accessories)}
+                    />
+                  </div>
+                </div>
               </div>
-            </div>
             )}
 {/* Step Navigation Controls */}
             <div className="flex justify-between items-center mt-2 pt-2 border-t border-slate-200">
@@ -5093,35 +8010,181 @@ export default function App() {
           <div className="lg:col-span-8 space-y-6">
             {/* Visualizer & Colors */}
             <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
-              <div className="bg-slate-100 border-b border-slate-200 px-5 py-3 flex justify-between items-center">
+              <div className="bg-slate-100 border-b border-slate-200 px-5 py-3 flex flex-col md:flex-row justify-between items-start md:items-center gap-3">
                 <h3 className="font-semibold text-slate-800 flex items-center gap-2">
                   <Monitor className="w-4 h-4 text-slate-500" />
-                  Structure Visualization
+                  Structure Views & Elevation Blueprints
                 </h3>
-                <div className="flex bg-slate-200 p-0.5 rounded-lg">
+                <div className="flex flex-wrap gap-1 bg-slate-200 p-1 rounded-lg w-full md:w-auto">
                   <button
-                    onClick={() => setIs3DMode(false)}
-                    className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${!is3DMode ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}
+                    onClick={() => setVisualizerTab('3d-model')}
+                    className={`flex-1 md:flex-initial px-3 py-1.5 text-xs font-semibold rounded-md transition-all ${visualizerTab === '3d-model' ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-600 hover:text-slate-800'}`}
                   >
-                    2D
+                    3D Full Model
                   </button>
                   <button
-                    onClick={() => setIs3DMode(true)}
-                    className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${is3DMode ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}
+                    onClick={() => setVisualizerTab('3d-frame')}
+                    className={`flex-1 md:flex-initial px-3 py-1.5 text-xs font-semibold rounded-md transition-all ${visualizerTab === '3d-frame' ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-600 hover:text-slate-800'}`}
                   >
-                    3D
+                    3D Structural Frame
+                  </button>
+                  <button
+                    onClick={() => setVisualizerTab('front-elevation')}
+                    className={`flex-1 md:flex-initial px-3 py-1.5 text-xs font-semibold rounded-md transition-all ${visualizerTab === 'front-elevation' ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-600 hover:text-slate-800'}`}
+                  >
+                    Front Elev.
+                  </button>
+                  <button
+                    onClick={() => setVisualizerTab('side-elevation')}
+                    className={`flex-1 md:flex-initial px-3 py-1.5 text-xs font-semibold rounded-md transition-all ${visualizerTab === 'side-elevation' ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-600 hover:text-slate-800'}`}
+                  >
+                    Side Elev.
+                  </button>
+                  <button
+                    onClick={() => setVisualizerTab('top-plan')}
+                    className={`flex-1 md:flex-initial px-3 py-1.5 text-xs font-semibold rounded-md transition-all ${visualizerTab === 'top-plan' ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-600 hover:text-slate-800'}`}
+                  >
+                    Top Plan
                   </button>
                 </div>
               </div>
-              {is3DMode ? (
-                <Building3DVisualizer specs={specs} dimensionUnit={dimensionUnit} panelColors={panelColors} setPanelColors={setPanelColors} />
-              ) : (
-                <BuildingVisualizer specs={specs} dimensionUnit={dimensionUnit} />
-              )}
-              <div className="border-t border-slate-200 bg-slate-50">
-                
+              <div className="relative">
+                {visualizerTab === '3d-model' && (
+                  <Building3DVisualizer specs={specs} dimensionUnit={dimensionUnit} panelColors={panelColors} setPanelColors={setPanelColors} framingOnly={false} weatherType={weatherType} />
+                )}
+                {visualizerTab === '3d-frame' && (
+                  <Building3DVisualizer specs={specs} dimensionUnit={dimensionUnit} panelColors={panelColors} setPanelColors={setPanelColors} framingOnly={true} weatherType={weatherType} />
+                )}
+                {visualizerTab === 'front-elevation' && (
+                  <BuildingVisualizer specs={specs} dimensionUnit={dimensionUnit} view="front" />
+                )}
+                {visualizerTab === 'side-elevation' && (
+                  <BuildingVisualizer specs={specs} dimensionUnit={dimensionUnit} view="side" />
+                )}
+                {visualizerTab === 'top-plan' && (
+                  <BuildingVisualizer specs={specs} dimensionUnit={dimensionUnit} view="top" />
+                )}
+              </div>
+              <div className="border-t border-slate-200 bg-slate-50/70 p-4">
+                <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
+                  <div className="space-y-1">
+                    <h4 className="text-sm font-semibold text-slate-800 flex items-center gap-1.5">
+                      <Zap className="w-4 h-4 text-amber-500 animate-pulse" />
+                      Environmental Simulator & Load Stress Testing
+                    </h4>
+                    <p className="text-xs text-slate-500">
+                      Simulate extreme weather actions to visualize live water runoff paths and structural load stress distributions.
+                    </p>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2 bg-slate-200/80 p-1 rounded-lg">
+                    <div className="flex flex-wrap gap-1">
+                      {[
+                        { type: 'clear', label: 'Clear Sky', icon: Sun, color: 'text-amber-500', activeBg: 'bg-white text-slate-800 shadow-sm' },
+                        { type: 'rain', label: 'Heavy Rain', icon: CloudRain, color: 'text-blue-500', activeBg: 'bg-white text-slate-800 shadow-sm' },
+                        { type: 'snow', label: 'Snow Load', icon: Snowflake, color: 'text-sky-400', activeBg: 'bg-white text-slate-800 shadow-sm' },
+                        { type: 'storm', label: 'High Wind Storm', icon: Wind, color: 'text-indigo-500', activeBg: 'bg-white text-slate-800 shadow-sm' },
+                      ].map(w => {
+                        const IconComp = w.icon;
+                        const isActive = weatherType === w.type;
+                        return (
+                          <button
+                            key={w.type}
+                            onClick={() => setWeatherType(w.type as any)}
+                            className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-md transition-all ${
+                              isActive ? w.activeBg : 'text-slate-600 hover:text-slate-800 hover:bg-slate-300/50'
+                            }`}
+                          >
+                            <IconComp className={`w-3.5 h-3.5 ${w.color}`} />
+                            {w.label}
+                          </button>
+                        );
+                      })}
+                    </div>
+
+                    {/* Procedural Rain Sound Toggle & Volume Slider */}
+                    {(weatherType === 'rain' || weatherType === 'storm') && (
+                      <div className="flex items-center gap-2 px-2 border-l border-slate-300 ml-1 animate-in fade-in slide-in-from-left-1 duration-300">
+                        <button
+                          type="button"
+                          title={isAudioEnabled ? "Mute Rain Sound" : "Unmute Rain Sound"}
+                          onClick={() => setIsAudioEnabled(!isAudioEnabled)}
+                          className={`p-1.5 rounded transition-colors ${
+                            isAudioEnabled 
+                              ? 'text-blue-600 bg-white shadow-sm hover:bg-blue-50' 
+                              : 'text-slate-500 hover:text-slate-700 hover:bg-slate-300/40'
+                          }`}
+                        >
+                          {isAudioEnabled ? <Volume2 className="w-3.5 h-3.5" /> : <VolumeX className="w-3.5 h-3.5" />}
+                        </button>
+                        <div className="flex items-center gap-1.5">
+                          <input
+                            type="range"
+                            min="0"
+                            max="1"
+                            step="0.05"
+                            value={audioVolume}
+                            onChange={(e) => setAudioVolume(parseFloat(e.target.value))}
+                            className="w-16 h-1 bg-slate-300 rounded appearance-none cursor-pointer accent-blue-600 focus:outline-none"
+                            style={{
+                              background: `linear-gradient(to right, #2563eb 0%, #2563eb ${audioVolume * 100}%, #cbd5e1 ${audioVolume * 100}%, #cbd5e1 100%)`
+                            }}
+                          />
+                          <span className="text-[9px] font-mono font-bold text-slate-500 w-6">
+                            {Math.round(audioVolume * 100)}%
+                          </span>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                {/* Live Stress / Runoff Feedback Ticker */}
+                {weatherType !== 'clear' && (
+                  <div className="mt-3 text-[11px] font-mono bg-white border border-slate-200/80 rounded-lg p-2.5 space-y-1.5 text-slate-600 animate-in fade-in slide-in-from-top-1 duration-200">
+                    {weatherType === 'rain' && (
+                      <div className="flex items-center gap-2">
+                        <span className="w-2 h-2 rounded-full bg-blue-500 animate-ping shrink-0" />
+                        <div className="flex-1 flex justify-between items-center flex-wrap gap-2">
+                          <span>
+                            <strong className="text-blue-700">RUNOFF SIMULATION ACTIVE:</strong> Stormwater flowing down roof slope into gutters; downpipes discharging at <strong>{(specs.width * specs.length * 0.05).toFixed(1)} L/min</strong>. No leaks detected.
+                          </span>
+                          <span className="text-[10px] font-bold text-slate-400 bg-slate-100 px-1.5 py-0.5 rounded flex items-center gap-1 shrink-0">
+                            <Volume2 className="w-3 h-3 text-blue-500 animate-pulse" /> Synthesized metal-roof rain audio active
+                          </span>
+                        </div>
+                      </div>
+                    )}
+                    {weatherType === 'snow' && (
+                      <div className="flex items-center gap-2">
+                        <span className="w-2 h-2 rounded-full bg-red-500 animate-pulse shrink-0" />
+                        <span>
+                          <strong className="text-red-700">GRAVITY LOAD WARNING (Snow):</strong> Accumulating weight on roof sheeting. Rafter compression and purlin shear stressed. Rafter elements colored in <span className="text-rose-600 font-bold">RED</span> showing design stress limits.
+                        </span>
+                      </div>
+                    )}
+                    {weatherType === 'storm' && (
+                      <div className="flex items-center gap-2">
+                        <span className="w-2 h-2 rounded-full bg-indigo-500 animate-pulse shrink-0" />
+                        <div className="flex-1 flex justify-between items-center flex-wrap gap-2">
+                          <span>
+                            <strong className="text-indigo-700">UPLIFT FORCE WARNING:</strong> High-velocity wind passing over eave peaks creates aerodynamic suction. Rafter & purlin anchors highlighted in <span className="text-cyan-600 font-bold">CYAN</span> showing tension resistance path.
+                          </span>
+                          <span className="text-[10px] font-bold text-slate-400 bg-slate-100 px-1.5 py-0.5 rounded flex items-center gap-1 shrink-0">
+                            <Volume2 className="w-3 h-3 text-indigo-500 animate-pulse" /> Storm gusts & rain audio active
+                          </span>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
             </div>
+
+            <StructuralLoadOptimizer specs={specs} setSpecs={setSpecs} dimensionUnit={dimensionUnit} />
+
+            {specs.frameType === 'Truss' && (
+              <TrussForceAnalyzer specs={specs} dimensionUnit={dimensionUnit} />
+            )}
 
             {/* Manufacturing & Construction Process Visualizer */}
             <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">

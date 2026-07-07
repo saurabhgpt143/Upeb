@@ -11,6 +11,9 @@ export const MaterialIcon = ({ type, className = "w-8 h-8" }: { type: string, cl
       );
     case 'rafters':
     case 'rafters_rafprofile':
+    case 'truss_top_chords':
+    case 'truss_bottom_chords':
+    case 'truss_webbing':
       return (
         <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" className={className}>
           <path d="M4 18L12 8L20 18H17L12 11.75L7 18H4Z" fill="currentColor" />
@@ -87,6 +90,7 @@ export const MaterialIcon = ({ type, className = "w-8 h-8" }: { type: string, cl
     case 'purlin_plates':
     case 'girt_plates':
     case 'screws':
+    case 'truss_gussets':
       return (
         <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" className={className}>
           <path d="M12 21V10M12 10L15 7H9L12 10ZM12 10V6M9 6H15L14 3H10L9 6Z" stroke="currentColor" strokeWidth="2" strokeLinejoin="round" />

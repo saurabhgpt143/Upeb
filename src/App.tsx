@@ -934,7 +934,7 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
                 <mesh receiveShadow position={[0, 0, -0.005]}>
                   <shapeGeometry args={[sShape]} />
                   <meshStandardMaterial 
-                    color={specs.hasInsulation !== false ? "#b0bec5" : "#e2e8f0"}
+                    color={specs.hasInsulation !== false ? "#b0bec5" : "#d3d3d3"}
                     roughness={specs.hasInsulation !== false ? 0.3 : 0.7}
                     metalness={specs.hasInsulation !== false ? 0.8 : 0.1}
                     side={THREE.BackSide} 
@@ -975,7 +975,7 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
                 <mesh receiveShadow position={[0, 0, -0.005]}>
                   <shapeGeometry args={[sShape]} />
                   <meshStandardMaterial 
-                    color={specs.hasInsulation !== false ? "#b0bec5" : "#e2e8f0"}
+                    color={specs.hasInsulation !== false ? "#b0bec5" : "#d3d3d3"}
                     roughness={specs.hasInsulation !== false ? 0.3 : 0.7}
                     metalness={specs.hasInsulation !== false ? 0.8 : 0.1}
                     side={THREE.BackSide} 
@@ -1093,7 +1093,7 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
                  </mesh>
                  <mesh receiveShadow position={[0, 0, 0.005]}>
                    <shapeGeometry args={[s]} />
-                   <meshStandardMaterial color={specs.hasInsulation !== false ? "#b0bec5" : "#e2e8f0"} roughness={specs.hasInsulation !== false ? 0.3 : 0.7} metalness={specs.hasInsulation !== false ? 0.8 : 0.1} side={THREE.FrontSide} />
+                   <meshStandardMaterial color={specs.hasInsulation !== false ? "#b0bec5" : "#d3d3d3"} roughness={specs.hasInsulation !== false ? 0.3 : 0.7} metalness={specs.hasInsulation !== false ? 0.8 : 0.1} side={THREE.FrontSide} />
                  </mesh>
                </group>
              );
@@ -1158,7 +1158,7 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
                  </mesh>
                  <mesh receiveShadow position={[0, 0, -0.005]}>
                    <shapeGeometry args={[sBack]} />
-                   <meshStandardMaterial color={specs.hasInsulation !== false ? "#b0bec5" : "#e2e8f0"} roughness={specs.hasInsulation !== false ? 0.3 : 0.7} metalness={specs.hasInsulation !== false ? 0.8 : 0.1} side={THREE.BackSide} />
+                   <meshStandardMaterial color={specs.hasInsulation !== false ? "#b0bec5" : "#d3d3d3"} roughness={specs.hasInsulation !== false ? 0.3 : 0.7} metalness={specs.hasInsulation !== false ? 0.8 : 0.1} side={THREE.BackSide} />
                  </mesh>
                </group>
              );
@@ -1380,10 +1380,27 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
                       metalness={0.6} 
                       roughness={0.3} 
                       envMapIntensity={1.2} 
-                      side={THREE.DoubleSide}
+                      side={THREE.FrontSide}
                     />
                   )}
                 </mesh>
+                {!isSkylight && (
+                  <mesh receiveShadow
+                    position={[locX - (segLength - overlapGap) / 2, -0.005, (wSheet - overlapGap) / 2]}
+                    rotation={[0, Math.PI / 2, 0]}
+                  >
+                    <extrudeGeometry args={[
+                      createTrapezoidalShape(wSheet - overlapGap, specs.roofProfile || '7v Profile'),
+                      { depth: segLength - overlapGap, bevelEnabled: false }
+                    ]} />
+                    <meshStandardMaterial 
+                      color={specs.hasInsulation !== false ? "#b0bec5" : "#d3d3d3"}
+                      roughness={specs.hasInsulation !== false ? 0.3 : 0.7}
+                      metalness={specs.hasInsulation !== false ? 0.8 : 0.1}
+                      side={THREE.BackSide}
+                    />
+                  </mesh>
+                )}
                 {/* Real-time Insulation layer beneath Roof Panel */}
                 {specs.hasInsulation !== false && !isSkylight && (
                   <mesh position={[locX, -0.012, 0]}>
@@ -1411,15 +1428,53 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
     });
   };
 
+  // Unified Gutter coordinate calculations across all roof types
+  let gutterL_X = -w / 2 - 0.3;
+  let gutterR_X = w / 2 + 0.3;
+  let gutterY = h + 0.35;
+
+  if (specs.roofType === 'Curved') {
+    const basePurlinTopOffset = modelPurlinYOffset + 0.075;
+    gutterL_X = -w / 2 - 0.5 - 0.05;
+    gutterR_X = w / 2 + 0.5 + 0.05;
+    gutterY = h + basePurlinTopOffset - 0.1 - 0.15;
+  } else if (specs.roofType === 'Single Slope') {
+    const totRoofH = w * (specs.roofSlope / 100);
+    const angle = Math.atan(totRoofH / w);
+    const panelYOffset = modelPurlinYOffset + 0.075;
+    const X_eave = -w / 2 - 0.5 * Math.cos(angle) - 0.1 * Math.sin(angle);
+    const Y_eave = h + panelYOffset - 0.5 * Math.sin(angle);
+    gutterL_X = X_eave - 0.05;
+    gutterR_X = w / 2 + 0.3; // Unused for Single Slope
+    gutterY = Y_eave - 0.15;
+  } else if (specs.roofType === 'Multi-Sloped Hut') {
+    const h_steep = (w / 4) * (specs.roofSlope * 1.5 / 100);
+    const a_steep = Math.atan(h_steep / (w / 4));
+    const offsetSteep = modelPurlinYOffset + 0.075;
+    const X_eave = -w / 2 - 0.5 * Math.cos(a_steep);
+    const Y_eave = h + offsetSteep - 0.5 * Math.sin(a_steep);
+    gutterL_X = X_eave - 0.05;
+    gutterR_X = w / 2 + 0.5 * Math.cos(a_steep) + 0.05;
+    gutterY = Y_eave - 0.15;
+  } else {
+    const roofH = (w / 2) * (specs.roofSlope / 100);
+    const angle = Math.atan(roofH / (w / 2));
+    const panelYOffset = modelPurlinYOffset + 0.075;
+    const X_eave = -w / 2 - 0.5 * Math.cos(angle);
+    const Y_eave = h + panelYOffset - 0.5 * Math.sin(angle);
+    gutterL_X = X_eave - 0.05;
+    gutterR_X = w / 2 + 0.5 * Math.cos(angle) + 0.05;
+    gutterY = Y_eave - 0.15;
+  }
+
   const roofPanels = [];
   if (specs.roofType === 'Single Slope') {
     const totRoofH = w * (specs.roofSlope / 100);
     const angle = Math.atan(totRoofH / w);
     const base_rl = Math.sqrt(w * w + totRoofH * totRoofH);
     const rl = base_rl + 0.5; // low eave overhang only
-    // shifting left by 0.1 * sin(angle) to prevent the bottom corner of the thick roof box from poking out
-    const cx = -0.25 * Math.cos(angle) - 0.1 * Math.sin(angle);
-    const panelYOffset = modelPurlinYOffset + 0.075 + 0.1 / Math.cos(angle);
+    const cx = -0.25 * Math.cos(angle);
+    const panelYOffset = modelPurlinYOffset + 0.075;
     const cy = (h + totRoofH / 2 + panelYOffset) - 0.25 * Math.sin(angle);
     roofPanels.push(...renderRoofPanelArea('single', cx, cy, rl, angle));
   } else if (specs.roofType === 'Multi-Sloped Hut') {
@@ -1432,8 +1487,8 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
     const a_steep = Math.atan(h_steep / (w / 4));
     const a_shallow = Math.atan(h_shallow / (w / 4));
 
-    const offsetSteep = modelPurlinYOffset + 0.075 + 0.1 / Math.cos(a_steep);
-    const offsetShallow = modelPurlinYOffset + 0.075 + 0.1 / Math.cos(a_shallow);
+    const offsetSteep = modelPurlinYOffset + 0.075;
+    const offsetShallow = modelPurlinYOffset + 0.075;
 
     roofPanels.push(...renderRoofPanelArea('m1', -w * 0.375 - 0.25 * Math.cos(a_steep), h + h_steep / 2 + offsetSteep - 0.25 * Math.sin(a_steep), rl_steep + 0.5, a_steep));
     roofPanels.push(...renderRoofPanelArea('m2', -w * 0.125, h + h_steep + h_shallow / 2 + offsetShallow, rl_shallow, a_shallow)); // no overhang on middle sections
@@ -1452,9 +1507,9 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
 
     const basePurlinTopOffset = modelPurlinYOffset + 0.075;
 
-    const I0 = {x: -w / 2 - 0.5, y: h + basePurlinTopOffset - 0.1};
-    const I1 = {x: 0, y: h + roofH * 2 + basePurlinTopOffset + 0.1};
-    const I2 = {x: w / 2 + 0.5, y: h + basePurlinTopOffset - 0.1};
+    const I0 = {x: -w / 2 - 0.5, y: h + basePurlinTopOffset};
+    const I1 = {x: 0, y: h + roofH * 2 + basePurlinTopOffset};
+    const I2 = {x: w / 2 + 0.5, y: h + basePurlinTopOffset};
 
     const O0 = {x: -w / 2 - 0.5, y: I0.y + 0.0005};
     const O1 = {x: 0, y: I1.y + 0.0005};
@@ -1526,7 +1581,7 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
                     <meshStandardMaterial color="#e0f2fe" roughness={0.1} metalness={0.1} transparent opacity={0.6} depthWrite={false} side={THREE.BackSide} />
                   ) : (
                     <meshStandardMaterial 
-                      color={specs.hasInsulation !== false ? "#b0bec5" : "#e2e8f0"}
+                      color={specs.hasInsulation !== false ? "#b0bec5" : "#d3d3d3"}
                       roughness={specs.hasInsulation !== false ? 0.3 : 0.7}
                       metalness={specs.hasInsulation !== false ? 0.8 : 0.1}
                       side={THREE.BackSide} 
@@ -1547,7 +1602,7 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
     const base_rl = Math.sqrt((w / 2) * (w / 2) + roofH * roofH);
     const rl = base_rl + 0.5;
     const cx1 = -w / 4 - 0.25 * Math.cos(angle);
-    const panelYOffset = modelPurlinYOffset + 0.075 + 0.1 / Math.cos(angle);
+    const panelYOffset = modelPurlinYOffset + 0.075;
     const cy1 = h + roofH / 2 + panelYOffset - 0.25 * Math.sin(angle);
     const cx2 = w / 4 + 0.25 * Math.cos(angle);
     
@@ -1578,27 +1633,27 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
       );
     };
 
-    const leftGutterY = specs.roofType === 'Curved' ? h + 0.15 : h + 0.35;
-    
     // Left Gutter
-    ancillaryElements.push(renderGutter("gutter_L", -w / 2 - 0.3, leftGutterY, l));
+    ancillaryElements.push(renderGutter("gutter_L", gutterL_X, gutterY, l));
 
     // Right Gutter
     if (specs.roofType !== 'Single Slope') {
-      ancillaryElements.push(renderGutter("gutter_R", w / 2 + 0.3, leftGutterY, l));
+      ancillaryElements.push(renderGutter("gutter_R", gutterR_X, gutterY, l));
     }
   }
 
   if (specs.hasRoof !== false && specs.hasRidgeCap !== false) {
     const rCapColor = specs.ridgeCapColor || '#383e42';
-    const renderInvertedVRidge = (keyStr: string, x: number, y: number, zLen: number, angle: number) => (
-      <group key={keyStr} position={[x, y + 0.75 + (specs.roofType === 'Curved' ? 0.3 : 0), l / 2]}>
-        <mesh position={[-0.2, -0.05, 0]} rotation={[0, 0, angle]}>
-           <boxGeometry args={[0.5, 0.05, zLen]} />
+    const isStandard = specs.roofProfile === 'Standard';
+    const peakHeight = isStandard ? 0.018 : 0.030;
+    const renderInvertedVRidge = (keyStr: string, x: number, y: number, zLen: number, angle: number, offset: number) => (
+      <group key={keyStr} position={[x, y + offset + peakHeight, l / 2]}>
+        <mesh position={[-0.2, -0.01, 0]} rotation={[0, 0, angle]}>
+           <boxGeometry args={[0.5, 0.01, zLen]} />
            <meshStandardMaterial color={rCapColor} roughness={0.7} />
         </mesh>
-        <mesh position={[0.2, -0.05, 0]} rotation={[0, 0, -angle]}>
-           <boxGeometry args={[0.5, 0.05, zLen]} />
+        <mesh position={[0.2, -0.01, 0]} rotation={[0, 0, -angle]}>
+           <boxGeometry args={[0.5, 0.01, zLen]} />
            <meshStandardMaterial color={rCapColor} roughness={0.7} />
         </mesh>
       </group>
@@ -1608,17 +1663,21 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
       const h_steep = (w / 4) * (specs.roofSlope * 1.5 / 100);
       const h_shallow = (w / 4) * (specs.roofSlope * 0.5 / 100);
       const a_shallow = Math.atan(h_shallow / (w / 4));
+      const offsetSteep = modelPurlinYOffset + 0.075;
+      const offsetShallow = modelPurlinYOffset + 0.075;
       
-      ancillaryElements.push(renderInvertedVRidge("ridge_cap_1", 0, h + h_steep + h_shallow, l + 0.1, a_shallow));
-      ancillaryElements.push(renderInvertedVRidge("ridge_cap_2", -w / 4, h + h_steep, l + 0.1, a_shallow));
-      ancillaryElements.push(renderInvertedVRidge("ridge_cap_3", w / 4, h + h_steep, l + 0.1, -a_shallow));
+      ancillaryElements.push(renderInvertedVRidge("ridge_cap_1", 0, h + h_steep + h_shallow, l + 0.1, a_shallow, offsetShallow));
+      ancillaryElements.push(renderInvertedVRidge("ridge_cap_2", -w / 4, h + h_steep, l + 0.1, a_shallow, offsetSteep));
+      ancillaryElements.push(renderInvertedVRidge("ridge_cap_3", w / 4, h + h_steep, l + 0.1, -a_shallow, offsetSteep));
     } else if (specs.roofType === 'Curved') {
       const roofH = (w / 2) * (specs.roofSlope / 100) * 1.5;
-      ancillaryElements.push(renderInvertedVRidge("ridge_cap", 0, h + roofH * 2, l + 0.1, 0.1));
+      const basePurlinTopOffset = modelPurlinYOffset + 0.075;
+      ancillaryElements.push(renderInvertedVRidge("ridge_cap", 0, h + roofH, l + 0.1, 0.1, basePurlinTopOffset));
     } else {
       const roofH = (w / 2) * (specs.roofSlope / 100);
       const angle = Math.atan(roofH / (w / 2));
-      ancillaryElements.push(renderInvertedVRidge("ridge_cap", 0, h + roofH, l + 0.1, angle));
+      const panelYOffset = modelPurlinYOffset + 0.075;
+      ancillaryElements.push(renderInvertedVRidge("ridge_cap", 0, h + roofH, l + 0.1, angle, panelYOffset));
     }
   }
 
@@ -1771,10 +1830,10 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
 
   if (specs.hasRoof !== false && specs.hasDownPipes !== false) {
     const pipePoints = [
-      [w / 2 + 0.3, h / 2, 0.2], // front right
-      [w / 2 + 0.3, h / 2, l - 0.2], // back right
-      [-w / 2 - 0.3, h / 2, 0.2], // front left
-      [-w / 2 - 0.3, h / 2, l - 0.2], // back left
+      [gutterR_X, gutterY - 0.175, 0.2], // front right
+      [gutterR_X, gutterY - 0.175, l - 0.2], // back right
+      [gutterL_X, gutterY - 0.175, 0.2], // front left
+      [gutterL_X, gutterY - 0.175, l - 0.2], // back left
     ];
     pipePoints.forEach((pos, idx) => {
       let px = pos[0];
@@ -1782,16 +1841,7 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
       // If single slope, only render downpipes on the left (lower) side
       if (specs.roofType === 'Single Slope' && px > 0) return;
 
-      let ph = h;
-      
-      const leftGutterY = specs.roofType === 'Curved' ? h + 0.15 : h + 0.35;
-      
-      if (px < 0) {
-        ph = leftGutterY;
-      } else {
-        ph = leftGutterY;
-      }
-      
+      let ph = pos[1]; // Ends exactly at the bottom of the gutter
       let py = ph / 2;
       
       ancillaryElements.push(
@@ -2829,7 +2879,9 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
         ) : (
           <meshStandardMaterial color="#cbd5e1" roughness={0.2} metalness={0.9} />
         );
-        const screwYOffset = purlinYOffset + 0.275 + d/2;
+        const isStandard = specs.roofProfile === 'Standard';
+        const peakH = isStandard ? 0.018 : 0.030;
+        const screwYOffset = purlinYOffset + 0.075 + peakH + d/2;
         const stepZ = 0.33; // Approx pitch distance along panels
 
         for (let pz = stepZ; pz <= l; pz += stepZ) {

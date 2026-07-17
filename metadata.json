@@ -2,7 +2,8 @@
   "name": "UPEB by M.G. Industries",
   "description": "A streamlined construction planning dashboard for pre-engineered buildings.",
   "requestFramePermissions": [
-    "camera"
+    "camera",
+    "microphone"
   ],
   "majorCapabilities": [
     "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"

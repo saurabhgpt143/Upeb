@@ -73,13 +73,14 @@ import { ProfileDiagram } from './components/ProfileDiagram';
 import { ProfileSheetWaterSimulator } from './components/ProfileSheetWaterSimulator';
 import { StructuralLoadOptimizer } from './components/StructuralLoadOptimizer';
 import { InstallPWA } from './components/InstallPWA';
+import VoiceChatAssistant from './components/VoiceChatAssistant';
 import { jsPDF } from 'jspdf';
 import autoTable from 'jspdf-autotable';
 import { MaterialIcon } from './components/MaterialIcons';
 
 type Phase = 'planning' | 'engineering' | 'fabrication' | 'delivery' | 'erection';
 
-interface ProjectSpecs {
+export interface ProjectSpecs {
   width: number;
   length: number;
   eaveHeight: number;
@@ -754,6 +755,63 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
     return canvas;
   }, []);
 
+  const createNormalMapFromHeightMap = (heightCanvas: HTMLCanvasElement, isVerticalPattern: boolean, strength: number = 3.5) => {
+    const width = heightCanvas.width;
+    const height = heightCanvas.height;
+    
+    const normalCanvas = document.createElement('canvas');
+    normalCanvas.width = width;
+    normalCanvas.height = height;
+    
+    const hCtx = heightCanvas.getContext('2d');
+    const nCtx = normalCanvas.getContext('2d');
+    if (!hCtx || !nCtx) return normalCanvas;
+    
+    const hData = hCtx.getImageData(0, 0, width, height);
+    const nData = nCtx.createImageData(width, height);
+    
+    const getVal = (x: number, y: number) => {
+      const cx = Math.max(0, Math.min(width - 1, x));
+      const cy = Math.max(0, Math.min(height - 1, y));
+      return hData.data[(cy * width + cx) * 4] / 255.0;
+    };
+    
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        let du = 0;
+        let dv = 0;
+        
+        if (!isVerticalPattern) {
+          // Horizontal variation
+          du = (getVal(x - 1, y) - getVal(x + 1, y)) * strength;
+          dv = 0;
+        } else {
+          // Vertical variation
+          du = 0;
+          dv = (getVal(x, y - 1) - getVal(x, y + 1)) * strength;
+        }
+        
+        const len = Math.sqrt(du * du + dv * dv + 1.0);
+        const nx = du / len;
+        const ny = dv / len;
+        const nz = 1.0 / len;
+        
+        const idx = (y * width + x) * 4;
+        nData.data[idx]     = Math.round((nx * 0.5 + 0.5) * 255);
+        nData.data[idx + 1] = Math.round((ny * 0.5 + 0.5) * 255);
+        nData.data[idx + 2] = Math.round((nz * 0.5 + 0.5) * 255);
+        nData.data[idx + 3] = 255;
+      }
+    }
+    
+    nCtx.putImageData(nData, 0, 0);
+    return normalCanvas;
+  };
+
+  const panelNormalCanvasH = useMemo(() => {
+    return createNormalMapFromHeightMap(panelCanvasH, false, 3.5);
+  }, [panelCanvasH]);
+
   const panelTexH = useMemo(() => {
     const tex = new THREE.CanvasTexture(panelCanvasH);
     tex.wrapS = THREE.RepeatWrapping;
@@ -761,6 +819,14 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
     tex.repeat.set(1.0 / (specs.wallProfile === '6v Profile' ? 0.198 : specs.wallProfile === '7v Profile' ? 0.198 : 0.2), 1);
     return tex;
   }, [panelCanvasH, specs.wallProfile]);
+
+  const panelNormalTexH = useMemo(() => {
+    const tex = new THREE.CanvasTexture(panelNormalCanvasH);
+    tex.wrapS = THREE.RepeatWrapping;
+    tex.wrapT = THREE.RepeatWrapping;
+    tex.repeat.set(1.0 / (specs.wallProfile === '6v Profile' ? 0.198 : specs.wallProfile === '7v Profile' ? 0.198 : 0.2), 1);
+    return tex;
+  }, [panelNormalCanvasH, specs.wallProfile]);
 
   const panelTexV = useMemo(() => {
     const tex = new THREE.CanvasTexture(panelCanvasV);
@@ -771,6 +837,7 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
   }, [panelCanvasV, specs.roofProfile]);
 
   const wallTexCache = useRef<Record<string, THREE.Texture>>({});
+  const wallNormalTexCache = useRef<Record<string, THREE.Texture>>({});
   const roofTexCache = useRef<Record<string, THREE.Texture>>({});
 
   const getWallTexture = (wShape: number, startCoord: number) => {
@@ -787,6 +854,22 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
       wallTexCache.current[cacheKey] = cloned;
     }
     return wallTexCache.current[cacheKey];
+  };
+
+  const getWallNormalTexture = (wShape: number, startCoord: number) => {
+    const profile = specs.wallProfile || '7v Profile';
+    const pitch = (profile === '6v Profile' || profile === '7v Profile') ? 0.198 : 0.076;
+    const cacheKey = `${wShape}_${startCoord}_${profile}`;
+    if (!wallNormalTexCache.current[cacheKey]) {
+      const cloned = panelNormalTexH.clone();
+      cloned.repeat.set(wShape / pitch, 1);
+      cloned.offset.set((startCoord / pitch) % 1, 0);
+      cloned.wrapS = THREE.RepeatWrapping;
+      cloned.wrapT = THREE.RepeatWrapping;
+      cloned.needsUpdate = true;
+      wallNormalTexCache.current[cacheKey] = cloned;
+    }
+    return wallNormalTexCache.current[cacheKey];
   };
 
   const getRoofTexture = (wSheet: number, startZ: number) => {
@@ -922,25 +1005,21 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
             const yMax = (j + 1) * segHLeft;
             const cStartX = isLeftGate ? cutStartZ : -1;
             const cEndX = isLeftGate ? cutEndZ : -1;
-            const sShape = createSideSegmentShape(yMin, yMax, cStartX, cEndX, gateH, heightLeft);
-            
-            return (
-              <group key={j}>
-                <mesh receiveShadow onClick={(e) => handlePanelClick(e, `${keyLeft}_${j}`, specs.wallColor || '#0089b6', 'wall')}>
-                  <shapeGeometry args={[sShape]} />
-                  <meshStandardMaterial color={getPanelColor(`${keyLeft}_${j}`, specs.wallColor || '#0089b6', 'wall', specs, panelColors)} metalness={0.5} roughness={0.4} bumpMap={getWallTexture(wSheet - overlapGap, i * effWidth)} envMapIntensity={1.2} side={THREE.FrontSide} bumpScale={0.025}>
-                  </meshStandardMaterial>
-                </mesh>
-                <mesh receiveShadow position={[0, 0, -0.005]}>
-                  <shapeGeometry args={[sShape]} />
-                  <meshStandardMaterial 
-                    color={specs.hasInsulation !== false ? "#b0bec5" : "#d3d3d3"}
-                    roughness={specs.hasInsulation !== false ? 0.3 : 0.7}
-                    metalness={specs.hasInsulation !== false ? 0.8 : 0.1}
-                    side={THREE.BackSide} 
-                  />
-                </mesh>
-              </group>
+            return render3DWallSheet(
+              `${keyLeft}_${j}`,
+              wSheet - overlapGap,
+              yMin,
+              yMax,
+              cStartX,
+              cEndX,
+              gateH,
+              i * effWidth,
+              specs.wallProfile || '7v Profile',
+              specs.wallColor || '#0089b6',
+              `${keyLeft}_${j}`,
+              undefined,
+              true,
+              isLast
             );
           })}
         </group>
@@ -949,7 +1028,7 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
       const keyRight = `wall_r_${i}`;
       const segmentsRight = Math.ceil(heightRight / 6);
       const segHRight = heightRight / segmentsRight;
-
+ 
       elements.push(
         <group 
           key={keyRight} 
@@ -963,25 +1042,21 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
             const cEndX = isRightGate ? wSheet - overlapGap - cutStartZ : -1;
             const sortedStartX = Math.min(cStartX, cEndX);
             const sortedEndX = Math.max(cStartX, cEndX);
-            const sShape = createSideSegmentShape(yMin, yMax, sortedStartX, sortedEndX, gateH, heightRight);
-            
-            return (
-              <group key={j}>
-                <mesh receiveShadow onClick={(e) => handlePanelClick(e, `${keyRight}_${j}`, specs.wallColor || '#0089b6', 'wall')}>
-                  <shapeGeometry args={[sShape]} />
-                  <meshStandardMaterial color={getPanelColor(`${keyRight}_${j}`, specs.wallColor || '#0089b6', 'wall', specs, panelColors)} metalness={0.5} roughness={0.4} bumpMap={getWallTexture(wSheet - overlapGap, -(i * effWidth + wSheet))} envMapIntensity={1.2} side={THREE.FrontSide} bumpScale={0.025}>
-                  </meshStandardMaterial>
-                </mesh>
-                <mesh receiveShadow position={[0, 0, -0.005]}>
-                  <shapeGeometry args={[sShape]} />
-                  <meshStandardMaterial 
-                    color={specs.hasInsulation !== false ? "#b0bec5" : "#d3d3d3"}
-                    roughness={specs.hasInsulation !== false ? 0.3 : 0.7}
-                    metalness={specs.hasInsulation !== false ? 0.8 : 0.1}
-                    side={THREE.BackSide} 
-                  />
-                </mesh>
-              </group>
+            return render3DWallSheet(
+              `${keyRight}_${j}`,
+              wSheet - overlapGap,
+              yMin,
+              yMax,
+              sortedStartX,
+              sortedEndX,
+              gateH,
+              -(i * effWidth + wSheet),
+              specs.wallProfile || '7v Profile',
+              specs.wallColor || '#0089b6',
+              `${keyRight}_${j}`,
+              undefined,
+              true,
+              isLast
             );
           })}
         </group>
@@ -1083,21 +1158,23 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
              const keyFront = `wall_f_${i}_${j}`;
              const yMin = j * segHFront;
              const yMax = (j + 1) * segHFront;
-             const s = createSegmentShape(yMin, yMax, cutStartX, cutEndX, gateH, getRoofY(startX), getRoofY(startX + wShape));
-             return (
-               <group key={j}>
-                 <mesh receiveShadow onClick={(e) => handlePanelClick(e, keyFront, specs.wallColor || '#0089b6', 'wall')}>
-                   <shapeGeometry args={[s]} />
-                   <meshStandardMaterial color={getPanelColor(keyFront, specs.wallColor || '#0089b6', 'wall', specs, panelColors)} metalness={0.5} roughness={0.4} bumpMap={getWallTexture(wShape, startX)} envMapIntensity={1.2} side={THREE.BackSide} bumpScale={0.025}>
-                   </meshStandardMaterial>
-                 </mesh>
-                 <mesh receiveShadow position={[0, 0, 0.005]}>
-                   <shapeGeometry args={[s]} />
-                   <meshStandardMaterial color={specs.hasInsulation !== false ? "#b0bec5" : "#d3d3d3"} roughness={specs.hasInsulation !== false ? 0.3 : 0.7} metalness={specs.hasInsulation !== false ? 0.8 : 0.1} side={THREE.FrontSide} />
-                 </mesh>
-               </group>
+             return render3DWallSheet(
+               keyFront,
+               wShape,
+               yMin,
+               yMax,
+               cutStartX,
+               cutEndX,
+               gateH,
+               startX,
+               specs.wallProfile || '7v Profile',
+               specs.wallColor || '#0089b6',
+               keyFront,
+               (localX: number) => getRoofY(startX + localX),
+               false,
+               isLast
              );
-          })}
+           })}
           {seamMeshesFront}
         </group>
       );
@@ -1148,19 +1225,21 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
              const keyBack = `wall_b_${i}_${j}`;
              const yMin = j * segHBack;
              const yMax = (j + 1) * segHBack;
-             const sBack = createSegmentShape(yMin, yMax, cutStartXBack, cutEndXBack, gateHBack, getRoofY(startX), getRoofY(startX + wShape));
-             return (
-               <group key={j}>
-                 <mesh receiveShadow onClick={(e) => handlePanelClick(e, keyBack, specs.wallColor || '#0089b6', 'wall')}>
-                   <shapeGeometry args={[sBack]} />
-                   <meshStandardMaterial color={getPanelColor(keyBack, specs.wallColor || '#0089b6', 'wall', specs, panelColors)} metalness={0.5} roughness={0.4} bumpMap={getWallTexture(wShape, startX)} envMapIntensity={1.2} side={THREE.FrontSide} bumpScale={0.025}>
-                   </meshStandardMaterial>
-                 </mesh>
-                 <mesh receiveShadow position={[0, 0, -0.005]}>
-                   <shapeGeometry args={[sBack]} />
-                   <meshStandardMaterial color={specs.hasInsulation !== false ? "#b0bec5" : "#d3d3d3"} roughness={specs.hasInsulation !== false ? 0.3 : 0.7} metalness={specs.hasInsulation !== false ? 0.8 : 0.1} side={THREE.BackSide} />
-                 </mesh>
-               </group>
+             return render3DWallSheet(
+               keyBack,
+               wShape,
+               yMin,
+               yMax,
+               cutStartXBack,
+               cutEndXBack,
+               gateHBack,
+               startX,
+               specs.wallProfile || '7v Profile',
+               specs.wallColor || '#0089b6',
+               keyBack,
+               (localX: number) => getRoofY(startX + localX),
+               true,
+               isLast
              );
           })}
           {seamMeshesBack}
@@ -1170,7 +1249,7 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
     return elements;
   };
 
-  const getProfilePoints = (wSheet: number, profileType: string) => {
+  const getProfilePoints = (wSheet: number, profileType: string, isLast?: boolean) => {
     const is7v = profileType === '7v Profile';
     const is6v = profileType === '6v Profile';
     const isStandard = profileType === 'Standard' || (!is7v && !is6v);
@@ -1297,32 +1376,53 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
       points.push({ x: currentX, y: 0 });
     }
 
+    let adjustedWSheet = wSheet;
+    if (isLast) {
+      const idx = points.findIndex(p => p.x > wSheet);
+      if (idx !== -1) {
+        const cutY = points[idx - 1]
+          ? points[idx - 1].y + (wSheet - points[idx - 1].x) / (points[idx].x - points[idx - 1].x) * (points[idx].y - points[idx - 1].y)
+          : points[idx].y;
+        if (cutY > 0.001) {
+          for (let k = idx; k < points.length; k++) {
+            if (points[k].y <= 0.001) {
+              adjustedWSheet = points[k].x;
+              break;
+            }
+          }
+          if (adjustedWSheet === wSheet && points.length > 0) {
+            adjustedWSheet = points[points.length - 1].x;
+          }
+        }
+      }
+    }
+
     const clippedPoints: { x: number; y: number }[] = [];
     for (let k = 0; k < points.length; k++) {
       const p = points[k];
-      if (p.x <= wSheet) {
+      if (p.x <= adjustedWSheet) {
         clippedPoints.push(p);
       } else {
         const prev = points[k - 1];
-        if (prev && prev.x < wSheet) {
-          const ratio = (wSheet - prev.x) / (p.x - prev.x);
+        if (prev && prev.x < adjustedWSheet) {
+          const ratio = (adjustedWSheet - prev.x) / (p.x - prev.x);
           const intersectedY = prev.y + ratio * (p.y - prev.y);
-          clippedPoints.push({ x: wSheet, y: intersectedY });
+          clippedPoints.push({ x: adjustedWSheet, y: intersectedY });
         }
         break;
       }
     }
 
-    if (clippedPoints.length > 0 && clippedPoints[clippedPoints.length - 1].x < wSheet) {
+    if (clippedPoints.length > 0 && clippedPoints[clippedPoints.length - 1].x < adjustedWSheet) {
       const last = clippedPoints[clippedPoints.length - 1];
-      clippedPoints.push({ x: wSheet, y: last.y });
+      clippedPoints.push({ x: adjustedWSheet, y: last.y });
     }
 
     return clippedPoints;
   };
 
-  const createTrapezoidalShape = (wSheet: number, profileType: string) => {
-    const pts = getProfilePoints(wSheet, profileType);
+  const createTrapezoidalShape = (wSheet: number, profileType: string, isLast?: boolean) => {
+    const pts = getProfilePoints(wSheet, profileType, isLast);
     const shape = new THREE.Shape();
     if (pts.length === 0) return shape;
 
@@ -1340,6 +1440,175 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
     return shape;
   };
 
+  const getProfilePointsOffset = (wSheet: number, profileType: string, xOffset: number, isLast?: boolean) => {
+    const is7v = profileType === '7v Profile';
+    const is6v = profileType === '6v Profile';
+    const pitch = (is7v || is6v) ? 0.198 : 0.076;
+    
+    let phase = xOffset % pitch;
+    if (phase < 0) phase += pitch;
+
+    const widerWidth = wSheet + phase + 0.2;
+    const pts = getProfilePoints(widerWidth, profileType, false);
+
+    const rawShifted = pts.map(p => ({ x: p.x - phase, y: p.y }));
+
+    let adjustedWSheet = wSheet;
+    if (isLast) {
+      const idx = rawShifted.findIndex(p => p.x > wSheet);
+      if (idx !== -1) {
+        const cutY = rawShifted[idx - 1]
+          ? rawShifted[idx - 1].y + (wSheet - rawShifted[idx - 1].x) / (rawShifted[idx].x - rawShifted[idx - 1].x) * (rawShifted[idx].y - rawShifted[idx - 1].y)
+          : rawShifted[idx].y;
+        if (cutY > 0.001) {
+          for (let k = idx; k < rawShifted.length; k++) {
+            if (rawShifted[k].y <= 0.001) {
+              adjustedWSheet = rawShifted[k].x;
+              break;
+            }
+          }
+          if (adjustedWSheet === wSheet && rawShifted.length > 0) {
+            adjustedWSheet = rawShifted[rawShifted.length - 1].x;
+          }
+        }
+      }
+    }
+
+    const finalPts: { x: number; y: number }[] = [];
+
+    for (let k = 0; k < rawShifted.length; k++) {
+      const p = rawShifted[k];
+      const prev = k > 0 ? rawShifted[k - 1] : null;
+
+      if (p.x >= 0 && p.x <= adjustedWSheet) {
+        if (prev && prev.x < 0) {
+          const ratio = (0 - prev.x) / (p.x - prev.x);
+          const yAt0 = prev.y + ratio * (p.y - prev.y);
+          finalPts.push({ x: 0, y: yAt0 });
+        }
+        finalPts.push(p);
+      } else if (p.x > adjustedWSheet) {
+        if (prev && prev.x <= adjustedWSheet) {
+          const ratio = (adjustedWSheet - prev.x) / (p.x - prev.x);
+          const yAtW = prev.y + ratio * (p.y - prev.y);
+          finalPts.push({ x: adjustedWSheet, y: yAtW });
+        }
+        break;
+      }
+    }
+
+    if (finalPts.length === 0) {
+      finalPts.push({ x: 0, y: 0 });
+      finalPts.push({ x: adjustedWSheet, y: 0 });
+    }
+
+    return finalPts;
+  };
+
+  const createTrapezoidalShapeOffset = (wSheet: number, profileType: string, xOffset: number, invertY?: boolean, isLast?: boolean) => {
+    const pts = getProfilePointsOffset(wSheet, profileType, xOffset, isLast);
+    const shape = new THREE.Shape();
+    if (pts.length === 0) return shape;
+
+    const sign = invertY ? -1 : 1;
+
+    shape.moveTo(pts[0].x, pts[0].y * sign);
+    for (let k = 1; k < pts.length; k++) {
+      shape.lineTo(pts[k].x, pts[k].y * sign);
+    }
+
+    const thickness = 0.002;
+    for (let k = pts.length - 1; k >= 0; k--) {
+      shape.lineTo(pts[k].x, (pts[k].y - thickness) * sign);
+    }
+
+    shape.closePath();
+    return shape;
+  };
+
+  const render3DWallSheet = (
+    key: string,
+    wSheet: number,
+    yMin: number,
+    yMax: number,
+    cStartX: number,
+    cEndX: number,
+    gH: number,
+    xOffset: number,
+    profileType: string,
+    color: string,
+    panelKey: string,
+    getSlopeY?: (localX: number) => number,
+    invertY?: boolean,
+    isLast?: boolean
+  ) => {
+    const subPanels: { xStart: number; xEnd: number; yStart: number; yEnd: number }[] = [];
+
+    if (cStartX < 0 || cEndX <= cStartX || yMin >= gH) {
+      subPanels.push({ xStart: 0, xEnd: wSheet, yStart: yMin, yEnd: yMax });
+    } else {
+      const cutoffY = Math.min(yMax, gH);
+
+      if (cStartX > 0) {
+        subPanels.push({ xStart: 0, xEnd: cStartX, yStart: yMin, yEnd: yMax });
+      }
+
+      if (yMax > cutoffY && cEndX > cStartX) {
+        subPanels.push({ xStart: cStartX, xEnd: cEndX, yStart: cutoffY, yEnd: yMax });
+      }
+
+      if (cEndX < wSheet) {
+        subPanels.push({ xStart: cEndX, xEnd: wSheet, yStart: yMin, yEnd: yMax });
+      }
+    }
+
+    return (
+      <group key={key}>
+        {subPanels.map((sub, idx) => {
+          const wSub = sub.xEnd - sub.xStart;
+          if (wSub <= 0.001) return null;
+
+          let subYEnd = sub.yEnd;
+          if (getSlopeY) {
+            const roofL = getSlopeY(sub.xStart);
+            const roofR = getSlopeY(sub.xEnd);
+            const roofMax = Math.max(roofL, roofR);
+            subYEnd = Math.min(sub.yEnd, roofMax);
+          }
+
+          const hSub = subYEnd - sub.yStart;
+          if (hSub <= 0.001) return null;
+
+          const subXOffset = xOffset + sub.xStart;
+          const shape = createTrapezoidalShapeOffset(wSub, profileType, subXOffset, invertY, isLast);
+
+          return (
+            <mesh
+              key={idx}
+              receiveShadow
+              castShadow
+              position={[sub.xStart, sub.yStart, 0]}
+              rotation={[-Math.PI / 2, 0, 0]}
+              onClick={(e) => handlePanelClick(e, panelKey, color, 'wall')}
+            >
+              <extrudeGeometry args={[
+                shape,
+                { depth: hSub, bevelEnabled: false }
+              ]} />
+              <meshStandardMaterial
+                color={getPanelColor(panelKey, color, 'wall', specs, panelColors)}
+                metalness={0.6}
+                roughness={0.3}
+                envMapIntensity={1.2}
+                side={THREE.DoubleSide}
+              />
+            </mesh>
+          );
+        })}
+      </group>
+    );
+  };
+
   const renderRoofPanelArea = (keyPrefix: string, cx: number, cy: number, length: number, angle: number) => {
     const roofEffWidth = specs.roofProfile === '6v Profile' ? 0.99 : (specs.roofProfile === '7v Profile' ? 1.188 : 1.0);
     const numSheets = Math.ceil(l / roofEffWidth - 0.001);
@@ -1349,8 +1618,26 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
 
     return Array.from({ length: numSheets }).map((_, i) => {
       const isLast = i === numSheets - 1;
-      const wSheet = isLast ? l - (numSheets - 1) * roofEffWidth : roofEffWidth;
-      const zCenter = i * roofEffWidth + wSheet / 2;
+      let wSheet = roofEffWidth;
+      let zCenter = i * roofEffWidth + wSheet / 2;
+
+      if (isLast && numSheets > 1) {
+        const pitch = (specs.roofProfile === '6v Profile' || specs.roofProfile === '7v Profile') ? 0.198 : 0.076;
+        let m = 1;
+        let z_last = (numSheets - 1) * roofEffWidth - m * pitch;
+        while (z_last > l - roofEffWidth + 0.001) {
+          m++;
+          z_last = (numSheets - 1) * roofEffWidth - m * pitch;
+        }
+        m = Math.max(1, m - 1);
+        z_last = (numSheets - 1) * roofEffWidth - m * pitch;
+        wSheet = l - z_last;
+        zCenter = z_last + wSheet / 2;
+      } else if (isLast) {
+        wSheet = l;
+        zCenter = wSheet / 2;
+      }
+
       const key = `${keyPrefix}_sheet_${i}`;
       
       const isSkylightCol = specs.hasPolySheets !== false && (i % 6 === 3);
@@ -1369,7 +1656,7 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
                   onClick={(e) => handlePanelClick(e, segKey, isSkylight ? 'transparent' : (specs.roofColor || '#0089b6'), 'roof')}
                 >
                   <extrudeGeometry args={[
-                    createTrapezoidalShape(wSheet - overlapGap, specs.roofProfile || '7v Profile'),
+                    createTrapezoidalShape(wSheet - overlapGap, specs.roofProfile || '7v Profile', isLast),
                     { depth: segLength - overlapGap, bevelEnabled: false }
                   ]} />
                   {isSkylight ? (
@@ -1380,27 +1667,10 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
                       metalness={0.6} 
                       roughness={0.3} 
                       envMapIntensity={1.2} 
-                      side={THREE.FrontSide}
+                      side={THREE.DoubleSide}
                     />
                   )}
                 </mesh>
-                {!isSkylight && (
-                  <mesh receiveShadow
-                    position={[locX - (segLength - overlapGap) / 2, -0.005, (wSheet - overlapGap) / 2]}
-                    rotation={[0, Math.PI / 2, 0]}
-                  >
-                    <extrudeGeometry args={[
-                      createTrapezoidalShape(wSheet - overlapGap, specs.roofProfile || '7v Profile'),
-                      { depth: segLength - overlapGap, bevelEnabled: false }
-                    ]} />
-                    <meshStandardMaterial 
-                      color={specs.hasInsulation !== false ? "#b0bec5" : "#d3d3d3"}
-                      roughness={specs.hasInsulation !== false ? 0.3 : 0.7}
-                      metalness={specs.hasInsulation !== false ? 0.8 : 0.1}
-                      side={THREE.BackSide}
-                    />
-                  </mesh>
-                )}
                 {/* Real-time Insulation layer beneath Roof Panel */}
                 {specs.hasInsulation !== false && !isSkylight && (
                   <mesh position={[locX, -0.012, 0]}>
@@ -1473,9 +1743,10 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
     const angle = Math.atan(totRoofH / w);
     const base_rl = Math.sqrt(w * w + totRoofH * totRoofH);
     const rl = base_rl + 0.5; // low eave overhang only
-    const cx = -0.25 * Math.cos(angle);
     const panelYOffset = modelPurlinYOffset + 0.075;
-    const cy = (h + totRoofH / 2 + panelYOffset) - 0.25 * Math.sin(angle);
+    
+    const cx = -0.25 * Math.cos(angle) - panelYOffset * Math.sin(angle);
+    const cy = h + totRoofH / 2 - 0.25 * Math.sin(angle) + panelYOffset * Math.cos(angle);
     roofPanels.push(...renderRoofPanelArea('single', cx, cy, rl, angle));
   } else if (specs.roofType === 'Multi-Sloped Hut') {
     const h_steep = (w / 4) * (specs.roofSlope * 1.5 / 100);
@@ -1490,10 +1761,22 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
     const offsetSteep = modelPurlinYOffset + 0.075;
     const offsetShallow = modelPurlinYOffset + 0.075;
 
-    roofPanels.push(...renderRoofPanelArea('m1', -w * 0.375 - 0.25 * Math.cos(a_steep), h + h_steep / 2 + offsetSteep - 0.25 * Math.sin(a_steep), rl_steep + 0.5, a_steep));
-    roofPanels.push(...renderRoofPanelArea('m2', -w * 0.125, h + h_steep + h_shallow / 2 + offsetShallow, rl_shallow, a_shallow)); // no overhang on middle sections
-    roofPanels.push(...renderRoofPanelArea('m3', w * 0.125, h + h_steep + h_shallow / 2 + offsetShallow, rl_shallow, -a_shallow)); // no overhang on middle sections
-    roofPanels.push(...renderRoofPanelArea('m4', w * 0.375 + 0.25 * Math.cos(a_steep), h + h_steep / 2 + offsetSteep - 0.25 * Math.sin(a_steep), rl_steep + 0.5, -a_steep));
+    const cx1 = -w * 0.375 - 0.25 * Math.cos(a_steep) - offsetSteep * Math.sin(a_steep);
+    const cy1 = h + h_steep / 2 - 0.25 * Math.sin(a_steep) + offsetSteep * Math.cos(a_steep);
+    
+    const cx2 = -w * 0.125 - offsetShallow * Math.sin(a_shallow);
+    const cy2 = h + h_steep + h_shallow / 2 + offsetShallow * Math.cos(a_shallow);
+    
+    const cx3 = w * 0.125 + offsetShallow * Math.sin(a_shallow);
+    const cy3 = h + h_steep + h_shallow / 2 + offsetShallow * Math.cos(a_shallow);
+    
+    const cx4 = w * 0.375 + 0.25 * Math.cos(a_steep) + offsetSteep * Math.sin(a_steep);
+    const cy4 = h + h_steep / 2 - 0.25 * Math.sin(a_steep) + offsetSteep * Math.cos(a_steep);
+
+    roofPanels.push(...renderRoofPanelArea('m1', cx1, cy1, rl_steep + 0.5, a_steep));
+    roofPanels.push(...renderRoofPanelArea('m2', cx2, cy2, rl_shallow, a_shallow));
+    roofPanels.push(...renderRoofPanelArea('m3', cx3, cy3, rl_shallow, -a_shallow));
+    roofPanels.push(...renderRoofPanelArea('m4', cx4, cy4, rl_steep + 0.5, -a_steep));
   } else if (specs.roofType === 'Curved') {
     const roofH = (w / 2) * (specs.roofSlope / 100) * 1.5;
     
@@ -1507,13 +1790,18 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
 
     const basePurlinTopOffset = modelPurlinYOffset + 0.075;
 
-    const I0 = {x: -w / 2 - 0.5, y: h + basePurlinTopOffset};
-    const I1 = {x: 0, y: h + roofH * 2 + basePurlinTopOffset};
-    const I2 = {x: w / 2 + 0.5, y: h + basePurlinTopOffset};
+    const arcLeftSlope = (4 * roofH) / w;
+    const curveEaveAngle = Math.atan(arcLeftSlope);
+    const cosA = Math.cos(curveEaveAngle);
+    const sinA = Math.sin(curveEaveAngle);
 
-    const O0 = {x: -w / 2 - 0.5, y: I0.y + 0.0005};
-    const O1 = {x: 0, y: I1.y + 0.0005};
-    const O2 = {x: w / 2 + 0.5, y: I2.y + 0.0005};
+    const I0 = {x: -w / 2 - 0.5 - basePurlinTopOffset * sinA, y: h + basePurlinTopOffset * cosA};
+    const I1 = {x: 0, y: h + roofH * 2 + basePurlinTopOffset};
+    const I2 = {x: w / 2 + 0.5 + basePurlinTopOffset * sinA, y: h + basePurlinTopOffset * cosA};
+
+    const O0 = {x: I0.x - 0.002 * sinA, y: I0.y + 0.002 * cosA};
+    const O1 = {x: I1.x, y: I1.y + 0.002};
+    const O2 = {x: I2.x + 0.002 * sinA, y: I2.y + 0.002 * cosA};
 
     const getQuadPoint = (p0: any, p1: any, p2: any, t: number) => {
       const invT = 1 - t;
@@ -1535,8 +1823,26 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
 
     const curvedSheets = Array.from({ length: numSheets }).map((_, i) => {
       const isLast = i === numSheets - 1;
-      const wSheet = isLast ? l - (numSheets - 1) * roofEffWidth : roofEffWidth;
-      const zStart = i * roofEffWidth;
+      let wSheet = roofEffWidth;
+      let zStart = i * roofEffWidth;
+
+      if (isLast && numSheets > 1) {
+        const pitch = (specs.roofProfile === '6v Profile' || specs.roofProfile === '7v Profile') ? 0.198 : 0.076;
+        let m = 1;
+        let z_last = (numSheets - 1) * roofEffWidth - m * pitch;
+        while (z_last > l - roofEffWidth + 0.001) {
+          m++;
+          z_last = (numSheets - 1) * roofEffWidth - m * pitch;
+        }
+        m = Math.max(1, m - 1);
+        z_last = (numSheets - 1) * roofEffWidth - m * pitch;
+        wSheet = l - z_last;
+        zStart = z_last;
+      } else if (isLast) {
+        wSheet = l;
+        zStart = 0;
+      }
+
       const isSkylight = specs.hasPolySheets !== false && (i % 6 === 3);
       const overlapGap = 0.0;
 
@@ -1566,26 +1872,12 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
               <group key={key}>
                 <mesh receiveShadow 
                   onClick={(e) => handlePanelClick(e, key, isSkylight ? 'transparent' : (specs.roofColor || '#0089b6'), 'roof')}
-                 
                 >
                   <extrudeGeometry args={[curveShape, { depth: Math.max(0.01, wSheet - overlapGap), bevelEnabled: false }]} />
                   {isSkylight ? (
                     <meshStandardMaterial color="#e0f2fe" roughness={0.1} metalness={0.1} transparent opacity={0.6} depthWrite={false} side={THREE.DoubleSide} />
                   ) : (
-                    <meshStandardMaterial color={getPanelColor(key, specs.roofColor || '#0089b6', 'roof', specs, panelColors)} metalness={0.6} roughness={0.3} bumpMap={getRoofTexture(wSheet, zStart)} envMapIntensity={1.2} bumpScale={0.025} />
-                  )}
-                </mesh>
-                <mesh receiveShadow position={[0, -0.01, 0]}>
-                  <extrudeGeometry args={[curveShape, { depth: wSheet, bevelEnabled: false }]} />
-                  {isSkylight ? (
-                    <meshStandardMaterial color="#e0f2fe" roughness={0.1} metalness={0.1} transparent opacity={0.6} depthWrite={false} side={THREE.BackSide} />
-                  ) : (
-                    <meshStandardMaterial 
-                      color={specs.hasInsulation !== false ? "#b0bec5" : "#d3d3d3"}
-                      roughness={specs.hasInsulation !== false ? 0.3 : 0.7}
-                      metalness={specs.hasInsulation !== false ? 0.8 : 0.1}
-                      side={THREE.BackSide} 
-                    />
+                    <meshStandardMaterial color={getPanelColor(key, specs.roofColor || '#0089b6', 'roof', specs, panelColors)} metalness={0.6} roughness={0.3} bumpMap={getRoofTexture(wSheet, zStart)} envMapIntensity={1.2} bumpScale={0.025} side={THREE.DoubleSide} />
                   )}
                 </mesh>
               </group>
@@ -1601,13 +1893,17 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
     const angle = Math.atan(roofH / (w / 2));
     const base_rl = Math.sqrt((w / 2) * (w / 2) + roofH * roofH);
     const rl = base_rl + 0.5;
-    const cx1 = -w / 4 - 0.25 * Math.cos(angle);
     const panelYOffset = modelPurlinYOffset + 0.075;
-    const cy1 = h + roofH / 2 + panelYOffset - 0.25 * Math.sin(angle);
-    const cx2 = w / 4 + 0.25 * Math.cos(angle);
+    
+    // Shift perpendicularly by panelYOffset and tangentially by 0.25 to account for eave overhang!
+    const cx1 = -w / 4 - 0.25 * Math.cos(angle) - panelYOffset * Math.sin(angle);
+    const cy1 = h + roofH / 2 - 0.25 * Math.sin(angle) + panelYOffset * Math.cos(angle);
+    
+    const cx2 = w / 4 + 0.25 * Math.cos(angle) + panelYOffset * Math.sin(angle);
+    const cy2 = h + roofH / 2 - 0.25 * Math.sin(angle) + panelYOffset * Math.cos(angle);
     
     roofPanels.push(...renderRoofPanelArea('d1', cx1, cy1, rl, angle));
-    roofPanels.push(...renderRoofPanelArea('d2', cx2, cy1, rl, -angle));
+    roofPanels.push(...renderRoofPanelArea('d2', cx2, cy2, rl, -angle));
   }
 
   const ancillaryElements = [];
@@ -2833,11 +3129,11 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
     }
 
     const addPurlinWithCleats = (px: number, py: number, angle: number, keyStr: string) => {
-      // 1. Purlin Beam aligned with slope
+      // 1. Purlin Beam aligned with slope (shortened slightly at each end to stay inside gable walls)
       structuralElements.push(
         <group key={`${keyStr}_purlin_grp`} position={[px, py, l/2]} rotation={[0, 0, angle]}>
           <mesh receiveShadow key={keyStr} position={[0, purlinYOffset, 0]}>
-            <boxGeometry args={[0.15, 0.15, l]} />
+            <boxGeometry args={[0.15, 0.15, l - 0.04]} />
             {purlinMaterial}
           </mesh>
         </group>
@@ -2882,29 +3178,91 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
         const isStandard = specs.roofProfile === 'Standard';
         const peakH = isStandard ? 0.018 : 0.030;
         const screwYOffset = purlinYOffset + 0.075 + peakH + d/2;
-        const stepZ = 0.33; // Approx pitch distance along panels
 
-        for (let pz = stepZ; pz <= l; pz += stepZ) {
-          ancillaryElements.push(
-            <group key={`${keyStr}_screw_grp_${pz}`} position={[px, py, pz]} rotation={[0, 0, angle]}>
-              <mesh receiveShadow position={[0, screwYOffset, 0]}>
-                <cylinderGeometry args={[r, r, d, 8]} />
-                {sdMat}
-              </mesh>
-            </group>
-          );
+        const roofEffWidthLoc = specs.roofProfile === '6v Profile' ? 0.99 : (specs.roofProfile === '7v Profile' ? 1.188 : 1.0);
+        const numSheetsLoc = Math.ceil(l / roofEffWidthLoc - 0.001);
+
+        const is7v = specs.roofProfile === '7v Profile';
+        const is6v = specs.roofProfile === '6v Profile';
+
+        for (let i = 0; i < numSheetsLoc; i++) {
+          const isLastSheet = i === numSheetsLoc - 1;
+          
+          let sheetStart = i * roofEffWidthLoc;
+          let sheetW = roofEffWidthLoc;
+          
+          if (isLastSheet && numSheetsLoc > 1) {
+            const pitch = (is6v || is7v) ? 0.198 : 0.076;
+            let m = 1;
+            let z_last = (numSheetsLoc - 1) * roofEffWidthLoc - m * pitch;
+            while (z_last > l - roofEffWidthLoc + 0.001) {
+              m++;
+              z_last = (numSheetsLoc - 1) * roofEffWidthLoc - m * pitch;
+            }
+            m = Math.max(1, m - 1);
+            sheetStart = (numSheetsLoc - 1) * roofEffWidthLoc - m * pitch;
+            sheetW = l - sheetStart;
+          } else if (isLastSheet) {
+            sheetW = l;
+            sheetStart = 0;
+          }
+
+          if (is6v || is7v) {
+            const numPeaks = is7v ? 7 : 6;
+            // Peaks are at x_peak = 0.0228 + k * 0.198 in shape coordinates.
+            // In world coordinates: z_peak = sheetStart + sheetW - x_peak.
+            // Place screws at every second peak (k = 0, 2, 4, 6) for spacing ~0.396m
+            for (let k = 0; k < numPeaks; k += 2) {
+              const x_peak = 0.0228 + k * 0.198;
+              if (x_peak > sheetW) break;
+              const pz = sheetStart + sheetW - x_peak;
+              if (pz < 0 || pz > l) continue;
+
+              ancillaryElements.push(
+                <group key={`${keyStr}_sheet_${i}_screw_${k}`} position={[px, py, pz]} rotation={[0, 0, angle]}>
+                  <mesh receiveShadow position={[0, screwYOffset, 0]}>
+                    <cylinderGeometry args={[r, r, d, 8]} />
+                    {sdMat}
+                  </mesh>
+                </group>
+              );
+            }
+          } else {
+            // Standard wave profile peaks are at wave peak locations: (k + 0.5) * 0.076.
+            // Place screws at every fourth wave peak for spacing ~0.304m
+            const wavePitch = 0.076;
+            const maxWaves = Math.floor(sheetW / wavePitch);
+            for (let k = 0; k < maxWaves; k += 4) {
+              const x_peak = (k + 0.5) * wavePitch;
+              if (x_peak > sheetW) break;
+              const pz = sheetStart + sheetW - x_peak;
+              if (pz < 0 || pz > l) continue;
+
+              ancillaryElements.push(
+                <group key={`${keyStr}_sheet_${i}_screw_${k}`} position={[px, py, pz]} rotation={[0, 0, angle]}>
+                  <mesh receiveShadow position={[0, screwYOffset, 0]}>
+                    <cylinderGeometry args={[r, r, d, 8]} />
+                    {sdMat}
+                  </mesh>
+                </group>
+              );
+            }
+          }
         }
       }
     };
     const purlinSpacing = specs.highWindVelocity || specs.snowLoad ? 1.0 : 1.5;
+    const inboardOffset = 0.15; // Shift outermost purlins 15cm inboard so they don't protrude past external side walls
+
     if (specs.roofType === 'Single Slope') {
       const totRoofH = w * (specs.roofSlope / 100);
       const rl = Math.sqrt(w * w + totRoofH * totRoofH);
       const runs = Math.max(1, Math.round(rl / purlinSpacing));
       const angle = Math.atan(totRoofH / w);
       for (let p = 0; p <= runs; p++) {
-        const px = -w/2 + (w * (p / runs));
-        const py = h + (totRoofH * (p / runs));
+        // Shift range to be fully inboard at eave boundaries
+        const px = (-w/2 + inboardOffset) + ((w - 2 * inboardOffset) * (p / runs));
+        const py = h + (px + w/2) * (totRoofH / w);
         addPurlinWithCleats(px, py, angle, `purlin_${p}`);
       }
     } else if (specs.roofType === 'Curved') {
@@ -2913,9 +3271,10 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
        const runs = Math.max(1, Math.round(arcLen / purlinSpacing));
        for (let p = 0; p <= runs; p++) {
          const t = p / runs;
-         const px = -w / 2 + w * t;
-         const py = h + 4 * roofH * (t - t * t);
-         const derivY = 4 * roofH * (1 - 2 * t);
+         const px = (-w / 2 + inboardOffset) + (w - 2 * inboardOffset) * t;
+         const t_curve = (px + w/2) / w;
+         const py = h + 4 * roofH * (t_curve - t_curve * t_curve);
+         const derivY = 4 * roofH * (1 - 2 * t_curve);
          const derivX = w;
          const angle = Math.atan(-derivY / derivX);
          addPurlinWithCleats(px, py, angle, `purlin_curved_${p}`);
@@ -2933,10 +3292,14 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
       const a_shallow = Math.atan(h_shallow / (w / 4));
 
       for (let side = -1; side <= 1; side += 2) {
-        // Steep portion purlins
+        // Steep portion purlins - shifted inboard
         for (let p = 0; p < runsSteep; p++) {
-          const px = side * (w/2 - (w/4 * (p / runsSteep)));
-          const py = h + (h_steep * (p / runsSteep));
+          const startX = side * (w/2 - inboardOffset);
+          const endX = side * (w/4);
+          const t = p / runsSteep;
+          const px = startX + (endX - startX) * t;
+          const distFromWall = w/2 - Math.abs(px);
+          const py = h + distFromWall * Math.tan(a_steep);
           addPurlinWithCleats(px, py, side * -a_steep, `purlin_steep_${side}_${p}`);
         }
         // Shallow portion purlins
@@ -2955,8 +3318,12 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
       const angle = Math.atan(roofH / (w / 2));
       for (let side = -1; side <= 1; side += 2) {
         for (let p = 0; p < runs; p++) {
-          const px = side * (w/2 - (w/2 * (p / runs)));
-          const py = h + (roofH * (p / runs));
+          const startX = side * (w/2 - inboardOffset);
+          const endX = 0;
+          const t = p / runs;
+          const px = startX + (endX - startX) * t;
+          const distFromWall = w/2 - Math.abs(px);
+          const py = h + distFromWall * Math.tan(angle);
           addPurlinWithCleats(px, py, side * -angle, `purlin_${side}_${p}`);
         }
       }
@@ -3162,12 +3529,68 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
         const gateW = Math.min(4, w * 0.6);
         const gateH = Math.min(3, h * 0.8);
         
-        for (let pz = stepZ; pz <= l; pz += stepZ) {
+        // Left & Right Walls Peak-aligned z coordinates
+        const is7vWall = specs.wallProfile === '7v Profile';
+        const is6vWall = specs.wallProfile === '6v Profile';
+        const wallEffWidth = is6vWall ? 0.99 : (is7vWall ? 1.188 : 1.0);
+        const numZSheets = Math.ceil(l / wallEffWidth - 0.001);
+
+        const wallZPZValues: number[] = [];
+        for (let i = 0; i < numZSheets; i++) {
+          const isLastSheet = i === numZSheets - 1;
+          let sheetStart = i * wallEffWidth;
+          let sheetW = wallEffWidth;
+          if (isLastSheet && numZSheets > 1) {
+            const pitch = (is6vWall || is7vWall) ? 0.198 : 0.076;
+            let m = 1;
+            let z_last = (numZSheets - 1) * wallEffWidth - m * pitch;
+            while (z_last > l - wallEffWidth + 0.001) {
+              m++;
+              z_last = (numZSheets - 1) * wallEffWidth - m * pitch;
+            }
+            m = Math.max(1, m - 1);
+            sheetStart = (numZSheets - 1) * wallEffWidth - m * pitch;
+            sheetW = l - sheetStart;
+          } else if (isLastSheet) {
+            sheetW = l;
+            sheetStart = 0;
+          }
+
+          if (is6vWall || is7vWall) {
+            const numPeaks = is7vWall ? 7 : 6;
+            // Valleys/pitch centers are located halfway between consecutive peaks
+            // x_valley = x_peak + pitch/2 = 0.0228 + k * 0.198 + 0.099
+            for (let k = 0; k < numPeaks - 1; k += 2) {
+              const x_valley = 0.0228 + k * 0.198 + 0.099;
+              if (x_valley > sheetW) break;
+              const pz = sheetStart + sheetW - x_valley;
+              if (pz >= 0 && pz <= l) {
+                wallZPZValues.push(pz);
+              }
+            }
+          } else {
+            const wavePitch = 0.076;
+            const maxWaves = Math.floor(sheetW / wavePitch);
+            // Valleys for standard corrugated sheet are at (k + 1.5) * wavePitch
+            for (let k = 0; k < maxWaves; k += 4) {
+              const x_valley = (k + 1.5) * wavePitch;
+              if (x_valley > sheetW) break;
+              const pz = sheetStart + sheetW - x_valley;
+              if (pz >= 0 && pz <= l) {
+                wallZPZValues.push(pz);
+              }
+            }
+          }
+        }
+
+        const wallOffset = 0.01 + d / 2;
+
+        for (const pz of wallZPZValues) {
           if (py <= h) {
             const inLeftGate = isLeftGate && py <= gateH && pz >= l/2 - gateWL/2 && pz <= l/2 + gateWL/2;
             if (!inLeftGate) {
               sdElements.push(
-                <mesh receiveShadow key={`sd_L_${py}_${pz}`} position={[-w/2 - 0.02, py, pz]}>
+                <mesh receiveShadow key={`sd_L_${py}_${pz}`} position={[-w/2 - wallOffset, py, pz]}>
                   <primitive object={sdGeoL} />
                   {sdMat}
                 </mesh>
@@ -3178,7 +3601,7 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
             const inRightGate = isRightGate && py <= gateH && pz >= l/2 - gateWL/2 && pz <= l/2 + gateWL/2;
             if (!inRightGate) {
               sdElements.push(
-                <mesh receiveShadow key={`sd_R_${py}_${pz}`} position={[w/2 + 0.02, py, pz]}>
+                <mesh receiveShadow key={`sd_R_${py}_${pz}`} position={[w/2 + wallOffset, py, pz]}>
                   <primitive object={sdGeoR} />
                   {sdMat}
                 </mesh>
@@ -3187,8 +3610,56 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
           }
         }
         
-        // Front and Back Walls
-        for (let px = -w/2 + stepZ; px < w/2; px += stepZ) {
+        // Front & Back wall peak x values
+        const wallXPXValues: number[] = [];
+        const numXSheets = Math.ceil(w / wallEffWidth - 0.001);
+        for (let i = 0; i < numXSheets; i++) {
+          const isLastSheet = i === numXSheets - 1;
+          let sheetStart = -w/2 + i * wallEffWidth;
+          let sheetW = wallEffWidth;
+          if (isLastSheet && numXSheets > 1) {
+            const pitch = (is6vWall || is7vWall) ? 0.198 : 0.076;
+            let m = 1;
+            let x_last = -w/2 + (numXSheets - 1) * wallEffWidth - m * pitch;
+            while (x_last > w/2 - wallEffWidth + 0.001) {
+              m++;
+              x_last = -w/2 + (numXSheets - 1) * wallEffWidth - m * pitch;
+            }
+            m = Math.max(1, m - 1);
+            sheetStart = -w/2 + (numXSheets - 1) * wallEffWidth - m * pitch;
+            sheetW = w/2 - sheetStart;
+          } else if (isLastSheet) {
+            sheetW = w/2 - sheetStart;
+          }
+
+          if (is6vWall || is7vWall) {
+            const numPeaks = is7vWall ? 7 : 6;
+            // Valleys/pitch centers are located halfway between consecutive peaks
+            // x_valley = x_peak + pitch/2 = 0.0228 + k * 0.198 + 0.099
+            for (let k = 0; k < numPeaks - 1; k += 2) {
+              const x_valley = 0.0228 + k * 0.198 + 0.099;
+              if (x_valley > sheetW) break;
+              const px = sheetStart + sheetW - x_valley;
+              if (px >= -w/2 && px <= w/2) {
+                wallXPXValues.push(px);
+              }
+            }
+          } else {
+            const wavePitch = 0.076;
+            const maxWaves = Math.floor(sheetW / wavePitch);
+            // Valleys for standard corrugated sheet are at (k + 1.5) * wavePitch
+            for (let k = 0; k < maxWaves; k += 4) {
+              const x_valley = (k + 1.5) * wavePitch;
+              if (x_valley > sheetW) break;
+              const px = sheetStart + sheetW - x_valley;
+              if (px >= -w/2 && px <= w/2) {
+                wallXPXValues.push(px);
+              }
+            }
+          }
+        }
+
+        for (const px of wallXPXValues) {
           const roofYFront = (specs.roofType === 'Single Slope') ? h + (px - (-w/2)) * Math.tan(roofAngle) : (px < 0 ? h + (px - (-w/2)) * Math.tan(roofAngle) : h + (w/2 - px) * Math.tan(roofAngle));
           
           if (py <= roofYFront) {
@@ -3196,7 +3667,7 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
             const inFrontGate = isFrontGate && py <= gateH && px >= -gateW/2 && px <= gateW/2;
             if (!inFrontGate) {
               sdElements.push(
-                <mesh receiveShadow key={`sd_F_${py}_${px}`} position={[px, py, -0.02]}>
+                <mesh receiveShadow key={`sd_F_${py}_${px}`} position={[px, py, -wallOffset]}>
                   <primitive object={sdGeoF} />
                   {sdMat}
                 </mesh>
@@ -3207,7 +3678,7 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
             const inBackGate = isBackGate && py <= gateH && px >= -gateW/2 && px <= gateW/2;
             if (!inBackGate) {
               sdElements.push(
-                <mesh receiveShadow key={`sd_B_${py}_${px}`} position={[px, py, l + 0.02]}>
+                <mesh receiveShadow key={`sd_B_${py}_${px}`} position={[px, py, l + wallOffset]}>
                   <primitive object={sdGeoF} />
                   {sdMat}
                 </mesh>
@@ -5703,7 +6174,7 @@ export default function App() {
     { label: 'Width', value: specs.wallProfile === '7v Profile' ? 'Covered width: 1188mm / Total width: 1253mm / Required coil width: 1450mm' : (specs.wallProfile === '6v Profile' ? 'Covered width: 990mm / Total width: 1055mm / Required coil width: 1250mm' : '1060 mm (Effective Cover Width 1000 mm)'), category: 'Specifications' },
     { label: 'Thickness', value: specs.highWindVelocity || specs.snowLoad ? '0.60 mm / 0.65 mm (Reinforced thick gauge)' : '0.47 mm / 0.50 mm (Color Coated Galvalume)', category: 'Specifications' },
     { label: 'Color', value: specs.alternateWallColors ? `${wallColorName} (Primary), ${altWallColorName} (Alternate)` : `${wallColorName} / Color Coated Galvalume`, category: 'Specifications' },
-    { label: 'Installation Steps', value: 'Setting base drip angle → Plumb alignment of first sheet → Fixing with 12-14 x 25mm self-drilling screws to girts → Successive overlapping → Corner & opening flashings', category: 'Installation Procedures' },
+    { label: 'Installation Steps', value: 'Setting base drip angle → Plumb alignment of first sheet → Fixing with 12-14 x 25mm self-drilling screws secured from the exterior side to girts (positioned at center of pitch, not on V-groove) → Successive overlapping → Corner & opening flashings', category: 'Installation Procedures' },
     { label: 'Full Address with pincode', value: specs.deliveryAddress || 'Not specified', category: 'Logistics' },
     { label: 'Price (Material)', value: `₹${Math.round(wallUnitCost * wallAreaNum).toLocaleString('en-IN')} (₹${wallUnitCost}/{dimensionUnit === 'ft' ? ' sq.ft' : ' m²'})`, category: 'Financials' },
     { label: 'Labor Cost', value: `₹${Math.round(wallLaborCost * wallAreaNum).toLocaleString('en-IN')} (Installation)`, category: 'Financials' },
@@ -5761,12 +6232,18 @@ export default function App() {
           }),
         });
 
-        if (!response.ok) {
-          const errData = await response.json();
-          throw new Error(errData.error || "Failed to analyze image");
+        const text = await response.text();
+        let resData: any;
+        try {
+          resData = JSON.parse(text);
+        } catch (e) {
+          throw new Error(text || "Failed to parse server response as JSON");
         }
 
-        const resData = await response.json();
+        if (!response.ok) {
+          throw new Error(resData?.error || resData?.message || text || "Failed to analyze image");
+        }
+
         if (resData.success && resData.data) {
           const data = resData.data;
 
@@ -7798,27 +8275,53 @@ export default function App() {
                      <>
                         <div className="flex flex-col gap-1 pt-2">
                           <label className="text-xs font-semibold text-slate-600 uppercase tracking-wider">Profile</label>
-                          <select className="p-2 border border-slate-300 rounded focus:ring-2 focus:ring-blue-500 focus:outline-none" value={specs.wallProfile} onChange={(e) => setSpecs({...specs, wallProfile: e.target.value as any})}>
+                         <div className="bg-indigo-50 border border-indigo-100 rounded-lg p-3.5 text-xs text-indigo-700 leading-relaxed mb-2">
+                           <strong>Independent Wall Configuration</strong>
+                           <p className="mt-0.5">Wall cladding profile, colors, patterns, and ratios can be configured independently from the roof settings.</p>
+                         </div>
+                          <select 
+                            className="p-2 border border-slate-300 rounded focus:ring-2 focus:ring-blue-500 focus:outline-none bg-white text-slate-800" 
+                            value={specs.wallProfile || '7v Profile'} 
+                            onChange={(e) => setSpecs({ ...specs, wallProfile: e.target.value as any })}
+                          >
                             <option value="7v Profile">7v Profile (198mm pitch, 30mm depth)</option>
                             <option value="6v Profile">6v Profile (198mm pitch, 30mm depth)</option>
                             <option value="Standard">Standard Corrugated</option>
                           </select>
                           <ProfileDiagram type={specs.wallProfile || '7v Profile'} />
+                          <div className="bg-amber-50 border border-amber-100 rounded-lg p-3 text-xs text-amber-800 leading-relaxed mt-2 flex gap-2 items-start">
+                            <span className="text-amber-500 font-bold">💡</span>
+                            <div>
+                              <strong>Installation Recommendation:</strong>
+                              <p className="mt-0.5">When installing wall panels, it is recommended to secure the self-drilling screws from the exterior side, ensuring they are fastened at the center of each pitch (rather than on the V-groove/crests) for optimal water-shedding and mechanical strength.</p>
+                            </div>
+                          </div>
                         </div>
                         
                         <div className="pt-2 border-t border-slate-100 flex flex-col gap-3">
                            <label className="text-xs font-semibold text-slate-800 uppercase tracking-wider">Primary Color</label>
                            <div className="flex gap-2 flex-wrap items-center">
                              {STANDARD_COLORS.map(c => (
-                               <button key={c.hex} className={`w-7 h-7 rounded-full border transition-transform ${specs.wallColor === c.hex ? 'border-slate-900 scale-125 shadow-md' : 'border-slate-300 shadow-sm hover:scale-110'}`} style={{ backgroundColor: c.hex }} onClick={() => setSpecs({...specs, wallColor: c.hex})} title={c.name} />
+                               <button 
+                                 key={c.hex} 
+                                 className={`w-7 h-7 rounded-full border transition-transform ${specs.wallColor === c.hex ? 'border-slate-900 scale-125 shadow-md' : 'border-slate-300 shadow-sm'}`} 
+                                 style={{ backgroundColor: c.hex }} 
+                                 onClick={() => setSpecs({ ...specs, wallColor: c.hex })}
+                                 title={c.name} 
+                               />
                              ))}
-                             <RALInput value={specs.wallColor || '#0089b6'} onChange={(v) => setSpecs({...specs, wallColor: v})} />
+                             <RALInput value={specs.wallColor || '#d3d3d3'} onChange={(v) => setSpecs({ ...specs, wallColor: v })} />
                            </div>
                         </div>
 
                         <div className="pt-2">
                            <label className="flex items-center gap-2 cursor-pointer pb-2">
-                             <input type="checkbox" className="w-4 h-4 text-blue-600 rounded border-slate-300 focus:ring-blue-500" checked={specs.alternateWallColors} onChange={(e) => setSpecs({...specs, alternateWallColors: e.target.checked})} />
+                             <input 
+                               type="checkbox" 
+                               className="w-4 h-4 text-blue-600 rounded border-slate-300 focus:ring-blue-500" 
+                               checked={specs.alternateWallColors} 
+                               onChange={(e) => setSpecs({ ...specs, alternateWallColors: e.target.checked })}
+                             />
                              <span className="text-sm font-medium text-slate-700">Enable Alternate Sheet Colors</span>
                            </label>
                            {specs.alternateWallColors && (
@@ -7826,13 +8329,23 @@ export default function App() {
                                <label className="text-xs font-semibold text-slate-800 uppercase tracking-wider">Alternate Color</label>
                                <div className="flex gap-2 flex-wrap items-center">
                                  {STANDARD_COLORS.map(c => (
-                                   <button key={`alt-wall-${c.hex}`} className={`w-6 h-6 rounded-full border ${specs.alternateWallColor === c.hex ? 'border-slate-900 scale-125' : 'border-slate-300'}`} style={{ backgroundColor: c.hex }} onClick={() => setSpecs({...specs, alternateWallColor: c.hex})} />
+                                   <button 
+                                     key={`alt-wall-${c.hex}`} 
+                                     className={`w-6 h-6 rounded-full border ${specs.alternateWallColor === c.hex ? 'border-slate-900 scale-125' : 'border-slate-300'}`} 
+                                     style={{ backgroundColor: c.hex }} 
+                                     onClick={() => setSpecs({ ...specs, alternateWallColor: c.hex })}
+                                     title={c.name}
+                                   />
                                  ))}
-                                 <RALInput value={specs.alternateWallColor || '#d3d3d3'} onChange={(v) => setSpecs({...specs, alternateWallColor: v})} />
+                                 <RALInput value={specs.alternateWallColor || '#d3d3d3'} onChange={(v) => setSpecs({ ...specs, alternateWallColor: v })} />
                                </div>
                                <div className="flex gap-2 items-center mt-2 flex-wrap">
                                  <label className="text-xs font-semibold text-slate-600">Pattern</label>
-                                 <select className="p-1 text-sm border border-slate-300 rounded bg-white" value={specs.alternateWallPattern || 'stripes'} onChange={(e) => setSpecs({...specs, alternateWallPattern: e.target.value as any})}>
+                                 <select 
+                                   className="p-1 text-sm border border-slate-300 rounded bg-white" 
+                                   value={specs.alternateWallPattern || 'stripes'} 
+                                   onChange={(e) => setSpecs({ ...specs, alternateWallPattern: e.target.value as any })}
+                                 >
                                    <option value="stripes">Vertical Stripes</option>
                                    <option value="bands">Horizontal Bands</option>
                                    <option value="checkerboard">Checkerboard</option>
@@ -7843,7 +8356,11 @@ export default function App() {
                                  {(!specs.alternateWallPattern || specs.alternateWallPattern === 'stripes' || specs.alternateWallPattern === 'checkerboard' || specs.alternateWallPattern === 'bands' || specs.alternateWallPattern === 'center') && (
                                     <>
                                        <label className="text-xs font-semibold text-slate-600 ml-2">Ratio/Spread</label>
-                                       <select className="p-1 text-sm border border-slate-300 rounded w-20 bg-white" value={specs.alternateWallRatio || 2} onChange={(e) => setSpecs({...specs, alternateWallRatio: parseInt(e.target.value)})}>
+                                       <select 
+                                         className="p-1 text-sm border border-slate-300 rounded w-20 bg-white" 
+                                         value={specs.alternateWallRatio || 2} 
+                                         onChange={(e) => setSpecs({ ...specs, alternateWallRatio: parseInt(e.target.value) })}
+                                       >
                                          <option value={2}>1 : 1</option>
                                          <option value={3}>2 : 1</option>
                                          <option value={4}>3 : 1</option>
@@ -9229,6 +9746,23 @@ export default function App() {
       })()}
 
       <InstallPWA />
+
+      <VoiceChatAssistant
+        specs={specs}
+        setSpecs={setSpecs}
+        dimensionUnit={dimensionUnit}
+        setDimensionUnit={setDimensionUnit}
+        weatherType={weatherType}
+        setWeatherType={setWeatherType}
+        projectName={projectName}
+        setProjectName={setProjectName}
+        configTab={configTab}
+        setConfigTab={setConfigTab}
+        visualizerTab={visualizerTab}
+        setVisualizerTab={setVisualizerTab}
+        projectNotes={projectNotes}
+        setProjectNotes={setProjectNotes}
+      />
 
       {/* Floating WhatsApp Button */}
       <a

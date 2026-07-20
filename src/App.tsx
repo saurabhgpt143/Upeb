@@ -89,6 +89,7 @@ export interface ProjectSpecs {
   roofProfile?: '7v Profile' | '6v Profile' | 'Standard';
   wallProfile?: '7v Profile' | '6v Profile' | 'Standard';
   frameType: 'Clear Span' | 'Multi-Span' | 'Truss';
+  autoOptimize?: boolean;
   roofColor?: string;
   wallColor?: string;
   hasRoof?: boolean;
@@ -152,6 +153,28 @@ export interface ProjectSpecs {
   nutBoltProfile?: string;
 }
 
+export function getBaySpacingAndFrames(length: number, autoOptimize: boolean = true): { baySpacing: number; numFrames: number } {
+  if (!autoOptimize) {
+    const bay = 6.0;
+    return { baySpacing: bay, numFrames: Math.ceil(length / bay) + 1 };
+  }
+  // Pre-engineered building optimization: Spacing between 4.5m and 6.5m
+  const targetSpacing = 6.0;
+  let numBays = Math.round(length / targetSpacing);
+  if (numBays < 1) numBays = 1;
+  
+  let spacing = length / numBays;
+  if (length > 6.5 && spacing > 6.5) {
+    numBays += 1;
+    spacing = length / numBays;
+  } else if (length > 4.5 && spacing < 4.2) {
+    numBays = Math.max(1, numBays - 1);
+    spacing = length / numBays;
+  }
+  
+  return { baySpacing: Math.round(spacing * 100) / 100, numFrames: numBays + 1 };
+}
+
 export function calculateSDScrews(specs: ProjectSpecs, type: 'roof' | 'wall' | 'all' = 'all'): number {
   const purlinSpacing = specs.highWindVelocity || specs.snowLoad ? 1.0 : 1.5;
   const girtSpacing = specs.highWindVelocity || specs.snowLoad ? 1.0 : 1.5;
@@ -167,12 +190,12 @@ export function calculateSDScrews(specs: ProjectSpecs, type: 'roof' | 'wall' | '
     const h_shallow = (specs.width / 4) * (specs.roofSlope * 0.5 / 100);
     const rl_steep = Math.sqrt((specs.width / 4) * (specs.width / 4) + h_steep * h_steep);
     const rl_shallow = Math.sqrt((specs.width / 4) * (specs.width / 4) + h_shallow * h_shallow);
-    purlinRunsPerFrame = (Math.max(1, Math.round(rl_steep / purlinSpacing)) + Math.max(1, Math.round(rl_shallow / purlinSpacing))) * 2 + 1;
+    purlinRunsPerFrame = (Math.max(1, Math.round(rl_steep / purlinSpacing)) + Math.max(1, Math.round(rl_shallow / purlinSpacing))) * 2 + 2;
   } else if (specs.roofType === 'Curved') {
     const arcLen = specs.width * 1.1; 
     purlinRunsPerFrame = Math.max(1, Math.round(arcLen / purlinSpacing)) + 1;
   } else {
-    purlinRunsPerFrame = Math.max(1, Math.round(parseFloat(rafterLength) / purlinSpacing)) * 2 + 1;
+    purlinRunsPerFrame = Math.max(1, Math.round(parseFloat(rafterLength) / purlinSpacing)) * 2 + 2;
   }
   
   const girtRuns = Math.ceil(specs.eaveHeight / girtSpacing) + 1; // +1 for base girt
@@ -651,6 +674,409 @@ function WeatherEffects({ weatherType, specs }: { weatherType: string; specs: Pr
   );
 }
 
+function getWallProfilePoints(wSheet: number, profileType: string, isLast?: boolean) {
+  const is7v = profileType === '7v Profile';
+  const is6v = profileType === '6v Profile';
+  const isStandard = profileType === 'Standard' || (!is7v && !is6v);
+
+  let numPeaks = 6;
+  let pitch = 0.198;
+  let peakHeight = 0.030;
+  let peakBaseW = 0.065;
+  let peakTopW = 0.025;
+  let edgeOffset = 0.010;
+
+  if (is7v) {
+    numPeaks = 7;
+    pitch = 0.198;
+    peakHeight = 0.030;
+    peakBaseW = 0.065;
+    peakTopW = 0.025;
+    edgeOffset = 0.010;
+  } else if (is6v) {
+    numPeaks = 6;
+    pitch = 0.198;
+    peakHeight = 0.030;
+    peakBaseW = 0.065;
+    peakTopW = 0.025;
+    edgeOffset = 0.010;
+  }
+
+  const points: { x: number; y: number }[] = [];
+  let currentX = 0;
+
+  if (isStandard) {
+    points.push({ x: 0, y: 0 });
+    currentX += 0.013;
+    points.push({ x: currentX, y: 0 });
+
+    // Standard wave profile
+    const stdPitch = 0.076;
+    const stdHeight = 0.018;
+    const totalSteps = 200;
+    for (let s = 1; s <= totalSteps; s++) {
+      const xVal = (s / totalSteps) * wSheet;
+      const yVal = ((Math.sin((xVal / stdPitch) * Math.PI * 2 - Math.PI / 2) + 1) / 2) * stdHeight;
+      points.push({ x: xVal, y: yVal });
+    }
+  } else {
+    const slopeW = (peakBaseW - peakTopW) / 2;
+    const shortLegLen = 0.0181; // 18.1mm
+    const stdLegLen = 0.0351;  // 35.1mm
+    const ratio = shortLegLen / stdLegLen;
+    const drawShortW = slopeW * ratio;
+    const drawShortH = peakHeight * ratio;
+    const stepH = 0.003; // 3mm step height
+
+    // Start at the bottom-left of the short leg
+    points.push({ x: 0, y: peakHeight - stepH - drawShortH });
+    
+    // Slant up to top-left of first peak but 3mm below topY
+    currentX = drawShortW;
+    points.push({ x: currentX, y: peakHeight - stepH });
+
+    // Vertical step UP of 3mm to peakHeight
+    points.push({ x: currentX, y: peakHeight });
+
+    for (let k = 0; k < numPeaks; k++) {
+      if (k === 0) {
+        // Top flat
+        currentX += peakTopW;
+        points.push({ x: currentX, y: peakHeight });
+
+        // Right slant down
+        currentX += slopeW;
+        points.push({ x: currentX, y: 0 });
+      } else {
+        // Left slant up
+        currentX += slopeW;
+        points.push({ x: currentX, y: peakHeight });
+
+        // Top flat
+        currentX += peakTopW;
+        points.push({ x: currentX, y: peakHeight });
+
+        // Right slant down
+        currentX += slopeW;
+        points.push({ x: currentX, y: 0 });
+      }
+
+      if (k < numPeaks - 1) {
+        // Minor ribs in the pan
+        const ribH3D = 0.0035;
+        
+        // First section of pan: length 26mm
+        currentX += 0.026;
+        points.push({ x: currentX, y: 0 });
+        
+        // Minor rib 1: 4mm rise, 20mm flat, 4mm drop
+        currentX += 0.004;
+        points.push({ x: currentX, y: ribH3D });
+        currentX += 0.020;
+        points.push({ x: currentX, y: ribH3D });
+        currentX += 0.004;
+        points.push({ x: currentX, y: 0 });
+        
+        // Middle flat section: length 25mm
+        currentX += 0.025;
+        points.push({ x: currentX, y: 0 });
+        
+        // Minor rib 2: 4mm rise, 20mm flat, 4mm drop
+        currentX += 0.004;
+        points.push({ x: currentX, y: ribH3D });
+        currentX += 0.020;
+        points.push({ x: currentX, y: ribH3D });
+        currentX += 0.004;
+        points.push({ x: currentX, y: 0 });
+        
+        // Last section of pan: length 26mm
+        currentX += 0.026;
+        points.push({ x: currentX, y: 0 });
+      }
+    }
+
+    currentX += edgeOffset;
+    points.push({ x: currentX, y: 0 });
+  }
+
+  let adjustedWSheet = wSheet;
+  if (isLast) {
+    const idx = points.findIndex(p => p.x > wSheet);
+    if (idx !== -1) {
+      const cutY = points[idx - 1]
+        ? points[idx - 1].y + (wSheet - points[idx - 1].x) / (points[idx].x - points[idx - 1].x) * (points[idx].y - points[idx - 1].y)
+        : points[idx].y;
+      if (cutY > 0.001) {
+        for (let k = idx; k < points.length; k++) {
+          if (points[k].y <= 0.001) {
+            adjustedWSheet = points[k].x;
+            break;
+          }
+        }
+        if (adjustedWSheet === wSheet && points.length > 0) {
+          adjustedWSheet = points[points.length - 1].x;
+        }
+      }
+    }
+  }
+
+  const clippedPoints: { x: number; y: number }[] = [];
+  for (let k = 0; k < points.length; k++) {
+    const p = points[k];
+    if (p.x <= adjustedWSheet) {
+      clippedPoints.push(p);
+    } else {
+      const prev = points[k - 1];
+      if (prev && prev.x < adjustedWSheet) {
+        const ratio = (adjustedWSheet - prev.x) / (p.x - prev.x);
+        const intersectedY = prev.y + ratio * (p.y - prev.y);
+        clippedPoints.push({ x: adjustedWSheet, y: intersectedY });
+      }
+      break;
+    }
+  }
+
+  if (clippedPoints.length > 0 && clippedPoints[clippedPoints.length - 1].x < adjustedWSheet) {
+    const last = clippedPoints[clippedPoints.length - 1];
+    clippedPoints.push({ x: adjustedWSheet, y: last.y });
+  }
+
+  if (isLast) {
+    const reversedPoints = clippedPoints.map(p => ({
+      x: adjustedWSheet - p.x,
+      y: p.y
+    }));
+    reversedPoints.sort((a, b) => a.x - b.x);
+    return reversedPoints;
+  }
+
+  return clippedPoints;
+}
+
+function getWallProfilePointsOffset(wSheet: number, profileType: string, xOffset: number, isLast?: boolean) {
+  const is7v = profileType === '7v Profile';
+  const is6v = profileType === '6v Profile';
+  const pitch = (is7v || is6v) ? 0.198 : 0.076;
+  
+  let phase = xOffset % pitch;
+  if (phase < 0) phase += pitch;
+
+  const widerWidth = wSheet + phase + 0.2;
+  const pts = getWallProfilePoints(widerWidth, profileType, false);
+
+  const rawShifted = pts.map(p => ({ x: p.x - phase, y: p.y }));
+
+  let adjustedWSheet = wSheet;
+  if (isLast) {
+    const idx = rawShifted.findIndex(p => p.x > wSheet);
+    if (idx !== -1) {
+      const cutY = rawShifted[idx - 1]
+        ? rawShifted[idx - 1].y + (wSheet - rawShifted[idx - 1].x) / (rawShifted[idx].x - rawShifted[idx - 1].x) * (rawShifted[idx].y - rawShifted[idx - 1].y)
+        : rawShifted[idx].y;
+      if (cutY > 0.001) {
+        for (let k = idx; k < rawShifted.length; k++) {
+          if (rawShifted[k].y <= 0.001) {
+            adjustedWSheet = rawShifted[k].x;
+            break;
+          }
+        }
+        if (adjustedWSheet === wSheet && rawShifted.length > 0) {
+          adjustedWSheet = rawShifted[rawShifted.length - 1].x;
+        }
+      }
+    }
+  }
+
+  const finalPts: { x: number; y: number }[] = [];
+
+  for (let k = 0; k < rawShifted.length; k++) {
+    const p = rawShifted[k];
+    const prev = k > 0 ? rawShifted[k - 1] : null;
+
+    if (p.x >= 0 && p.x <= adjustedWSheet) {
+      if (prev && prev.x < 0) {
+        const ratio = (0 - prev.x) / (p.x - prev.x);
+        const yAt0 = prev.y + ratio * (p.y - prev.y);
+        finalPts.push({ x: 0, y: yAt0 });
+      }
+      finalPts.push(p);
+    } else if (p.x > adjustedWSheet) {
+      if (prev && prev.x <= adjustedWSheet) {
+        const ratio = (adjustedWSheet - prev.x) / (p.x - prev.x);
+        const yAtW = prev.y + ratio * (p.y - prev.y);
+        finalPts.push({ x: adjustedWSheet, y: yAtW });
+      }
+      break;
+    }
+  }
+
+  if (finalPts.length === 0) {
+    finalPts.push({ x: 0, y: 0 });
+    finalPts.push({ x: adjustedWSheet, y: 0 });
+  }
+
+  return finalPts;
+}
+
+function createWallTrapezoidalShapeOffset(wSheet: number, profileType: string, xOffset: number, invertY?: boolean, isLast?: boolean) {
+  const pts = getWallProfilePointsOffset(wSheet, profileType, xOffset, isLast);
+  const shape = new THREE.Shape();
+  if (pts.length === 0) return shape;
+
+  const sign = invertY ? -1 : 1;
+
+  shape.moveTo(pts[0].x, pts[0].y * sign);
+  for (let k = 1; k < pts.length; k++) {
+    shape.lineTo(pts[k].x, pts[k].y * sign);
+  }
+
+  const thickness = 0.002;
+  for (let k = pts.length - 1; k >= 0; k--) {
+    shape.lineTo(pts[k].x, (pts[k].y - thickness) * sign);
+  }
+
+  shape.closePath();
+  return shape;
+}
+
+interface WallSubSheetComponentProps {
+  sub: {
+    xStart: number;
+    xEnd: number;
+    yStart: number;
+    yEnd: number;
+  };
+  idx: number;
+  wSub: number;
+  profileType: string;
+  subXOffset: number;
+  invertY?: boolean;
+  isLast?: boolean;
+  hSub: number;
+  hasSlope?: boolean;
+  startX?: number;
+  panelKey: string;
+  color: string;
+  specs: ProjectSpecs;
+  panelColors: Record<string, string>;
+  handlePanelClick: (e: any, key: string, color: string, type: 'wall' | 'roof') => void;
+}
+
+function WallSubSheetComponent({
+  sub,
+  idx,
+  wSub,
+  profileType,
+  subXOffset,
+  invertY,
+  isLast,
+  hSub,
+  hasSlope,
+  startX = 0,
+  panelKey,
+  color,
+  specs,
+  panelColors,
+  handlePanelClick,
+}: WallSubSheetComponentProps) {
+  // Compute getWallTopY internally
+  const h = specs.eaveHeight;
+  const w = specs.width;
+  const isTrussModel = specs.frameType === 'Truss';
+  const modelPurlinYOffset = isTrussModel
+    ? (specs.roofType === 'Curved' ? 0.255 : specs.roofType === 'Multi-Sloped Hut' ? 0.235 : 0.25)
+    : (specs.roofType === 'Curved' ? 0.325 : 0.5);
+
+  const getRoofY = (x: number) => {
+    const roofOffset = 0.6; // To account for rafter and purlin thickness
+    if (specs.roofType === 'Single Slope') {
+       return h + (x + w/2) * (specs.roofSlope / 100) + roofOffset;
+    } else if (specs.roofType === 'Multi-Sloped Hut') {
+       const h_steep = (w / 4) * (specs.roofSlope * 1.5 / 100);
+       const h_shallow = (w / 4) * (specs.roofSlope * 0.5 / 100);
+       const absX = Math.abs(x);
+       if (absX >= w/4) {
+          return h + (w/2 - absX) * (h_steep / (w/4)) + roofOffset;
+       } else {
+          return h + h_steep + (w/4 - absX) * (h_shallow / (w/4)) + roofOffset;
+       }
+    } else if (specs.roofType === 'Curved') {
+       const roofH = (w / 2) * (specs.roofSlope / 100) * 1.5;
+       const t = x / w + 0.5;
+       return h + 4 * roofH * (t - t * t) + roofOffset;
+    } else {
+       const roofH = (w / 2) * (specs.roofSlope / 100);
+       const absX = Math.abs(x);
+       return h + (w/2 - absX) * (roofH / (w/2)) + roofOffset;
+    }
+  };
+
+  const getWallTopY = (x: number) => {
+    const rafterY = getRoofY(x) - 0.6;
+    return rafterY + modelPurlinYOffset;
+  };
+
+  const geometry = useMemo(() => {
+    const shape = createWallTrapezoidalShapeOffset(wSub, profileType, subXOffset, invertY, isLast);
+    const geom = new THREE.ExtrudeGeometry(shape, { depth: hSub, bevelEnabled: false });
+    if (hasSlope) {
+      const posAttr = geom.attributes.position;
+      for (let k = 0; k < posAttr.count; k++) {
+        const vx = posAttr.getX(k);
+        const vz = posAttr.getZ(k);
+        if (vz > hSub * 0.5) {
+          const localX = sub.xStart + vx;
+          const slopeY = getWallTopY(startX + localX);
+          const targetY = Math.min(sub.yEnd, slopeY);
+          const newVz = Math.max(0, targetY - sub.yStart);
+          posAttr.setZ(k, newVz);
+        }
+      }
+      geom.computeVertexNormals();
+      geom.computeBoundingBox();
+      geom.computeBoundingSphere();
+    }
+    return geom;
+  }, [
+    wSub,
+    profileType,
+    subXOffset,
+    invertY,
+    isLast,
+    hSub,
+    hasSlope,
+    startX,
+    sub.xStart,
+    sub.yStart,
+    sub.yEnd,
+    specs.width,
+    specs.eaveHeight,
+    specs.roofSlope,
+    specs.roofType,
+    specs.frameType
+  ]);
+
+  return (
+    <mesh
+      key={idx}
+      receiveShadow
+      castShadow
+      position={[sub.xStart, sub.yStart, 0]}
+      rotation={[-Math.PI / 2, 0, 0]}
+      geometry={geometry}
+      onClick={(e) => handlePanelClick(e, panelKey, color, 'wall')}
+    >
+      <meshStandardMaterial
+        color={getPanelColor(panelKey, color, 'wall', specs, panelColors)}
+        metalness={0.6}
+        roughness={0.3}
+        envMapIntensity={1.2}
+        side={THREE.DoubleSide}
+      />
+    </mesh>
+  );
+}
+
 function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = false, weatherType = 'clear' }: { specs: ProjectSpecs, panelColors: Record<string, string>, setPanelColors: React.Dispatch<React.SetStateAction<Record<string, string>>>, framingOnly?: boolean, weatherType?: string }) {
   const w = specs.width;
   const l = Math.max(specs.length, 1);
@@ -664,6 +1090,9 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
   const modelPurlinYOffset = isTrussModel
     ? (specs.roofType === 'Curved' ? 0.255 : specs.roofType === 'Multi-Sloped Hut' ? 0.235 : 0.25)
     : (specs.roofType === 'Curved' ? 0.325 : 0.5);
+
+  const modelEaveOverhang = specs.hasGutters ? 0.075 : 0.50; // 75mm (0.075m) eave overhang if gutters installed, else 500mm (0.50m)
+  const modelHalfOverhang = modelEaveOverhang / 2;
 
   const panelCanvasH = useMemo(() => {
     const canvas = document.createElement('canvas');
@@ -920,6 +1349,11 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
     }
   };
 
+  const getWallTopY = (x: number) => {
+    const rafterY = getRoofY(x) - 0.6;
+    return rafterY + modelPurlinYOffset;
+  };
+
   const renderWallSheets = () => {
     if (specs.hasWalls === false) return null;
     const elements = [];
@@ -930,8 +1364,8 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
       const isLast = i === numZSheets - 1;
       const wSheet = isLast ? l - (numZSheets - 1) * effWidth : effWidth;
       const zCenter = i * effWidth + wSheet / 2;
-      const heightLeft = getRoofY(-w/2);
-      const heightRight = getRoofY(w/2);
+      const heightLeft = getWallTopY(-w/2);
+      const heightRight = getWallTopY(w/2);
 
       const createSideSegmentShape = (yMin: number, yMax: number, cStartX: number, cEndX: number, gH: number, hVal: number) => {
           const s = new THREE.Shape();
@@ -1126,7 +1560,7 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
           return s;
       };
 
-      const maxHFront = Math.max(getRoofY(startX), getRoofY(startX + wShape));
+      const maxHFront = Math.max(getWallTopY(startX), getWallTopY(startX + wShape));
       const segmentsFront = Math.ceil(maxHFront / 6);
       const segHFront = maxHFront / segmentsFront;
       
@@ -1170,7 +1604,7 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
                specs.wallProfile || '7v Profile',
                specs.wallColor || '#0089b6',
                keyFront,
-               (localX: number) => getRoofY(startX + localX),
+               (localX: number) => getWallTopY(startX + localX),
                false,
                isLast
              );
@@ -1194,7 +1628,7 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
           }
       }
 
-      const maxHBack = Math.max(getRoofY(startX), getRoofY(startX + wShape));
+      const maxHBack = Math.max(getWallTopY(startX), getWallTopY(startX + wShape));
       const segmentsBack = Math.ceil(maxHBack / 6);
       const segHBack = maxHBack / segmentsBack;
       const seamMeshesBack: any[] = [];
@@ -1237,7 +1671,7 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
                specs.wallProfile || '7v Profile',
                specs.wallColor || '#0089b6',
                keyBack,
-               (localX: number) => getRoofY(startX + localX),
+               (localX: number) => getWallTopY(startX + localX),
                true,
                isLast
              );
@@ -1418,6 +1852,15 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
       clippedPoints.push({ x: adjustedWSheet, y: last.y });
     }
 
+    if (isLast) {
+      const reversedPoints = clippedPoints.map(p => ({
+        x: adjustedWSheet - p.x,
+        y: p.y
+      }));
+      reversedPoints.sort((a, b) => a.x - b.x);
+      return reversedPoints;
+    }
+
     return clippedPoints;
   };
 
@@ -1580,29 +2023,26 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
           if (hSub <= 0.001) return null;
 
           const subXOffset = xOffset + sub.xStart;
-          const shape = createTrapezoidalShapeOffset(wSub, profileType, subXOffset, invertY, isLast);
 
           return (
-            <mesh
+            <WallSubSheetComponent
               key={idx}
-              receiveShadow
-              castShadow
-              position={[sub.xStart, sub.yStart, 0]}
-              rotation={[-Math.PI / 2, 0, 0]}
-              onClick={(e) => handlePanelClick(e, panelKey, color, 'wall')}
-            >
-              <extrudeGeometry args={[
-                shape,
-                { depth: hSub, bevelEnabled: false }
-              ]} />
-              <meshStandardMaterial
-                color={getPanelColor(panelKey, color, 'wall', specs, panelColors)}
-                metalness={0.6}
-                roughness={0.3}
-                envMapIntensity={1.2}
-                side={THREE.DoubleSide}
-              />
-            </mesh>
+              sub={sub}
+              idx={idx}
+              wSub={wSub}
+              profileType={profileType}
+              subXOffset={subXOffset}
+              invertY={invertY}
+              isLast={isLast}
+              hSub={hSub}
+              hasSlope={getSlopeY !== undefined}
+              startX={xOffset}
+              panelKey={panelKey}
+              color={color}
+              specs={specs}
+              panelColors={panelColors}
+              handlePanelClick={handlePanelClick}
+            />
           );
         })}
       </group>
@@ -1613,8 +2053,92 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
     const roofEffWidth = specs.roofProfile === '6v Profile' ? 0.99 : (specs.roofProfile === '7v Profile' ? 1.188 : 1.0);
     const numSheets = Math.ceil(l / roofEffWidth - 0.001);
     const roofSegments = Math.ceil(length / 6);
-    const segLength = length / roofSegments;
     const overlapGap = 0.0; // A small visual gap to illustrate the division
+
+    const inboardOffset = 0.15;
+    const purlinSpacing = specs.highWindVelocity || specs.snowLoad ? 1.0 : 1.5;
+
+    // 1. Get the list of all purlin positions (distances from the start of the panel)
+    let purlinDists: number[] = [];
+
+    if (specs.roofType === 'Single Slope') {
+      const totRoofH = w * (specs.roofSlope / 100);
+      const rl = Math.sqrt(w * w + totRoofH * totRoofH);
+      const runs = Math.max(1, Math.round(rl / purlinSpacing));
+      const angleVal = Math.atan(totRoofH / w);
+      for (let p = 0; p <= runs; p++) {
+        const px = (-w/2 + inboardOffset) + ((w - 2 * inboardOffset) * (p / runs));
+        const dist = (px + w/2) / Math.cos(angleVal);
+        purlinDists.push(dist);
+      }
+    } else if (specs.roofType === 'Multi-Sloped Hut') {
+      const h_steep = (w / 4) * (specs.roofSlope * 1.5 / 100);
+      const h_shallow = (w / 4) * (specs.roofSlope * 0.5 / 100);
+      const rl_steep = Math.sqrt((w / 4) * (w / 4) + h_steep * h_steep);
+      const rl_shallow = Math.sqrt((w / 4) * (w / 4) + h_shallow * h_shallow);
+
+      const runsSteep = Math.max(1, Math.round(rl_steep / purlinSpacing));
+      const runsShallow = Math.max(1, Math.round(rl_shallow / purlinSpacing));
+
+      const a_steep = Math.atan(h_steep / (w / 4));
+      const a_shallow = Math.atan(h_shallow / (w / 4));
+
+      if (keyPrefix === 'm1' || keyPrefix === 'm4') {
+        for (let p = 0; p < runsSteep; p++) {
+          const side = keyPrefix === 'm1' ? -1 : 1;
+          const startX = side * (w/2 - inboardOffset);
+          const endX = side * (w/4);
+          const t = p / runsSteep;
+          const px = startX + (endX - startX) * t;
+          const dist = modelEaveOverhang + (w/2 - Math.abs(px)) / Math.cos(a_steep);
+          purlinDists.push(dist);
+        }
+      } else if (keyPrefix === 'm2' || keyPrefix === 'm3') {
+        for (let p = 0; p < runsShallow; p++) {
+          const side = keyPrefix === 'm2' ? -1 : 1;
+          const px = side * (w/4 - (w/4 * (p / runsShallow)));
+          const dist = (w/4 - Math.abs(px)) / Math.cos(a_shallow);
+          purlinDists.push(dist);
+        }
+        const ridgeOffsethut = 0.15;
+        const px_ridge = (keyPrefix === 'm2' ? -1 : 1) * ridgeOffsethut;
+        const dist_ridge = (w/4 - Math.abs(px_ridge)) / Math.cos(a_shallow);
+        purlinDists.push(dist_ridge);
+      }
+    } else {
+      // Standard Gable
+      const roofH = (w / 2) * (specs.roofSlope / 100);
+      const rl = Math.sqrt((w / 2) * (w / 2) + roofH * roofH);
+      const runs = Math.max(1, Math.round(rl / purlinSpacing));
+      const angleVal = Math.atan(roofH / (w / 2));
+
+      for (let p = 0; p < runs; p++) {
+        const side = keyPrefix === 'd1' ? -1 : 1;
+        const startX = side * (w/2 - inboardOffset);
+        const endX = 0;
+        const t = p / runs;
+        const px = startX + (endX - startX) * t;
+        const dist = (w/2 - Math.abs(px)) / Math.cos(angleVal);
+        purlinDists.push(dist);
+      }
+      const ridgeOffsetGable = 0.15;
+      const dist_ridge = (w/2 - ridgeOffsetGable) / Math.cos(angleVal);
+      purlinDists.push(dist_ridge);
+    }
+
+    const sortedDists = Array.from(new Set(purlinDists.map(d => Math.round(d * 1000) / 1000))).sort((a, b) => a - b);
+    if (sortedDists.length === 0 || sortedDists[0] > 0.01) {
+      sortedDists.unshift(0);
+    } else {
+      sortedDists[0] = 0;
+    }
+    if (sortedDists[sortedDists.length - 1] < length - 0.01) {
+      sortedDists.push(length);
+    } else {
+      sortedDists[sortedDists.length - 1] = length;
+    }
+
+    const boundaries = Array.from({ length: roofSegments + 1 }).map((_, j) => j * (length / roofSegments));
 
     return Array.from({ length: numSheets }).map((_, i) => {
       const isLast = i === numSheets - 1;
@@ -1622,42 +2146,34 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
       let zCenter = i * roofEffWidth + wSheet / 2;
 
       if (isLast && numSheets > 1) {
-        const pitch = (specs.roofProfile === '6v Profile' || specs.roofProfile === '7v Profile') ? 0.198 : 0.076;
-        let m = 1;
-        let z_last = (numSheets - 1) * roofEffWidth - m * pitch;
-        while (z_last > l - roofEffWidth + 0.001) {
-          m++;
-          z_last = (numSheets - 1) * roofEffWidth - m * pitch;
-        }
-        m = Math.max(1, m - 1);
-        z_last = (numSheets - 1) * roofEffWidth - m * pitch;
-        wSheet = l - z_last;
-        zCenter = z_last + wSheet / 2;
+        wSheet = l - (numSheets - 1) * roofEffWidth;
+        zCenter = (numSheets - 1) * roofEffWidth + wSheet / 2;
       } else if (isLast) {
         wSheet = l;
         zCenter = wSheet / 2;
       }
 
       const key = `${keyPrefix}_sheet_${i}`;
-      
       const isSkylightCol = specs.hasPolySheets !== false && (i % 6 === 3);
 
       return (
         <group key={key} position={[cx, cy, zCenter]} rotation={[0, 0, angle]}>
-          {Array.from({ length: roofSegments }).map((_, j) => {
-            const locX = -length / 2 + (segLength / 2) + j * segLength;
+          {boundaries.slice(0, -1).map((startVal, j) => {
+            const endVal = boundaries[j+1];
+            const segD = endVal - startVal;
+            const locX = -length / 2 + startVal + segD / 2;
             const segKey = `${key}_seg_${j}`;
-            const isSkylight = isSkylightCol && (roofSegments >= 3 ? j === Math.floor(roofSegments / 2) : true);
+            const isSkylight = isSkylightCol && (boundaries.length - 1 >= 3 ? j === Math.floor((boundaries.length - 1) / 2) : true);
             return (
               <group key={j}>
                 <mesh receiveShadow 
-                  position={[locX - (segLength - overlapGap) / 2, 0, (wSheet - overlapGap) / 2]} 
+                  position={[-length / 2 + startVal, 0, (wSheet - overlapGap) / 2]} 
                   rotation={[0, Math.PI / 2, 0]}
                   onClick={(e) => handlePanelClick(e, segKey, isSkylight ? 'transparent' : (specs.roofColor || '#0089b6'), 'roof')}
                 >
                   <extrudeGeometry args={[
                     createTrapezoidalShape(wSheet - overlapGap, specs.roofProfile || '7v Profile', isLast),
-                    { depth: segLength - overlapGap, bevelEnabled: false }
+                    { depth: segD - overlapGap, bevelEnabled: false }
                   ]} />
                   {isSkylight ? (
                     <meshStandardMaterial color="#e0f2fe" roughness={0.1} metalness={0.1} transparent opacity={0.6} depthWrite={false} side={THREE.DoubleSide} />
@@ -1674,7 +2190,7 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
                 {/* Real-time Insulation layer beneath Roof Panel */}
                 {specs.hasInsulation !== false && !isSkylight && (
                   <mesh position={[locX, -0.012, 0]}>
-                    <boxGeometry args={[segLength - overlapGap, 0.002, wSheet - overlapGap]} />
+                    <boxGeometry args={[segD - overlapGap, 0.002, wSheet - overlapGap]} />
                     <meshStandardMaterial color="#b0bec5" roughness={0.3} metalness={0.8} />
                   </mesh>
                 )}
@@ -1685,7 +2201,7 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
                   const peakHeight = is7v ? 0.029 : (is6v ? 0.035 : 0.018);
                   return (
                     <mesh position={[locX, peakHeight + 0.01, 0]}>
-                      <boxGeometry args={[segLength - overlapGap + 0.01, 0.02, wSheet - overlapGap + 0.01]} />
+                      <boxGeometry args={[segD - overlapGap + 0.01, 0.02, wSheet - overlapGap + 0.01]} />
                       <meshStandardMaterial color="#ffffff" roughness={0.9} metalness={0.0} />
                     </mesh>
                   );
@@ -1705,15 +2221,15 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
 
   if (specs.roofType === 'Curved') {
     const basePurlinTopOffset = modelPurlinYOffset + 0.075;
-    gutterL_X = -w / 2 - 0.5 - 0.05;
-    gutterR_X = w / 2 + 0.5 + 0.05;
+    gutterL_X = -w / 2 - modelEaveOverhang - 0.05;
+    gutterR_X = w / 2 + modelEaveOverhang + 0.05;
     gutterY = h + basePurlinTopOffset - 0.1 - 0.15;
   } else if (specs.roofType === 'Single Slope') {
     const totRoofH = w * (specs.roofSlope / 100);
     const angle = Math.atan(totRoofH / w);
     const panelYOffset = modelPurlinYOffset + 0.075;
-    const X_eave = -w / 2 - 0.5 * Math.cos(angle) - 0.1 * Math.sin(angle);
-    const Y_eave = h + panelYOffset - 0.5 * Math.sin(angle);
+    const X_eave = -w / 2 - modelEaveOverhang * Math.cos(angle) - 0.1 * Math.sin(angle);
+    const Y_eave = h + panelYOffset - modelEaveOverhang * Math.sin(angle);
     gutterL_X = X_eave - 0.05;
     gutterR_X = w / 2 + 0.3; // Unused for Single Slope
     gutterY = Y_eave - 0.15;
@@ -1721,19 +2237,19 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
     const h_steep = (w / 4) * (specs.roofSlope * 1.5 / 100);
     const a_steep = Math.atan(h_steep / (w / 4));
     const offsetSteep = modelPurlinYOffset + 0.075;
-    const X_eave = -w / 2 - 0.5 * Math.cos(a_steep);
-    const Y_eave = h + offsetSteep - 0.5 * Math.sin(a_steep);
+    const X_eave = -w / 2 - modelEaveOverhang * Math.cos(a_steep);
+    const Y_eave = h + offsetSteep - modelEaveOverhang * Math.sin(a_steep);
     gutterL_X = X_eave - 0.05;
-    gutterR_X = w / 2 + 0.5 * Math.cos(a_steep) + 0.05;
+    gutterR_X = w / 2 + modelEaveOverhang * Math.cos(a_steep) + 0.05;
     gutterY = Y_eave - 0.15;
   } else {
     const roofH = (w / 2) * (specs.roofSlope / 100);
     const angle = Math.atan(roofH / (w / 2));
     const panelYOffset = modelPurlinYOffset + 0.075;
-    const X_eave = -w / 2 - 0.5 * Math.cos(angle);
-    const Y_eave = h + panelYOffset - 0.5 * Math.sin(angle);
+    const X_eave = -w / 2 - modelEaveOverhang * Math.cos(angle);
+    const Y_eave = h + panelYOffset - modelEaveOverhang * Math.sin(angle);
     gutterL_X = X_eave - 0.05;
-    gutterR_X = w / 2 + 0.5 * Math.cos(angle) + 0.05;
+    gutterR_X = w / 2 + modelEaveOverhang * Math.cos(angle) + 0.05;
     gutterY = Y_eave - 0.15;
   }
 
@@ -1742,11 +2258,11 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
     const totRoofH = w * (specs.roofSlope / 100);
     const angle = Math.atan(totRoofH / w);
     const base_rl = Math.sqrt(w * w + totRoofH * totRoofH);
-    const rl = base_rl + 0.5; // low eave overhang only
+    const rl = base_rl + modelEaveOverhang; // low eave overhang only
     const panelYOffset = modelPurlinYOffset + 0.075;
     
-    const cx = -0.25 * Math.cos(angle) - panelYOffset * Math.sin(angle);
-    const cy = h + totRoofH / 2 - 0.25 * Math.sin(angle) + panelYOffset * Math.cos(angle);
+    const cx = -modelHalfOverhang * Math.cos(angle) - panelYOffset * Math.sin(angle);
+    const cy = h + totRoofH / 2 - modelHalfOverhang * Math.sin(angle) + panelYOffset * Math.cos(angle);
     roofPanels.push(...renderRoofPanelArea('single', cx, cy, rl, angle));
   } else if (specs.roofType === 'Multi-Sloped Hut') {
     const h_steep = (w / 4) * (specs.roofSlope * 1.5 / 100);
@@ -1761,8 +2277,8 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
     const offsetSteep = modelPurlinYOffset + 0.075;
     const offsetShallow = modelPurlinYOffset + 0.075;
 
-    const cx1 = -w * 0.375 - 0.25 * Math.cos(a_steep) - offsetSteep * Math.sin(a_steep);
-    const cy1 = h + h_steep / 2 - 0.25 * Math.sin(a_steep) + offsetSteep * Math.cos(a_steep);
+    const cx1 = -w * 0.375 - modelHalfOverhang * Math.cos(a_steep) - offsetSteep * Math.sin(a_steep);
+    const cy1 = h + h_steep / 2 - modelHalfOverhang * Math.sin(a_steep) + offsetSteep * Math.cos(a_steep);
     
     const cx2 = -w * 0.125 - offsetShallow * Math.sin(a_shallow);
     const cy2 = h + h_steep + h_shallow / 2 + offsetShallow * Math.cos(a_shallow);
@@ -1770,13 +2286,13 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
     const cx3 = w * 0.125 + offsetShallow * Math.sin(a_shallow);
     const cy3 = h + h_steep + h_shallow / 2 + offsetShallow * Math.cos(a_shallow);
     
-    const cx4 = w * 0.375 + 0.25 * Math.cos(a_steep) + offsetSteep * Math.sin(a_steep);
-    const cy4 = h + h_steep / 2 - 0.25 * Math.sin(a_steep) + offsetSteep * Math.cos(a_steep);
+    const cx4 = w * 0.375 + modelHalfOverhang * Math.cos(a_steep) + offsetSteep * Math.sin(a_steep);
+    const cy4 = h + h_steep / 2 - modelHalfOverhang * Math.sin(a_steep) + offsetSteep * Math.cos(a_steep);
 
-    roofPanels.push(...renderRoofPanelArea('m1', cx1, cy1, rl_steep + 0.5, a_steep));
+    roofPanels.push(...renderRoofPanelArea('m1', cx1, cy1, rl_steep + modelEaveOverhang, a_steep));
     roofPanels.push(...renderRoofPanelArea('m2', cx2, cy2, rl_shallow, a_shallow));
     roofPanels.push(...renderRoofPanelArea('m3', cx3, cy3, rl_shallow, -a_shallow));
-    roofPanels.push(...renderRoofPanelArea('m4', cx4, cy4, rl_steep + 0.5, -a_steep));
+    roofPanels.push(...renderRoofPanelArea('m4', cx4, cy4, rl_steep + modelEaveOverhang, -a_steep));
   } else if (specs.roofType === 'Curved') {
     const roofH = (w / 2) * (specs.roofSlope / 100) * 1.5;
     
@@ -1795,9 +2311,9 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
     const cosA = Math.cos(curveEaveAngle);
     const sinA = Math.sin(curveEaveAngle);
 
-    const I0 = {x: -w / 2 - 0.5 - basePurlinTopOffset * sinA, y: h + basePurlinTopOffset * cosA};
+    const I0 = {x: -w / 2 - modelEaveOverhang - basePurlinTopOffset * sinA, y: h + basePurlinTopOffset * cosA};
     const I1 = {x: 0, y: h + roofH * 2 + basePurlinTopOffset};
-    const I2 = {x: w / 2 + 0.5 + basePurlinTopOffset * sinA, y: h + basePurlinTopOffset * cosA};
+    const I2 = {x: w / 2 + modelEaveOverhang + basePurlinTopOffset * sinA, y: h + basePurlinTopOffset * cosA};
 
     const O0 = {x: I0.x - 0.002 * sinA, y: I0.y + 0.002 * cosA};
     const O1 = {x: I1.x, y: I1.y + 0.002};
@@ -1821,23 +2337,19 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
       };
     };
 
+    const purlinSpacingLocal = specs.highWindVelocity || specs.snowLoad ? 1.0 : 1.5;
+    const baseRuns = Math.max(1, Math.round((w * 1.1) / purlinSpacingLocal));
+    const runsCurved = Math.ceil(baseRuns / totalSegs) * totalSegs;
+    const t_boundaries = Array.from({ length: totalSegs + 1 }).map((_, j) => j / totalSegs);
+
     const curvedSheets = Array.from({ length: numSheets }).map((_, i) => {
       const isLast = i === numSheets - 1;
       let wSheet = roofEffWidth;
       let zStart = i * roofEffWidth;
 
       if (isLast && numSheets > 1) {
-        const pitch = (specs.roofProfile === '6v Profile' || specs.roofProfile === '7v Profile') ? 0.198 : 0.076;
-        let m = 1;
-        let z_last = (numSheets - 1) * roofEffWidth - m * pitch;
-        while (z_last > l - roofEffWidth + 0.001) {
-          m++;
-          z_last = (numSheets - 1) * roofEffWidth - m * pitch;
-        }
-        m = Math.max(1, m - 1);
-        z_last = (numSheets - 1) * roofEffWidth - m * pitch;
-        wSheet = l - z_last;
-        zStart = z_last;
+        wSheet = l - (numSheets - 1) * roofEffWidth;
+        zStart = (numSheets - 1) * roofEffWidth;
       } else if (isLast) {
         wSheet = l;
         zStart = 0;
@@ -1850,8 +2362,8 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
         <group key={`curved_col_${i}`} position={[0, 0, zStart]}>
           {Array.from({ length: totalSegs }).map((_, j) => {
             const key = `curved_sheet_${i}_seg_${j}`;
-            const t0 = j / totalSegs;
-            const t1 = (j + 1) / totalSegs;
+            const t0 = t_boundaries[j];
+            const t1 = t_boundaries[j+1];
              
             const is = getQuadPoint(I0, I1, I2, t0);
             const ic = getQuadControlPoint(I0, I1, I2, t0, t1);
@@ -1892,15 +2404,15 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
     const roofH = (w / 2) * (specs.roofSlope / 100);
     const angle = Math.atan(roofH / (w / 2));
     const base_rl = Math.sqrt((w / 2) * (w / 2) + roofH * roofH);
-    const rl = base_rl + 0.5;
+    const rl = base_rl + modelEaveOverhang;
     const panelYOffset = modelPurlinYOffset + 0.075;
     
-    // Shift perpendicularly by panelYOffset and tangentially by 0.25 to account for eave overhang!
-    const cx1 = -w / 4 - 0.25 * Math.cos(angle) - panelYOffset * Math.sin(angle);
-    const cy1 = h + roofH / 2 - 0.25 * Math.sin(angle) + panelYOffset * Math.cos(angle);
+    // Shift perpendicularly by panelYOffset and tangentially by modelHalfOverhang to account for eave overhang!
+    const cx1 = -w / 4 - modelHalfOverhang * Math.cos(angle) - panelYOffset * Math.sin(angle);
+    const cy1 = h + roofH / 2 - modelHalfOverhang * Math.sin(angle) + panelYOffset * Math.cos(angle);
     
-    const cx2 = w / 4 + 0.25 * Math.cos(angle) + panelYOffset * Math.sin(angle);
-    const cy2 = h + roofH / 2 - 0.25 * Math.sin(angle) + panelYOffset * Math.cos(angle);
+    const cx2 = w / 4 + modelHalfOverhang * Math.cos(angle) + panelYOffset * Math.sin(angle);
+    const cy2 = h + roofH / 2 - modelHalfOverhang * Math.sin(angle) + panelYOffset * Math.cos(angle);
     
     roofPanels.push(...renderRoofPanelArea('d1', cx1, cy1, rl, angle));
     roofPanels.push(...renderRoofPanelArea('d2', cx2, cy2, rl, -angle));
@@ -2027,9 +2539,9 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
       const totRoofH = w * (specs.roofSlope / 100);
       const angle = Math.atan(totRoofH / w);
       const base_rl = Math.sqrt(w * w + totRoofH * totRoofH);
-      const rl = base_rl + 0.5; // low eave overhang only
-      const cx = -0.25 * Math.cos(angle) - 0.1 * Math.sin(angle);
-      const cy = (h + totRoofH / 2 + 0.6) - 0.25 * Math.sin(angle);
+      const rl = base_rl + modelEaveOverhang; // low eave overhang only
+      const cx = -modelHalfOverhang * Math.cos(angle) - 0.1 * Math.sin(angle);
+      const cy = (h + totRoofH / 2 + 0.6) - modelHalfOverhang * Math.sin(angle);
       ancillaryElements.push(renderGable('gable_front_single', 0, cx, cy, rl, angle, true));
       ancillaryElements.push(renderGable('gable_back_single', l, cx, cy, rl, angle, false));
       ancillaryElements.push(renderLengthGable('gable_high_single', w / 2, h + totRoofH + 0.6, l, 0, true));
@@ -2043,13 +2555,13 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
       const a_steep = Math.atan(h_steep / (w / 4));
       const a_shallow = Math.atan(h_shallow / (w / 4));
 
-      const cx1 = -w * 0.375 - 0.25 * Math.cos(a_steep);
-      const cy1 = h + h_steep / 2 + 0.6 - 0.25 * Math.sin(a_steep);
-      const cx4 = w * 0.375 + 0.25 * Math.cos(a_steep);
-      const cy4 = h + h_steep / 2 + 0.6 - 0.25 * Math.sin(a_steep);
+      const cx1 = -w * 0.375 - modelHalfOverhang * Math.cos(a_steep);
+      const cy1 = h + h_steep / 2 + 0.6 - modelHalfOverhang * Math.sin(a_steep);
+      const cx4 = w * 0.375 + modelHalfOverhang * Math.cos(a_steep);
+      const cy4 = h + h_steep / 2 + 0.6 - modelHalfOverhang * Math.sin(a_steep);
 
-      ancillaryElements.push(renderGable('gable_front_m1', 0, cx1, cy1, rl_steep + 0.5, a_steep, true));
-      ancillaryElements.push(renderGable('gable_back_m1', l, cx1, cy1, rl_steep + 0.5, a_steep, false));
+      ancillaryElements.push(renderGable('gable_front_m1', 0, cx1, cy1, rl_steep + modelEaveOverhang, a_steep, true));
+      ancillaryElements.push(renderGable('gable_back_m1', l, cx1, cy1, rl_steep + modelEaveOverhang, a_steep, false));
       
       ancillaryElements.push(renderGable('gable_front_m2', 0, -w * 0.125, h + h_steep + h_shallow / 2 + 0.6, rl_shallow, a_shallow, true));
       ancillaryElements.push(renderGable('gable_back_m2', l, -w * 0.125, h + h_steep + h_shallow / 2 + 0.6, rl_shallow, a_shallow, false));
@@ -2057,15 +2569,15 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
       ancillaryElements.push(renderGable('gable_front_m3', 0, w * 0.125, h + h_steep + h_shallow / 2 + 0.6, rl_shallow, -a_shallow, true));
       ancillaryElements.push(renderGable('gable_back_m3', l, w * 0.125, h + h_steep + h_shallow / 2 + 0.6, rl_shallow, -a_shallow, false));
 
-      ancillaryElements.push(renderGable('gable_front_m4', 0, cx4, cy4, rl_steep + 0.5, -a_steep, true));
-      ancillaryElements.push(renderGable('gable_back_m4', l, cx4, cy4, rl_steep + 0.5, -a_steep, false));
+      ancillaryElements.push(renderGable('gable_front_m4', 0, cx4, cy4, rl_steep + modelEaveOverhang, -a_steep, true));
+      ancillaryElements.push(renderGable('gable_back_m4', l, cx4, cy4, rl_steep + modelEaveOverhang, -a_steep, false));
     } else if (specs.roofType === 'Curved') {
       const roofH = (w / 2) * (specs.roofSlope / 100) * 1.5;
       const curveShape = new THREE.Shape();
-      curveShape.moveTo(-w / 2 - 0.5, h + 0.3);
-      curveShape.quadraticCurveTo(0, h + roofH * 2 + 0.5, w / 2 + 0.5, h + 0.3);
-      curveShape.lineTo(w / 2 + 0.5, h + 0.5);
-      curveShape.quadraticCurveTo(0, h + roofH * 2 + 0.7, -w / 2 - 0.5, h + 0.5);
+      curveShape.moveTo(-w / 2 - modelEaveOverhang, h + 0.3);
+      curveShape.quadraticCurveTo(0, h + roofH * 2 + 0.5, w / 2 + modelEaveOverhang, h + 0.3);
+      curveShape.lineTo(w / 2 + modelEaveOverhang, h + 0.5);
+      curveShape.quadraticCurveTo(0, h + roofH * 2 + 0.7, -w / 2 - modelEaveOverhang, h + 0.5);
       curveShape.closePath();
       
       ancillaryElements.push(
@@ -2084,10 +2596,10 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
       const roofH = (w / 2) * (specs.roofSlope / 100);
       const angle = Math.atan(roofH / (w / 2));
       const base_rl = Math.sqrt((w / 2) * (w / 2) + roofH * roofH);
-      const rl = base_rl + 0.5;
-      const cx1 = -w / 4 - 0.25 * Math.cos(angle);
-      const cy1 = h + roofH / 2 + 0.6 - 0.25 * Math.sin(angle);
-      const cx2 = w / 4 + 0.25 * Math.cos(angle);
+      const rl = base_rl + modelEaveOverhang;
+      const cx1 = -w / 4 - modelHalfOverhang * Math.cos(angle);
+      const cy1 = h + roofH / 2 + 0.6 - modelHalfOverhang * Math.sin(angle);
+      const cx2 = w / 4 + modelHalfOverhang * Math.cos(angle);
 
       ancillaryElements.push(renderGable('gable_front_d1', 0, cx1, cy1, rl, angle, true));
       ancillaryElements.push(renderGable('gable_back_d1', l, cx1, cy1, rl, angle, false));
@@ -2565,8 +3077,7 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
   }
 
   const structuralElements = [];
-  const baySpacing = 6;
-  const numFrames = Math.ceil(l / baySpacing) + 1;
+  const { baySpacing, numFrames } = getBaySpacingAndFrames(l, specs.autoOptimize);
   let colColor = "#1e293b";
   let rafterColor = "#334155";
   let purlinColor = "#475569";
@@ -3179,6 +3690,13 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
         const peakH = isStandard ? 0.018 : 0.030;
         const screwYOffset = purlinYOffset + 0.075 + peakH + d/2;
 
+        let finalScrewYOffset = screwYOffset;
+        if (keyStr.startsWith("purlin_ridge") && specs.hasRidgeCap !== false) {
+          const absAngle = Math.abs(angle);
+          const ridgeAdj = -0.005 + Math.abs(px) * Math.tan(absAngle) - (Math.abs(px) - 0.2) * Math.sin(absAngle);
+          finalScrewYOffset += Math.max(0.012, ridgeAdj) + 0.02; // Elevated to guarantee visibility above the ridge
+        }
+
         const roofEffWidthLoc = specs.roofProfile === '6v Profile' ? 0.99 : (specs.roofProfile === '7v Profile' ? 1.188 : 1.0);
         const numSheetsLoc = Math.ceil(l / roofEffWidthLoc - 0.001);
 
@@ -3192,15 +3710,7 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
           let sheetW = roofEffWidthLoc;
           
           if (isLastSheet && numSheetsLoc > 1) {
-            const pitch = (is6v || is7v) ? 0.198 : 0.076;
-            let m = 1;
-            let z_last = (numSheetsLoc - 1) * roofEffWidthLoc - m * pitch;
-            while (z_last > l - roofEffWidthLoc + 0.001) {
-              m++;
-              z_last = (numSheetsLoc - 1) * roofEffWidthLoc - m * pitch;
-            }
-            m = Math.max(1, m - 1);
-            sheetStart = (numSheetsLoc - 1) * roofEffWidthLoc - m * pitch;
+            sheetStart = (numSheetsLoc - 1) * roofEffWidthLoc;
             sheetW = l - sheetStart;
           } else if (isLastSheet) {
             sheetW = l;
@@ -3210,17 +3720,17 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
           if (is6v || is7v) {
             const numPeaks = is7v ? 7 : 6;
             // Peaks are at x_peak = 0.0228 + k * 0.198 in shape coordinates.
-            // In world coordinates: z_peak = sheetStart + sheetW - x_peak.
+            // In world coordinates: z_peak = sheetStart + sheetW - x_peak (or sheetStart + x_peak if reversed).
             // Place screws at every second peak (k = 0, 2, 4, 6) for spacing ~0.396m
             for (let k = 0; k < numPeaks; k += 2) {
               const x_peak = 0.0228 + k * 0.198;
               if (x_peak > sheetW) break;
-              const pz = sheetStart + sheetW - x_peak;
+              const pz = (isLastSheet && numSheetsLoc > 1) ? (sheetStart + x_peak) : (sheetStart + sheetW - x_peak);
               if (pz < 0 || pz > l) continue;
 
               ancillaryElements.push(
                 <group key={`${keyStr}_sheet_${i}_screw_${k}`} position={[px, py, pz]} rotation={[0, 0, angle]}>
-                  <mesh receiveShadow position={[0, screwYOffset, 0]}>
+                  <mesh receiveShadow position={[0, finalScrewYOffset, 0]}>
                     <cylinderGeometry args={[r, r, d, 8]} />
                     {sdMat}
                   </mesh>
@@ -3235,12 +3745,12 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
             for (let k = 0; k < maxWaves; k += 4) {
               const x_peak = (k + 0.5) * wavePitch;
               if (x_peak > sheetW) break;
-              const pz = sheetStart + sheetW - x_peak;
+              const pz = (isLastSheet && numSheetsLoc > 1) ? (sheetStart + x_peak) : (sheetStart + sheetW - x_peak);
               if (pz < 0 || pz > l) continue;
 
               ancillaryElements.push(
                 <group key={`${keyStr}_sheet_${i}_screw_${k}`} position={[px, py, pz]} rotation={[0, 0, angle]}>
-                  <mesh receiveShadow position={[0, screwYOffset, 0]}>
+                  <mesh receiveShadow position={[0, finalScrewYOffset, 0]}>
                     <cylinderGeometry args={[r, r, d, 8]} />
                     {sdMat}
                   </mesh>
@@ -3257,14 +3767,30 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
     if (specs.roofType === 'Single Slope') {
       const totRoofH = w * (specs.roofSlope / 100);
       const rl = Math.sqrt(w * w + totRoofH * totRoofH);
-      const runs = Math.max(1, Math.round(rl / purlinSpacing));
+      const roofSegments = Math.ceil(rl / 6);
+      const L_seg = rl / roofSegments;
       const angle = Math.atan(totRoofH / w);
-      for (let p = 0; p <= runs; p++) {
-        // Shift range to be fully inboard at eave boundaries
-        const px = (-w/2 + inboardOffset) + ((w - 2 * inboardOffset) * (p / runs));
+      
+      const dists: number[] = [];
+      for (let j = 0; j < roofSegments; j++) {
+        const start = j * L_seg;
+        const n_spaces = Math.max(1, Math.ceil(L_seg / purlinSpacing));
+        for (let k = 0; k <= n_spaces; k++) {
+          dists.push(start + k * (L_seg / n_spaces));
+        }
+      }
+      const sortedDists = Array.from(new Set(dists.map(d => Math.round(d * 1000) / 1000))).sort((a, b) => a - b);
+      
+      sortedDists.forEach((d, p) => {
+        let px = -w/2 + d * Math.cos(angle);
+        if (p === 0) {
+          px = -w/2 + inboardOffset;
+        } else if (p === sortedDists.length - 1) {
+          px = w/2 - inboardOffset;
+        }
         const py = h + (px + w/2) * (totRoofH / w);
         addPurlinWithCleats(px, py, angle, `purlin_${p}`);
-      }
+      });
     } else if (specs.roofType === 'Curved') {
        const roofH = (w / 2) * (specs.roofSlope / 100) * 1.5;
        const arcLen = w * 1.1; // simple generic arc length approximation base
@@ -3285,49 +3811,109 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
       const rl_steep = Math.sqrt((w / 4) * (w / 4) + h_steep * h_steep);
       const rl_shallow = Math.sqrt((w / 4) * (w / 4) + h_shallow * h_shallow);
 
-      const runsSteep = Math.max(1, Math.round(rl_steep / purlinSpacing));
-      const runsShallow = Math.max(1, Math.round(rl_shallow / purlinSpacing));
+      const roofSegmentsSteep = Math.ceil((rl_steep + modelEaveOverhang) / 6);
+      const roofSegmentsShallow = Math.ceil(rl_shallow / 6);
 
       const a_steep = Math.atan(h_steep / (w / 4));
       const a_shallow = Math.atan(h_shallow / (w / 4));
 
       for (let side = -1; side <= 1; side += 2) {
-        // Steep portion purlins - shifted inboard
-        for (let p = 0; p < runsSteep; p++) {
-          const startX = side * (w/2 - inboardOffset);
-          const endX = side * (w/4);
-          const t = p / runsSteep;
-          const px = startX + (endX - startX) * t;
-          const distFromWall = w/2 - Math.abs(px);
-          const py = h + distFromWall * Math.tan(a_steep);
-          addPurlinWithCleats(px, py, side * -a_steep, `purlin_steep_${side}_${p}`);
+        // Steep portion - aligned with equal segments of length (rl_steep + modelEaveOverhang)
+        const L_seg_steep = (rl_steep + modelEaveOverhang) / roofSegmentsSteep;
+        const distsSteep: number[] = [];
+        for (let j = 0; j < roofSegmentsSteep; j++) {
+          const start = j * L_seg_steep;
+          const n_spaces = Math.max(1, Math.ceil(L_seg_steep / purlinSpacing));
+          for (let k = 0; k <= n_spaces; k++) {
+            distsSteep.push(start + k * (L_seg_steep / n_spaces));
+          }
         }
-        // Shallow portion purlins
-        for (let p = 0; p < runsShallow; p++) {
-          const px = side * (w/4 - (w/4 * (p / runsShallow)));
-          const py = h + h_steep + (h_shallow * (p / runsShallow));
-          addPurlinWithCleats(px, py, side * -a_shallow, `purlin_shallow_${side}_${p}`);
+        const sortedDistsSteep = Array.from(new Set(distsSteep.map(d => Math.round(d * 1000) / 1000))).sort((a, b) => a - b);
+        
+        let pIndexSteep = 0;
+        sortedDistsSteep.forEach((d) => {
+          const distFromWall = d - modelEaveOverhang; // Since sheet starts with modelEaveOverhang eave overhang
+          if (distFromWall < -0.01) return; // Do not place purlin on the overhang
+          
+          let px = side * (w/2 - distFromWall * Math.cos(a_steep));
+          // Shift the eave purlin inboard by inboardOffset
+          if (distFromWall < 0.1) {
+            px = side * (w/2 - inboardOffset);
+          }
+          const distFromWallActual = w/2 - Math.abs(px);
+          const py = h + distFromWallActual * Math.tan(a_steep);
+          addPurlinWithCleats(px, py, side * -a_steep, `purlin_steep_${side}_${pIndexSteep++}`);
+        });
+
+        // Shallow portion - aligned with equal segments of length rl_shallow
+        const L_seg_shallow = rl_shallow / roofSegmentsShallow;
+        const distsShallow: number[] = [];
+        for (let j = 0; j < roofSegmentsShallow; j++) {
+          const start = j * L_seg_shallow;
+          const n_spaces = Math.max(1, Math.ceil(L_seg_shallow / purlinSpacing));
+          for (let k = 0; k <= n_spaces; k++) {
+            distsShallow.push(start + k * (L_seg_shallow / n_spaces));
+          }
         }
+        const sortedDistsShallow = Array.from(new Set(distsShallow.map(d => Math.round(d * 1000) / 1000))).sort((a, b) => a - b);
+        
+        let pIndexShallow = 0;
+        sortedDistsShallow.forEach((d) => {
+          // Filter out the purlin at the ridge because ridgeOffsethut handles it
+          if (d >= rl_shallow - 0.15) return;
+          
+          const px = side * (w/4 - d * Math.cos(a_shallow));
+          const py = h + h_steep + d * Math.sin(a_shallow);
+          addPurlinWithCleats(px, py, side * -a_shallow, `purlin_shallow_${side}_${pIndexShallow++}`);
+        });
       }
-      addPurlinWithCleats(0, h + h_steep + h_shallow, 0, `purlin_ridge`);
+      // Implement two adjacent purlins at the ridge to secure the sheet ends
+      const ridgeOffsethut = 0.15;
+      for (let side = -1; side <= 1; side += 2) {
+        const px = side * ridgeOffsethut;
+        const py = h + h_steep + h_shallow - ridgeOffsethut * Math.tan(a_shallow);
+        addPurlinWithCleats(px, py, side * -a_shallow, `purlin_ridge_${side}`);
+      }
     } else {
       const roofH = (w / 2) * (specs.roofSlope / 100);
       const rl = Math.sqrt((w / 2) * (w / 2) + roofH * roofH);
-      const runs = Math.max(1, Math.round(rl / purlinSpacing));
-      
+      const roofSegments = Math.ceil(rl / 6);
+      const L_seg = rl / roofSegments;
       const angle = Math.atan(roofH / (w / 2));
-      for (let side = -1; side <= 1; side += 2) {
-        for (let p = 0; p < runs; p++) {
-          const startX = side * (w/2 - inboardOffset);
-          const endX = 0;
-          const t = p / runs;
-          const px = startX + (endX - startX) * t;
-          const distFromWall = w/2 - Math.abs(px);
-          const py = h + distFromWall * Math.tan(angle);
-          addPurlinWithCleats(px, py, side * -angle, `purlin_${side}_${p}`);
+      
+      const dists: number[] = [];
+      for (let j = 0; j < roofSegments; j++) {
+        const start = j * L_seg;
+        const n_spaces = Math.max(1, Math.ceil(L_seg / purlinSpacing));
+        for (let k = 0; k <= n_spaces; k++) {
+          dists.push(start + k * (L_seg / n_spaces));
         }
       }
-      addPurlinWithCleats(0, h + roofH, 0, `purlin_ridge`);
+      const sortedDists = Array.from(new Set(dists.map(d => Math.round(d * 1000) / 1000))).sort((a, b) => a - b);
+      
+      for (let side = -1; side <= 1; side += 2) {
+        let pIndex = 0;
+        sortedDists.forEach((d, idx) => {
+          // Filter out the ridge purlins because ridgeOffsetGable handles it
+          if (d >= rl - 0.15) return;
+          
+          let px = side * (w/2 - d * Math.cos(angle));
+          // Shift the eave purlin inboard by inboardOffset
+          if (idx === 0) {
+            px = side * (w/2 - inboardOffset);
+          }
+          const distFromWall = w/2 - Math.abs(px);
+          const py = h + distFromWall * Math.tan(angle);
+          addPurlinWithCleats(px, py, side * -angle, `purlin_${side}_${pIndex++}`);
+        });
+      }
+      // Implement two adjacent purlins at the ridge to secure the sheet ends
+      const ridgeOffsetGable = 0.15;
+      for (let side = -1; side <= 1; side += 2) {
+        const px = side * ridgeOffsetGable;
+        const py = h + (w/2 - ridgeOffsetGable) * Math.tan(angle);
+        addPurlinWithCleats(px, py, side * -angle, `purlin_ridge_${side}`);
+      }
     }
 
     const girtSpacing = specs.highWindVelocity || specs.snowLoad ? 1.0 : 1.5;
@@ -4317,8 +4903,7 @@ function BuildingVisualizer({ specs, dimensionUnit, view = 'front' }: { specs: P
     const startX = centerX - drawL / 2;
     const endX = centerX + drawL / 2;
 
-    const baySpacing = 6;
-    const numFrames = Math.ceil(lVal / baySpacing) + 1;
+    const { baySpacing, numFrames } = getBaySpacingAndFrames(lVal, specs.autoOptimize);
     const fDepth = Math.max(0.6, Math.round(specs.eaveHeight * 0.2 * 10) / 10);
     const fDepthPx = fDepth * scale;
 
@@ -4450,6 +5035,10 @@ function BuildingVisualizer({ specs, dimensionUnit, view = 'front' }: { specs: P
     const scaleY = (canvasH - 2 * paddingY) / maxH;
     const scale = Math.min(scaleX, scaleY);
 
+    const overhangVal = specs.hasGutters ? 0.075 : 0.50; // 75mm (0.075m) eave overhang if gutters installed, else 500mm (0.50m)
+    const overhangPx = overhangVal * scale;
+    const overhangStr = dimensionUnit === 'ft' ? (overhangVal * 3.28084).toFixed(2) + ' ft' : overhangVal.toFixed(2) + ' m';
+
     const drawL = lVal * scale;
     const drawW = wVal * scale;
 
@@ -4461,8 +5050,7 @@ function BuildingVisualizer({ specs, dimensionUnit, view = 'front' }: { specs: P
     const startY = centerY - drawW / 2;
     const endY = centerY + drawW / 2;
 
-    const baySpacing = 6;
-    const numFrames = Math.ceil(lVal / baySpacing) + 1;
+    const { baySpacing, numFrames } = getBaySpacingAndFrames(lVal, specs.autoOptimize);
 
     const isSingle = specs.roofType === 'Single Slope';
     const isMulti = specs.roofType === 'Multi-Sloped Hut';
@@ -4470,6 +5058,7 @@ function BuildingVisualizer({ specs, dimensionUnit, view = 'front' }: { specs: P
 
     const frameLines = [];
     const purlinLines = [];
+    const purlinYCoords: number[] = [];
 
     // Columns and Main Rafter Frame lines
     for (let i = 0; i < numFrames; i++) {
@@ -4524,6 +5113,7 @@ function BuildingVisualizer({ specs, dimensionUnit, view = 'front' }: { specs: P
             purlinLines.push(
               <line key={`top_purlin_${y1}_${k}`} x1={startX} y1={py} x2={endX} y2={py} stroke="#475569" strokeWidth="1" strokeDasharray="3 3" opacity="0.7" />
             );
+            purlinYCoords.push(py);
           }
         } else {
           for (let k = 0; k <= runs; k++) {
@@ -4531,6 +5121,7 @@ function BuildingVisualizer({ specs, dimensionUnit, view = 'front' }: { specs: P
             purlinLines.push(
               <line key={`top_purlin_${y1}_${k}`} x1={startX} y1={py} x2={endX} y2={py} stroke="#475569" strokeWidth="1" strokeDasharray="3 3" opacity="0.7" />
             );
+            purlinYCoords.push(py);
           }
         }
       };
@@ -4552,6 +5143,103 @@ function BuildingVisualizer({ specs, dimensionUnit, view = 'front' }: { specs: P
       }
     }
 
+    const sortedUniqueY = Array.from(new Set(purlinYCoords.map(y => Math.round(y * 10) / 10))).sort((a, b) => a - b);
+    let purlinDimensionLine = null;
+    const marginGapVal = 0.15;
+    const centerGapVal = 0.30;
+    const marginGapStr = dimensionUnit === 'ft' ? (marginGapVal * 3.28084).toFixed(2) + ' ft' : marginGapVal.toFixed(2) + ' m';
+    const centerGapStr = dimensionUnit === 'ft' ? (centerGapVal * 3.28084).toFixed(2) + ' ft' : centerGapVal.toFixed(2) + ' m';
+
+    if (specs.hasSecondarySteel !== false && sortedUniqueY.length >= 2) {
+      const p1 = sortedUniqueY[0];
+      const p2 = sortedUniqueY[1];
+      const dimX = startX + 45;
+      purlinDimensionLine = (
+        <g key="purlin_dim_top" opacity="0.9">
+          {/* Vertical dimension line */}
+          <line x1={dimX} y1={p1} x2={dimX} y2={p2} stroke="#0ea5e9" strokeWidth="1.5" />
+          
+          {/* Ticks at the ends */}
+          <line x1={dimX - 4} y1={p1} x2={dimX + 4} y2={p1} stroke="#0ea5e9" strokeWidth="1.5" />
+          <line x1={dimX - 4} y1={p2} x2={dimX + 4} y2={p2} stroke="#0ea5e9" strokeWidth="1.5" />
+          
+          {/* Text label next to the line */}
+          <rect x={dimX + 6} y={(p1 + p2) / 2 - 8} width={dimensionUnit === 'ft' ? 120 : 110} height="16" fill="#f8fafc" rx="2" />
+          <text 
+            x={dimX + 10} 
+            y={(p1 + p2) / 2} 
+            fill="#0284c7" 
+            fontSize="9" 
+            fontWeight="700"
+            dominantBaseline="middle"
+          >
+            Purlin Spacing: {dimensionUnit === 'ft' ? (purlinSpacing * 3.28084).toFixed(2) : purlinSpacing.toFixed(1)}{dimensionUnit === 'ft' ? 'ft' : 'm'}
+          </text>
+        </g>
+      );
+    }
+
+    let marginGapDimension = null;
+    let centerGapDimension = null;
+
+    if (specs.hasSecondarySteel !== false) {
+      const marginY1 = startY;
+      const marginY2 = startY + 8; // offset of 8px
+      const mDimX = endX + 15;
+      marginGapDimension = (
+        <g key="margin_gap_dim" opacity="0.9">
+          {/* Vertical dimension line */}
+          <line x1={mDimX} y1={marginY1} x2={mDimX} y2={marginY2} stroke="#0ea5e9" strokeWidth="1.5" />
+          
+          {/* Ticks at the ends */}
+          <line x1={mDimX - 4} y1={marginY1} x2={mDimX + 4} y2={marginY1} stroke="#0ea5e9" strokeWidth="1.5" />
+          <line x1={mDimX - 4} y1={marginY2} x2={mDimX + 4} y2={marginY2} stroke="#0ea5e9" strokeWidth="1.5" />
+          
+          {/* Label */}
+          <rect x={mDimX + 6} y={(marginY1 + marginY2) / 2 - 8} width={dimensionUnit === 'ft' ? 105 : 95} height="16" fill="#f8fafc" rx="2" />
+          <text 
+            x={mDimX + 10} 
+            y={(marginY1 + marginY2) / 2} 
+            fill="#0284c7" 
+            fontSize="9" 
+            fontWeight="700"
+            dominantBaseline="middle"
+          >
+            Margin Gap: {marginGapStr}
+          </text>
+        </g>
+      );
+
+      if (!isSingle) {
+        const centerY1 = centerY - 8;
+        const centerY2 = centerY + 8;
+        const cDimX = endX + 15;
+        centerGapDimension = (
+          <g key="center_gap_dim" opacity="0.9">
+            {/* Vertical dimension line */}
+            <line x1={cDimX} y1={centerY1} x2={cDimX} y2={centerY2} stroke="#0ea5e9" strokeWidth="1.5" />
+            
+            {/* Ticks at the ends */}
+            <line x1={cDimX - 4} y1={centerY1} x2={cDimX + 4} y2={centerY1} stroke="#0ea5e9" strokeWidth="1.5" />
+            <line x1={cDimX - 4} y1={centerY2} x2={cDimX + 4} y2={centerY2} stroke="#0ea5e9" strokeWidth="1.5" />
+            
+            {/* Label */}
+            <rect x={cDimX + 6} y={(centerY1 + centerY2) / 2 - 8} width={dimensionUnit === 'ft' ? 105 : 95} height="16" fill="#f8fafc" rx="2" />
+            <text 
+              x={cDimX + 10} 
+              y={(centerY1 + centerY2) / 2} 
+              fill="#0284c7" 
+              fontSize="9" 
+              fontWeight="700"
+              dominantBaseline="middle"
+            >
+              Ridge Gap: {centerGapStr}
+            </text>
+          </g>
+        );
+      }
+    }
+
     return (
       <div id="peb-top-container" className="w-full relative flex items-center justify-center p-6 bg-white h-[40vh] md:h-[50vh] min-h-[300px] max-h-[600px]">
         <div className="absolute top-4 right-4 z-10 flex gap-2">
@@ -4565,7 +5253,7 @@ function BuildingVisualizer({ specs, dimensionUnit, view = 'front' }: { specs: P
         </div>
         <svg id="peb-top-svg" ref={svgRef} width="100%" height="100%" viewBox={`0 0 ${canvasW} ${canvasH}`} className="max-h-72 w-full drop-shadow-sm bg-white" xmlns="http://www.w3.org/2000/svg">
           {/* Outline boundary of roof */}
-          <rect x={startX - 5} y={startY - 5} width={drawL + 10} height={drawW + 10} fill="none" stroke="#0ea5e9" strokeWidth="2" strokeDasharray="5 3" opacity="0.6" />
+          <rect x={startX - overhangPx} y={startY - overhangPx} width={drawL + 2 * overhangPx} height={drawW + 2 * overhangPx} fill="none" stroke="#0ea5e9" strokeWidth="2" strokeDasharray="5 3" opacity="0.6" />
           
           {/* Building Slab/Base outline */}
           <rect x={startX} y={startY} width={drawL} height={drawW} fill="#f8fafc" stroke="#94a3b8" strokeWidth="1.5" />
@@ -4573,16 +5261,63 @@ function BuildingVisualizer({ specs, dimensionUnit, view = 'front' }: { specs: P
           {/* Purlins */}
           {purlinLines}
 
+          {/* Purlin Dimension Line inside */}
+          {purlinDimensionLine}
+
+          {/* Purlin Margin & Ridge Dimension Lines */}
+          {marginGapDimension}
+          {centerGapDimension}
+
+          {/* Roof Overhang Eave Line Dimension with Leader */}
+          <g key="overhang_leader" opacity="0.95">
+            {/* Small vertical dimension line spanning the overhang */}
+            <line x1={startX + 20} y1={startY - overhangPx} x2={startX + 20} y2={startY} stroke="#0ea5e9" strokeWidth="1.5" />
+            {/* Ticks */}
+            <line x1={startX + 16} y1={startY - overhangPx} x2={startX + 24} y2={startY - overhangPx} stroke="#0ea5e9" strokeWidth="1.5" />
+            <line x1={startX + 16} y1={startY} x2={startX + 24} y2={startY} stroke="#0ea5e9" strokeWidth="1.5" />
+            
+            {/* Leader lines extending out to the text */}
+            <path 
+              d={`M ${startX + 20} ${startY - overhangPx / 2} L ${startX + 20} ${startY - overhangPx - 15} L ${startX + 35} ${startY - overhangPx - 15}`} 
+              fill="none" 
+              stroke="#0ea5e9" 
+              strokeWidth="1.2" 
+            />
+            
+            {/* Label box and text */}
+            <rect 
+              x={startX + 38} 
+              y={startY - overhangPx - 25} 
+              width={dimensionUnit === 'ft' ? 120 : 110} 
+              height="18" 
+              fill="#f8fafc" 
+              rx="3" 
+              stroke="#0ea5e9" 
+              strokeWidth="0.5" 
+            />
+            <text 
+              x={startX + 44} 
+              y={startY - overhangPx - 16} 
+              fill="#0284c7" 
+              fontSize="9" 
+              fontWeight="700" 
+              dominantBaseline="middle"
+            >
+              Overhang: {overhangStr}
+            </text>
+          </g>
+
           {/* Frames and Column Markers */}
           {frameLines}
 
           {/* Legends */}
-          <g transform={`translate(${startX}, ${startY - 25})`}>
+          <g transform={`translate(${startX}, ${startY - 45})`}>
+            {/* Row 1 */}
             <rect x="0" y="0" width="8" height="8" fill="#10b981" rx="1" />
             <text x="12" y="8" fontSize="10" fill="#475569" fontWeight="500">Columns (Primary Frame)</text>
 
             <rect x="150" y="0" width="8" height="8" fill="none" stroke="#0ea5e9" strokeWidth="1" strokeDasharray="2 2" />
-            <text x="162" y="8" fontSize="10" fill="#475569" fontWeight="500">Roof Overhang (Eave Line)</text>
+            <text x="162" y="8" fontSize="10" fill="#475569" fontWeight="500">Roof Overhang (Eave Line: {overhangStr})</text>
 
             {specs.frameType === 'Multi-Span' && (
               <>
@@ -4590,6 +5325,21 @@ function BuildingVisualizer({ specs, dimensionUnit, view = 'front' }: { specs: P
                 <text x="318" y="8" fontSize="10" fill="#475569" fontWeight="500">Mid-Span Columns</text>
               </>
             )}
+
+            {/* Row 2 */}
+            <g transform="translate(0, 14)">
+              <line x1="0" y1="4" x2="16" y2="4" stroke="#475569" strokeWidth="1.5" strokeDasharray="3 2" opacity="0.8" />
+              <text x="22" y="8" fontSize="10" fill="#475569" fontWeight="500">Purlins (Spacing: {dimensionUnit === 'ft' ? (purlinSpacing * 3.28084).toFixed(2) : purlinSpacing.toFixed(1)}{dimensionUnit === 'ft' ? 'ft' : 'm'} center-to-center)</text>
+            </g>
+
+            {/* Row 3 */}
+            <g transform="translate(0, 28)">
+              <rect x="0" y="2" width="16" height="4" fill="none" stroke="#0ea5e9" strokeWidth="1" />
+              <text x="22" y="8" fontSize="10" fill="#475569" fontWeight="500">
+                Margin Gap (Eave Offset): {marginGapStr}
+                {!isSingle && ` | Ridge Center Gap: ${centerGapStr}`}
+              </text>
+            </g>
           </g>
 
           {/* Overall Dimensions */}
@@ -5688,6 +6438,7 @@ export default function App() {
     roofProfile: '6v Profile',
     wallProfile: '7v Profile',
     frameType: 'Clear Span',
+    autoOptimize: false,
     deliveryAddress: '',
     deliveryDistance: 0,
     dieselPrice: 90,
@@ -5843,8 +6594,7 @@ export default function App() {
   const wallArea = calculatedWallArea.toFixed(0);
 
   // Detailed Primary Elements Breakdown
-  const baySpacing = 6;
-  const numFrames = Math.ceil(specs.length / baySpacing) + 1;
+  const { baySpacing, numFrames } = getBaySpacingAndFrames(specs.length, specs.autoOptimize);
   const colsPerFrame = specs.frameType === 'Clear Span' || specs.frameType === 'Truss' ? 2 : 3;
   const totalColumns = numFrames * colsPerFrame;
   let totalRafters = numFrames * 2;
@@ -5973,7 +6723,7 @@ export default function App() {
     const rl_shallow = Math.sqrt((specs.width / 4) * (specs.width / 4) + h_shallow * h_shallow);
     const runsSteep = Math.max(1, Math.round(rl_steep / purlinSpacing));
     const runsShallow = Math.max(1, Math.round(rl_shallow / purlinSpacing));
-    purlinRunsPerFrame = (runsSteep + runsShallow) * 2 + 1;
+    purlinRunsPerFrame = (runsSteep + runsShallow) * 2 + 2;
   } else if (specs.roofType === 'Curved') {
     purlinRunsPerFrame = 1; // Just ridge for visualizer now, but maybe should be estimated roughly
     const arcLen = specs.width * 1.1; // generic approximation
@@ -5981,7 +6731,7 @@ export default function App() {
   } else {
     // Standard Hut
     const runsPerSlope = Math.max(1, Math.round(parseFloat(rafterLength) / purlinSpacing));
-    purlinRunsPerFrame = runsPerSlope * 2 + 1;
+    purlinRunsPerFrame = runsPerSlope * 2 + 2;
   }
   
   const purlinRuns = purlinRunsPerFrame;
@@ -6043,7 +6793,8 @@ export default function App() {
   // Sheet individual units
   const roofEffWidth = specs.roofProfile === '6v Profile' ? 0.99 : (specs.roofProfile === '7v Profile' ? 1.188 : 1.0);
   const roofSlopeFactor = Math.sqrt(1 + Math.pow(specs.roofSlope / 100, 2));
-  const sheetLengthRoof = specs.roofType === 'Single Slope' ? (specs.width * roofSlopeFactor) : ((specs.width / 2) * roofSlopeFactor);
+  const modelEaveOverhang = specs.hasGutters ? 0.075 : 0.50; // 75mm (0.075m) eave overhang if gutters installed, else 500mm (0.50m)
+  const sheetLengthRoof = (specs.roofType === 'Single Slope' ? (specs.width * roofSlopeFactor) : ((specs.width / 2) * roofSlopeFactor)) + modelEaveOverhang;
   const roofSides = specs.roofType === 'Single Slope' ? 1 : 2;
   const roofSegments = Math.ceil(sheetLengthRoof / 6);
   const roofOverlap = 0.2; // 200mm end overlap
@@ -6613,11 +7364,11 @@ export default function App() {
        } else if (specs.roofType === 'Multi-Sloped Hut') {
           const hw_steep = (specs.width / 4) * (specs.roofSlope * 1.5 / 100);
           const hw_sh = (specs.width / 4) * (specs.roofSlope * 0.5 / 100);
-          purlinRunsPerFrame = (Math.max(1, Math.round(Math.sqrt(Math.pow(specs.width / 4, 2) + hw_steep * hw_steep) / purlinSpacing)) + Math.max(1, Math.round(Math.sqrt(Math.pow(specs.width / 4, 2) + hw_sh * hw_sh) / purlinSpacing))) * 2 + 1;
+          purlinRunsPerFrame = (Math.max(1, Math.round(Math.sqrt(Math.pow(specs.width / 4, 2) + hw_steep * hw_steep) / purlinSpacing)) + Math.max(1, Math.round(Math.sqrt(Math.pow(specs.width / 4, 2) + hw_sh * hw_sh) / purlinSpacing))) * 2 + 2;
        } else if (specs.roofType === 'Curved') {
           purlinRunsPerFrame = Math.max(1, Math.round((specs.width * 1.1) / purlinSpacing)) + 1;
        } else {
-          purlinRunsPerFrame = Math.max(1, Math.round(parseFloat(rafterLength) / purlinSpacing)) * 2 + 1;
+          purlinRunsPerFrame = Math.max(1, Math.round(parseFloat(rafterLength) / purlinSpacing)) * 2 + 2;
        }
        const roofTotal = Math.max(0, Math.ceil((6 * specs.length * purlinRunsPerFrame) - ((specs.length - 1) * purlinRunsPerFrame)));
        

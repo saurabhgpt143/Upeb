@@ -450,14 +450,98 @@ export default function VoiceChatAssistant({
 
       // 6. Sizes (Regex match for width x length or width by length)
       const sizeMatch = msgLower.match(/(\d+)\s*(?:x|by|into|bhai|\*)\s*(\d+)/);
+      let isFt = msgLower.includes("feet") || msgLower.includes("ft") || msgLower.includes("फिट") || msgLower.includes("फुट") || dimensionUnit === "ft";
+      
+      const getClientShedCostReport = (w: number, l: number, isFtUnit: boolean, isHi: boolean) => {
+        const w_m = isFtUnit ? w * 0.3048 : w;
+        const l_m = isFtUnit ? l * 0.3048 : l;
+
+        const area_m2 = w_m * l_m;
+        const area_sqft = area_m2 * 10.7639;
+
+        const weightFactor = 35;
+        const targetSteelWeight = (area_m2 * weightFactor) / 1000;
+        const primarySteelTons = targetSteelWeight * 0.65;
+        const secondarySteelTons = targetSteelWeight * 0.15;
+
+        const primaryCost = Math.round(primarySteelTons * 110000);
+        const secondaryCost = Math.round(secondarySteelTons * 90000);
+        const roofCost = Math.round(area_m2 * 1.05 * 500);
+        const wallCost = Math.round(2 * (w_m + l_m) * 8 * 465);
+        const civilCost = Math.round(area_m2 * 1500);
+        const hardwareAndLogistics = Math.round(area_m2 * 150 + 30000);
+
+        const subTotal = primaryCost + secondaryCost + roofCost + wallCost + civilCost + hardwareAndLogistics;
+        const tax = Math.round(subTotal * 0.18);
+        const grandTotal = subTotal + tax;
+
+        const sizeStr = isFtUnit ? `${w} x ${l} ft` : `${w} x ${l} m`;
+        const areaStr = `${Math.round(area_sqft).toLocaleString('en-IN')} Sq.ft (${Math.round(area_m2).toLocaleString('en-IN')} Sqm)`;
+
+        if (isHi) {
+          return `\n\n💰 **शेड अनुमानित बजट रिपोर्ट (${sizeStr}):**
+• **कुल क्षेत्रफल (Area):** ${areaStr}
+• **प्राइमरी स्टील फ्रेमिंग (कॉलम और राफ्टर्स):** ₹${primaryCost.toLocaleString('en-IN')} (~${primarySteelTons.toFixed(1)} टन)
+• **सेकेंडरी स्टील फ्रेमिंग (पर्लिन्स और गर्ट्स):** ₹${secondaryCost.toLocaleString('en-IN')} (~${secondarySteelTons.toFixed(1)} टन)
+• **छत की शीट (Roof sheeting installed):** ₹${roofCost.toLocaleString('en-IN')}
+• **दीवार की शीट (Wall cladding installed):** ₹${wallCost.toLocaleString('en-IN')}
+• **फाउंडेशन और सिविल कार्य (₹1,500/वर्ग मीटर):** ₹${civilCost.toLocaleString('en-IN')}
+• **फास्टनर्स, हार्डवेयर और लॉजिस्टिक्स:** ₹${hardwareAndLogistics.toLocaleString('en-IN')}
+• **जीएसटी टैक्स (18% GST):** ₹${tax.toLocaleString('en-IN')}
+---
+🏆 **कुल टर्नकी अनुमानित मूल्य (Overall PEB Turnkey Total): ₹${grandTotal.toLocaleString('en-IN')}**`;
+        } else {
+          return `\n\n💰 **Estimated Shed Cost Report (${sizeStr}):**
+• **Total Area:** ${areaStr}
+• **Primary Steel Framing (Columns & Rafters):** ₹${primaryCost.toLocaleString('en-IN')} (~${primarySteelTons.toFixed(1)} Tons)
+• **Secondary Steel Framing (Purlins & Girts):** ₹${secondaryCost.toLocaleString('en-IN')} (~${secondarySteelTons.toFixed(1)} Tons)
+• **Roof Sheeting (Installed):** ₹${roofCost.toLocaleString('en-IN')}
+• **Wall Cladding (Installed):** ₹${wallCost.toLocaleString('en-IN')}
+• **Civil Foundation Work (₹1,500/sqm):** ₹${civilCost.toLocaleString('en-IN')}
+• **Fasteners, Hardware & Logistics:** ₹${hardwareAndLogistics.toLocaleString('en-IN')}
+• **GST Tax (18%):** ₹${tax.toLocaleString('en-IN')}
+---
+🏆 **Overall PEB Turnkey Total: ₹${grandTotal.toLocaleString('en-IN')}**`;
+        }
+      };
+
       if (sizeMatch) {
         const w = parseInt(sizeMatch[1]);
         const l = parseInt(sizeMatch[2]);
-        if (w >= 10 && w <= 150) updateSpecs.width = w;
-        if (l >= 10 && l <= 500) updateSpecs.length = l;
+        
+        // Convert to meters for storage (since React state expects meters)
+        const w_m = isFt ? w * 0.3048 : w;
+        const l_m = isFt ? l * 0.3048 : l;
+
+        if (w_m >= 3 && w_m <= 150) updateSpecs.width = Number(w_m.toFixed(2));
+        if (l_m >= 3 && l_m <= 500) updateSpecs.length = Number(l_m.toFixed(2));
+
+        const unitLabel = isFt ? "ft" : "m";
         reply += isHindi 
-          ? ` शेड का आकार बदलकर ${w} x ${l} कर दिया गया है।` 
-          : ` Shed size updated to ${w} x ${l} units.`;
+          ? ` शेड का आकार बदलकर ${w} x ${l} ${unitLabel === "ft" ? "फीट" : "मीटर"} कर दिया गया है।` 
+          : ` Shed size updated to ${w} x ${l} ${unitLabel}.`;
+
+        // Check if cost/price was also asked
+        const isCostQuery = /\b(price|cost|estimate|valuation|amount|budget|paisa|daam|keemat|kharcha|rupee|rs|gst|tax|खर्चा|कीमत|दाम|मूल्य|पैसे)\b/i.test(msgLower);
+        if (isCostQuery) {
+          reply += getClientShedCostReport(w, l, isFt, isHindi);
+        }
+      }
+
+      // If they asked about price but didn't specify a size, calculate for current specs
+      const isCostQuery = /\b(price|cost|estimate|valuation|amount|budget|paisa|daam|keemat|kharcha|rupee|rs|gst|tax|खर्चा|कीमत|दाम|मूल्य|पैसे)\b/i.test(msgLower);
+      if (isCostQuery && !sizeMatch) {
+        const currentW = specs ? (specs.width || 30) : 30;
+        const currentL = specs ? (specs.length || 60) : 60;
+        
+        const w_display = isFt ? Math.round(currentW * 3.28084) : currentW;
+        const l_display = isFt ? Math.round(currentL * 3.28084) : currentL;
+
+        reply += isHindi
+          ? ` यहाँ आपके वर्तमान शेड आकार का अनुमानित मूल्य दिया गया है:`
+          : ` Here is the estimated price for your current shed dimensions:`;
+        
+        reply += getClientShedCostReport(w_display, l_display, isFt, isHindi);
       }
 
       // 7. Heights

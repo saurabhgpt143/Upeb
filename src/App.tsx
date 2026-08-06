@@ -6553,8 +6553,6 @@ function BuildingVisualizer({ specs, dimensionUnit, view = 'front' }: { specs: P
 
   const totalRoofH = isSingle ? specs.width * (specs.roofSlope / 100) : (isMulti ? h_steep + h_shallow : (isCurved ? h_curved : (specs.width / 2) * (specs.roofSlope / 100)));
   const ridgeHeight = specs.eaveHeight + totalRoofH;
-  const centerRoofRise = isSingle ? totalRoofH / 2 : totalRoofH;
-  const centerHeight = specs.eaveHeight + centerRoofRise;
 
   const maxH = Math.max(ridgeHeight, 5);
 
@@ -7983,25 +7981,20 @@ function BuildingVisualizer({ specs, dimensionUnit, view = 'front' }: { specs: P
 
         {isSingle ? (
           <>
-            <text x={pRightGround.x + 20} y={groundY - (specs.eaveHeight + totalRoofH) * scale / 2} fill="#64748b" fontSize="16" textAnchor="start" dominantBaseline="middle" fontWeight="500">High Eave: {fmtLen(specs.eaveHeight + totalRoofH)}</text>
+            <text x={pRightGround.x + 20} y={groundY - (specs.eaveHeight + totalRoofH) * scale / 2} fill="#64748b" fontSize="16" textAnchor="start" dominantBaseline="middle" fontWeight="500">High Eave: {dimensionUnit === 'ft' ? ((specs.eaveHeight + totalRoofH) * 3.28084).toFixed(1) : (specs.eaveHeight + totalRoofH).toFixed(1)}{dimensionUnit === 'ft' ? 'ft' : 'm'}</text>
             <line x1={pRightGround.x + 12} y1={groundY} x2={pRightGround.x + 12} y2={pRightTop.y} stroke="#94a3b8" strokeWidth="1" />
             <line x1={pRightGround.x + 6} y1={groundY} x2={pRightGround.x + 18} y2={groundY} stroke="#94a3b8" strokeWidth="1" />
             <line x1={pRightGround.x + 6} y1={pRightTop.y} x2={pRightGround.x + 18} y2={pRightTop.y} stroke="#94a3b8" strokeWidth="1" />
-
-            {/* Center Height indicator */}
-            <text x={centerX} y={groundY - (specs.eaveHeight + centerRoofRise) * scale - 15} fill="#0284c7" fontSize="16" textAnchor="middle" fontWeight="600">Center Height: {fmtLen(centerHeight)}</text>
-            <line x1={centerX} y1={groundY} x2={centerX} y2={groundY - (specs.eaveHeight + centerRoofRise) * scale} stroke="#0284c7" strokeWidth="1.2" strokeDasharray="4 4" />
           </>
         ) : (
           <>
-            <text x={pRightGround.x + 20} y={groundY - drawEave / 2} fill="#64748b" fontSize="16" textAnchor="start" dominantBaseline="middle" fontWeight="500">Eave: {fmtLen(specs.eaveHeight)}</text>
+            <text x={pRightGround.x + 20} y={groundY - drawEave / 2} fill="#64748b" fontSize="16" textAnchor="start" dominantBaseline="middle" fontWeight="500">Eave: {dimensionUnit === 'ft' ? (specs.eaveHeight * 3.28084).toFixed(2) : specs.eaveHeight}{dimensionUnit === 'ft' ? 'ft' : 'm'}</text>
             <line x1={pRightGround.x + 12} y1={groundY} x2={pRightGround.x + 12} y2={pRightTop.y} stroke="#94a3b8" strokeWidth="1" />
             <line x1={pRightGround.x + 6} y1={groundY} x2={pRightGround.x + 18} y2={groundY} stroke="#94a3b8" strokeWidth="1" />
             <line x1={pRightGround.x + 6} y1={pRightTop.y} x2={pRightGround.x + 18} y2={pRightTop.y} stroke="#94a3b8" strokeWidth="1" />
             
-            {/* Center Height (Ridge) indicator */}
-            <text x={centerX} y={groundY - ridgeHeight * scale - 15} fill="#0284c7" fontSize="16" textAnchor="middle" fontWeight="600">Center Height (Ridge): {fmtLen(centerHeight)}</text>
-            <line x1={centerX} y1={groundY} x2={centerX} y2={groundY - ridgeHeight * scale} stroke="#0284c7" strokeWidth="1.2" strokeDasharray="4 4" />
+            <text x={centerX} y={groundY - ridgeHeight * scale - 15} fill="#64748b" fontSize="16" textAnchor="middle" fontWeight="500">Ridge: {dimensionUnit === 'ft' ? ((specs.eaveHeight + totalRoofH) * 3.28084).toFixed(1) : (specs.eaveHeight + totalRoofH).toFixed(1)}{dimensionUnit === 'ft' ? 'ft' : 'm'}</text>
+            <line x1={centerX} y1={groundY} x2={centerX} y2={groundY - ridgeHeight * scale} stroke="#94a3b8" strokeWidth="1" strokeDasharray="4 4" />
           </>
         )}
 
@@ -8071,17 +8064,11 @@ function BuildingVisualizer({ specs, dimensionUnit, view = 'front' }: { specs: P
             </div>
 
             {/* Stats Summary Cards */}
-            <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3 text-xs">
-              <div className="p-3 bg-sky-50/70 rounded-lg border border-sky-100">
-                <span className="text-sky-700 font-semibold">Center Height</span>
-                <div className="text-base font-extrabold text-sky-950 mt-0.5">
-                  {fmtLen(centerHeight)}
-                </div>
-              </div>
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs">
               <div className="p-3 bg-emerald-50/60 rounded-lg border border-emerald-100">
                 <span className="text-emerald-700 font-semibold">Web Members (per Truss)</span>
                 <div className="text-base font-extrabold text-emerald-900 mt-0.5">
-                  {webMembers.length} Struts ({verticalWebs.length}V + {diagonalWebs.length}D)
+                  {webMembers.length} Web Struts ({verticalWebs.length}V + {diagonalWebs.length}D)
                 </div>
               </div>
               <div className="p-3 bg-blue-50/60 rounded-lg border border-blue-100">

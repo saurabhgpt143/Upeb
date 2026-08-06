@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <rect width="512" height="512" fill="#ffffff" />
+  <g transform="scale(2.6666) translate(0, 0)">
+    <path d="M40 120 L40 90 L96 70 L152 90 L152 120" stroke="#0f172a" stroke-width="8" fill="none" />
+    <path d="M60 120 L60 98 M96 120 L96 90 M132 120 L132 98" stroke="#0f172a" stroke-width="6" />
+    <path d="M40 90 L152 90" stroke="#0f172a" stroke-width="4" />
+    <ellipse cx="96" cy="95" rx="65" ry="30" fill="none" stroke="#2563eb" stroke-width="6" transform="rotate(-15 96 95)" />
+    <text x="50%" y="155" dominant-baseline="middle" text-anchor="middle" font-size="28" font-weight="bold" fill="#0f172a" font-family="sans-serif">UPEB</text>
+  </g>
+</svg>

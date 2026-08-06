@@ -1,0 +1,110 @@
+67:} from 'lucide-react';
+189:  { name: 'RAL 9001 Cream', hex: '#e9e5ce' },
+201:  { name: 'RAL 9006 White Aluminium', hex: '#a5a5a5' },
+838:            vxs = [0]; // Midpoint of the incline from -w/2 to w/2
+1454:              {dimensionUnit === 'ft' ? (specs.width * 3.28084).toFixed(2) : specs.width}{dimensionUnit === 'ft' ? 'ft' : 'm'} Width
+1461:            <Text position={[specs.width / 2 + 1.5, 0.1, -specs.length / 2]} rotation={[-Math.PI / 2, 0, Math.PI / 2]} fontSize={Math.max(1, Math.min(specs.length * 0.05, 3))} color="#1e293b" anchorX="center" anchorY="bottom">
+1462:              {dimensionUnit === 'ft' ? (specs.length * 3.28084).toFixed(2) : specs.length}{dimensionUnit === 'ft' ? 'ft' : 'm'} Length
+1469:            <Text position={[-specs.width / 2 - 1.5, specs.eaveHeight / 2, 0]} rotation={[0, -Math.PI / 2, 0]} fontSize={Math.max(1, Math.min(specs.eaveHeight * 0.15, 3))} color="#1e293b" anchorX="center" anchorY="bottom">
+1470:              {dimensionUnit === 'ft' ? (specs.eaveHeight * 3.28084).toFixed(2) : specs.eaveHeight}{dimensionUnit === 'ft' ? 'ft' : 'm'} Height
+1476:        <OrbitControls makeDefault enableZoom={true} enablePan={true} minPolarAngle={0} maxPolarAngle={isInside ? Math.PI : Math.PI / 2 - 0.05} />
+1558:    dPath = `M ${pLeftGround.x} ${pLeftGround.y} L ${pLeftEave.x} ${pLeftEave.y} L ${pRightTop.x} ${pRightTop.y} L ${pRightGround.x} ${pRightGround.y}`;
+1559:    dRoof = `M ${pLeftEave.x - 5} ${pLeftEave.y + (5 * (pLeftEave.y - pRightTop.y) / drawW)} L ${pRightTop.x + 5} ${pRightTop.y - (5 * (pLeftEave.y - pRightTop.y) / drawW)}`;
+1565:    dPath = `M ${pLeftGround.x} ${pLeftGround.y} L ${pLeftEave.x} ${pLeftEave.y} L ${quarter1} ${h1Y} L ${centerX} ${pRidgeY} L ${quarter3} ${h1Y} L ${pRightTop.x} ${pRightTop.y} L ${pRightGround.x} ${pRightGround.y}`;
+1566:    dRoof = `M ${pLeftEave.x} ${pLeftEave.y} L ${quarter1} ${h1Y} L ${centerX} ${pRidgeY} L ${quarter3} ${h1Y} L ${pRightTop.x} ${pRightTop.y}`;
+1569:    dPath = `M ${pLeftGround.x} ${pLeftGround.y} L ${pLeftEave.x} ${pLeftEave.y} Q ${centerX} ${cpY} ${pRightTop.x} ${pRightTop.y} L ${pRightGround.x} ${pRightGround.y}`;
+1570:    dRoof = `M ${pLeftEave.x} ${pLeftEave.y} Q ${centerX} ${cpY} ${pRightTop.x} ${pRightTop.y}`;
+1574:    dPath = `M ${pLeftGround.x} ${pLeftGround.y} L ${pLeftEave.x} ${pLeftEave.y} L ${centerX} ${pRidgeY} L ${pRightTop.x} ${pRightTop.y} L ${pRightGround.x} ${pRightGround.y}`;
+1575:    dRoof = `M ${pLeftEave.x} ${pLeftEave.y} L ${centerX} ${pRidgeY} L ${pRightTop.x} ${pRightTop.y}`;
+1777:          <Legend verticalAlign="bottom" height={36} iconType="circle" />
+1825:          title="Custom Color"
+1835:  "Base plates": { icon: Square, color: "text-slate-700 bg-slate-100", desc: "Thick steel plates welded to the bottom of columns to distribute load to the concrete foundation." },
+1852:  "M.S. Pipe Purlins/Girts": { icon: AlignJustify, color: "text-slate-500 bg-slate-100", desc: "Tubular secondary steel sections supporting the roof and wall cladding." },
+1864:  "12-14 x 55mm": { icon: Target, color: "text-emerald-700 bg-emerald-200", desc: "Common 55mm length self-drilling screw, often used for roofing." },
+1865:  "12-14 x 25mm": { icon: Target, color: "text-emerald-700 bg-emerald-200", desc: "Common 25mm length self-drilling screw, used for wall cladding." },
+1866:  "EPDM Washers": { icon: Circle, color: "text-slate-900 bg-slate-200", desc: "Rubber washers attached to screws to provide weather-tight seals." },
+1867:  "Bare Galvalume": { icon: Sun, color: "text-zinc-400 bg-zinc-100", desc: "Unpainted zinc-aluminum coated steel sheeting." },
+1935:      if (typeof item === 'string') {
+1941:                key={`${key}-${i}-${Math.random()}`}
+1954:        newResult.push(item);
+2006:        stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
+2008:          videoRef.current.srcObject = stream;
+2048:      if (stream) {
+2190:    columnProfile: '2 x 72 x 72 x 6000mm -27kg',
+2191:    rafterProfile: '2 x 48 x 96 x 6000mm -27kg',
+2192:    purlinProfile: '2 x 38 x 38 x 6000mm -14kg',
+2193:    girtProfile: '2 x 38 x 38 x 6000mm -14kg',
+2194:    basePlateProfile: '8 x 200 x 200mm -2.5kg',
+2195:    nutBoltProfile: '12 x 50mm -0.100kg',
+2270:      details: `Dimensions updated to ${specs.width}x${dimensionUnit === 'ft' ? (specs.length * 3.28084).toFixed(2) : specs.length}{dimensionUnit === 'ft' ? 'ft' : 'm'}, H:${dimensionUnit === 'ft' ? (specs.eaveHeight * 3.28084).toFixed(2) : specs.eaveHeight}{dimensionUnit === 'ft' ? 'ft' : 'm'}, ${specs.roofType} Roof, ${specs.frameType} Frame.`
+2369:    { label: 'Standard Embedment Depth', value: `${embedmentDepth.toFixed(1)}m`, category: 'Foundation & Civil' },
+2370:    { label: 'Grounded Column (Pedestal)', value: '0.6m x 0.6m', category: 'Foundation & Civil' },
+2371:    { label: 'Concrete Footing Pad', value: '1.2m x 1.2m x 0.3m thickness (Ensures 0.3m separation from grounded column on all sides)', category: 'Foundation & Civil' },
+2378:    { label: 'Spacing', value: 'Columns & Rafters (Bay Spacing): 6.0m center-to-center', category: 'Specifications' },
+2379:    { label: 'Length', value: `Columns: ~${(specs.eaveHeight + embedmentDepth).toFixed(1)}m (includes ${embedmentDepth}m embedment), Rafters: ~${rafterLength}m`, category: 'Specifications' },
+2382:    { label: 'Quantity (Calculated)', value: `${colPcscalc} sections & ${rafPcscalc} sections (6m stock)`, category: 'Logistics & Quantity' },
+2393:    { label: 'Components & Consumables', value: 'M.S. Pipe frames, Base plates, Gusset plates, Stiffeners, Welding consumables, Red Oxide Primer, Synthetic Enamel Paint', category: 'Components & Process' },
+2394:    { label: 'Hardware', value: 'ASTM A325/A490 High-Strength Bolts, Base Anchor Bolts', category: 'Components & Process' },
+2451:    { label: 'Spacing (Purlins)', value: `${purlinSpacing}m center-to-center`, category: 'Specifications' },
+2452:    ...(specs.hasGirts !== false ? [{ label: 'Spacing (Girts)', value: `${girtSpacing}m center-to-center`, category: 'Specifications' }] : []),
+2453:    { label: 'Length', value: `Standard Bay Length (~${baySpacing}m, continuous/overlapped)`, category: 'Specifications' },
+2472:    { label: 'Components', value: `M.S. Pipe Purlins, ${specs.hasGirts !== false ? 'M.S. Pipe Girts, ' : ''}Eave struts, Sag rods, Brace pipes, Gusset plates`, category: 'Components & Process' },
+2485:    { label: 'Quantity', value: `${roofArea} m² (~${specs.roofProfile === '7v Profile' ? Math.ceil(parseFloat(roofArea) / 1.188) : (specs.roofProfile === '6v Profile' ? Math.ceil(parseFloat(roofArea) / 0.960) : Math.ceil(parseFloat(roofArea) / 1.05))} linear meters)`, category: 'Specifications' },
+2486:    { label: 'Length', value: `Custom cut (Typically ~${(parseFloat(rafterLength) + 0.5).toFixed(1)}m from ridge to eave including overhang)`, category: 'Specifications' },
+2487:    { label: 'Width', value: specs.roofProfile === '7v Profile' ? 'Covered width: 1188mm / Total width: 1253mm / Required coil width: 1440mm' : (specs.roofProfile === '6v Profile' ? 'Covered width: 960mm / Total width: 1060mm / Required coil width: 1220mm' : '1060 mm (Effective Cover Width 1000 mm)'), category: 'Specifications' },
+2488:    { label: 'Thickness', value: specs.highWindVelocity || specs.snowLoad ? '0.60 mm / 0.65 mm (Reinforced thick gauge)' : '0.47 mm / 0.50 mm (Bare Galvalume or Color Coated)', category: 'Specifications' },
+2490:    { label: 'Installation Steps', value: 'Eave alignment → Lifting sheets to roof → Fixing with 12-14 x 55mm self-drilling screws → Applying butyl tape at overlaps → Ridge cap & flashing installation', category: 'Installation Procedures' },
+2492:    { label: 'Price (Material)', value: `₹${Math.round(roofUnitCost * roofAreaNum).toLocaleString('en-IN')} (₹${roofUnitCost}/{dimensionUnit === 'ft' ? ' sq.ft' : ' m²'})`, category: 'Financials' },
+2493:    { label: 'Labor Cost', value: `₹${Math.round(roofLaborCost * roofAreaNum).toLocaleString('en-IN')} (Installation)`, category: 'Financials' },
+2494:    { label: 'Total Est. Cost', value: `₹${Math.round((roofUnitCost + roofLaborCost) * roofAreaNum).toLocaleString('en-IN')} (Installed)`, category: 'Financials' },
+2505:    { label: 'Quantity', value: `${wallArea} m² (~${specs.wallProfile === '7v Profile' ? Math.ceil(parseFloat(wallArea) / 1.188) : (specs.wallProfile === '6v Profile' ? Math.ceil(parseFloat(wallArea) / 0.960) : Math.ceil(parseFloat(wallArea) / 1.05))} linear meters)`, category: 'Specifications' },
+2506:    { label: 'Length', value: `Custom cut (Typically ~${dimensionUnit === 'ft' ? (specs.eaveHeight * 3.28084).toFixed(2) : specs.eaveHeight}{dimensionUnit === 'ft' ? 'ft' : 'm'} vertical sheets)`, category: 'Specifications' },
+2507:    { label: 'Width', value: specs.wallProfile === '7v Profile' ? 'Covered width: 1188mm / Total width: 1253mm / Required coil width: 1440mm' : (specs.wallProfile === '6v Profile' ? 'Covered width: 960mm / Total width: 1060mm / Required coil width: 1220mm' : '1060 mm (Effective Cover Width 1000 mm)'), category: 'Specifications' },
+2508:    { label: 'Thickness', value: specs.highWindVelocity || specs.snowLoad ? '0.60 mm / 0.65 mm (Reinforced thick gauge)' : '0.47 mm / 0.50 mm (Color Coated Galvalume)', category: 'Specifications' },
+2510:    { label: 'Installation Steps', value: 'Setting base drip angle → Plumb alignment of first sheet → Fixing with 12-14 x 25mm self-drilling screws to girts → Successive overlapping → Corner & opening flashings', category: 'Installation Procedures' },
+2512:    { label: 'Price (Material)', value: `₹${Math.round(wallUnitCost * wallAreaNum).toLocaleString('en-IN')} (₹${wallUnitCost}/{dimensionUnit === 'ft' ? ' sq.ft' : ' m²'})`, category: 'Financials' },
+2513:    { label: 'Labor Cost', value: `₹${Math.round(wallLaborCost * wallAreaNum).toLocaleString('en-IN')} (Installation)`, category: 'Financials' },
+2514:    { label: 'Total Est. Cost', value: `₹${Math.round((wallUnitCost + wallLaborCost) * wallAreaNum).toLocaleString('en-IN')} (Installed)`, category: 'Financials' },
+2527:    { label: 'Self-Drilling Screws', value: '12-14 x 55mm (Roofing) / 12-14 x 25mm (Wall) Hex Head (with EPDM Washers)', category: 'Items' },
+2531:    { label: 'Fastening Procedure', value: 'Foundation anchor bolt layout & casting → Base plate positioning & bolt tightening → Main frame connections with high-strength bolts (Torque wrench method) → Secondary members with standard machine bolts → Cladding & Roofing with self-drilling screws ensuring proper EPDM compression', category: 'Installation Procedures' },
+2539:    { label: 'Deformation Limits', value: 'Maximum allowable deflection for roof beams (L/180) and building drift (H/300) maintained.', category: 'Structural Implications' },
+2542:    { label: 'Depreciation', value: 'Accelerated depreciation potential (typically 3-10% per annum depending on regional tax codes) owing to pre-engineered steel asset classification.', category: 'Financials' },
+2738:    // Columns & Rafters (from Primary Steel)
+2770:    // Purlins & Girts (from Secondary Steel)
+2824:        if (specs.hasRidgeCap !== false) accRows.push(override("ridgeCap", "Ridge Cap", "m", Math.ceil(specs.length), 350));
+2825:        if (specs.hasGutters !== false) accRows.push(override("gutters", "Gutters", "m", Math.ceil(specs.length * (specs.roofType === 'Single Slope' ? 1 : 2)), 400));
+2826:        if (specs.hasGables !== false) accRows.push(override("gables", "Gable / Rake Flashing", "m", Math.ceil(specs.width * (specs.roofType === 'Single Slope' ? 1 : 2)), 250));
+2827:        if (specs.hasDownPipes !== false) accRows.push(override("downPipes", "Down Pipes", "m", Math.ceil(specs.eaveHeight * 4), 150));
+2830:    if (specs.hasCornerFlashing !== false && specs.hasWalls !== false) accRows.push(override("cornerFlashing", "Corner Flashing", "m", Math.ceil(specs.eaveHeight * 4), 250));
+2831:    if (specs.hasEndFlashing !== false && specs.hasWalls !== false) accRows.push(override("endFlashing", "End Flashing", "m", Math.ceil(specs.width * 2), 200));
+2833:    if (specs.hasInsulation !== false) accRows.push(override("insulation", "Air Bubble Insulation", "sqm", Math.ceil(specs.width * specs.length * 1.1), 120));
+2835:    if (specs.hasMSFlats !== false) accRows.push(override("msFlats", "Mild Steel Flats (25x3mm)", "m", Math.ceil(specs.length * 4), 40));
+2838:    if (specs.hasWindows !== false && specs.hasWalls !== false) accRows.push(override("windows", "Aluminum Windows", "units", Math.floor(specs.length / 5) * 2, 6500));
+2839:    if (specs.hasCrimpedSheets !== false && specs.hasWalls !== false) accRows.push(override("crimpedSheets", "Crimped Sheets", "m", Math.ceil(specs.width * 2), 500));
+2854:      hardwareRows.push(formatRow('bolts', `12*50mm Nut Bolt`, 'pcs', nutBoltPcs, Math.round(nutBoltPricePerPc)));
+2895:          id: item.id,
+2896:          name: item.name,
+2897:          unit: item.unit,
+2902:          overrideQty: item.qty,
+2903:          overridePrice: item.price,
+2906:          formatted: [item.name, item.unit, q.toLocaleString('en-IN'), `Rs. ${p.toLocaleString('en-IN')}`, `Rs. ${Math.round(q * p).toLocaleString('en-IN')}`]
+2914:  }, [specs, primaryTons, secondaryTons, accessories, totalPurlins, totalGirts, primaryUnitCost, secondaryUnitCost, roofAreaNum, wallAreaNum, roofUnitCost, wallUnitCost, columnLinearMeasurement, rafterLinearMeasurement, hardwareUnitCostPerKg]);
+2918:    doc.text(`Material Requirements & Pricing - ${specs.width}x${specs.length}x${dimensionUnit === 'ft' ? (specs.eaveHeight * 3.28084).toFixed(2) : specs.eaveHeight}{dimensionUnit === 'ft' ? 'ft' : 'm'} PEB`, 14, 20);
+2955:        doc.text("UPEB by M.G. INDUSTRIES 9752556113", doc.internal.pageSize.width / 2, doc.internal.pageSize.height - 10, { align: 'center' });
+2963:    doc.text(`Project Quote & Specifications - ${specs.width}x${specs.length}x${dimensionUnit === 'ft' ? (specs.eaveHeight * 3.28084).toFixed(2) : specs.eaveHeight}{dimensionUnit === 'ft' ? 'ft' : 'm'} PEB`, 14, 20);
+2979:        ['Target Civil Foundation (Rs. 1,500/sqm)', `Rs. ${Math.round(civilFoundationCost).toLocaleString('en-IN')}`],
+3021:    doc.text("M.G. INDUSTRIES", doc.internal.pageSize.width - 70, signatureY + 20);
+3028:        doc.text("UPEB by M.G. INDUSTRIES 9752556113", doc.internal.pageSize.width / 2, doc.internal.pageSize.height - 10, { align: 'center' });
+3036:    doc.text(`${title} - ${specs.width}x${specs.length}x${dimensionUnit === 'ft' ? (specs.eaveHeight * 3.28084).toFixed(2) : specs.eaveHeight}{dimensionUnit === 'ft' ? 'ft' : 'm'} PEB`, 14, 20);
+3051:        doc.text("UPEB by M.G. INDUSTRIES 9752556113", doc.internal.pageSize.width / 2, doc.internal.pageSize.height - 10, { align: 'center' });
+3247:                        value={dimensionUnit === 'm' ? specs.width : Number((specs.width * 3.28084).toFixed(2))} 
+3255:                        value={dimensionUnit === 'm' ? specs.length : Number((specs.length * 3.28084).toFixed(2))} 
+3263:                        value={dimensionUnit === 'm' ? specs.eaveHeight : Number((specs.eaveHeight * 3.28084).toFixed(2))} 
+3391:                            <option value="7v Profile">7v Profile (210mm pitch, 28-30mm depth)</option>
+3392:                            <option value="6v Profile">6v Profile (330mm pitch, 32-35mm depth)</option>
+3610:                      {currentIdx < stepKeys.length - 1 ? 'Next Step &rarr;' : 'View Complete BOM'}
+3863:                      <LineChart data={monthlySpendingData} margin={{ top: 10, right: 10, left: 10, bottom: 5 }}>
+3877:                        <Legend verticalAlign="top" height={36} iconType="circle" wrapperStyle={{ paddingBottom: '20px' }} />
+3895:                      <BarChart data={annualComparativeData} margin={{ top: 10, right: 10, left: 10, bottom: 5 }}>
+3927:                      <LineChart data={trendData} margin={{ top: 10, right: 10, left: 10, bottom: 5 }}>
+4506:                                      title="Remove item"

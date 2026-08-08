@@ -88,7 +88,7 @@ interface ProjectSpecs {
   basePlateProfile?: string;
   nutBoltProfile?: string;
   accessoryOverrides?: {
-    [key: string]: { qty?: number; price?: number };
+    [key: string]: { qty?: number | ''; price?: number | ''; name?: string };
   };
   materialOverrides?: { [key: string]: { qty?: number | ''; price?: number | ''; name?: string } };
   additionalItems?: { id: string; name: string; unit: string; qty: number | ''; price: number | '' }[];

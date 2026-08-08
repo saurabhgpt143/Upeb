@@ -160,7 +160,7 @@ export interface ProjectSpecs {
   deliveryDistance?: number;
   dieselPrice?: number;
   accessoryOverrides?: {
-    [key: string]: { qty?: number; price?: number };
+    [key: string]: { qty?: number | ''; price?: number | ''; name?: string };
   };
   materialOverrides?: { [key: string]: { qty?: number | ''; price?: number | ''; name?: string } };
   additionalItems?: { id: string; name: string; unit: string; qty: number | ''; price: number | '' }[];
@@ -197,6 +197,171 @@ export function getBaySpacingAndFrames(length: number, autoOptimize: boolean = t
   }
   
   return { baySpacing: Math.round(spacing * 100) / 100, numFrames: numBays + 1 };
+}
+
+export function calculateLouverAndWindowCounts(specs: ProjectSpecs): { louverCount: number; windowCount: number } {
+  if (specs.hasWalls === false) return { louverCount: 0, windowCount: 0 };
+
+  const l = specs.length;
+  const w = specs.width;
+  const h = specs.eaveHeight;
+
+  const wPos = specs.windowsPosition || 'Left & Right';
+  const lPos = specs.louversPosition || 'Left & Right';
+  const hasWindows = specs.hasWindows !== false;
+  const hasLouvers = specs.hasLouvers !== false;
+
+  if (!hasWindows && !hasLouvers) return { louverCount: 0, windowCount: 0 };
+
+  const girtSpacing = specs.highWindVelocity || specs.snowLoad ? 1.0 : 1.5;
+  const wy = Math.max(girtSpacing, Math.min(h - 0.8, Math.round((h * 0.5) / girtSpacing) * girtSpacing));
+  const ww = 1.2;
+  const wh = 0.9;
+
+  const isGateActive = specs.hasProfileGate !== false;
+  const gPos = specs.profileGatePosition || 'Front';
+  const isFrontOrBackGate = gPos === 'Front' || gPos === 'Back';
+  const gW = Math.min(4, (isFrontOrBackGate ? w : l) * 0.6);
+  const gH = Math.min(3, h * 0.8);
+
+  const isLeftGate = isGateActive && gPos === 'Left';
+  const isRightGate = isGateActive && gPos === 'Right';
+  const isFrontGate = isGateActive && gPos === 'Front';
+  const isBackGate = isGateActive && gPos === 'Back';
+
+  const isWindowOnWall = (wall: 'Left' | 'Right' | 'Front' | 'Back') => {
+    if (!hasWindows) return false;
+    if (wall === 'Left' || wall === 'Right') {
+      return wPos === wall || wPos === 'Left & Right' || wPos === 'All Sides';
+    }
+    return wPos === wall || wPos === 'Front & Back' || wPos === 'All Sides';
+  };
+
+  const isLouverOnWall = (wall: 'Left' | 'Right' | 'Front' | 'Back') => {
+    if (!hasLouvers) return false;
+    if (wall === 'Left' || wall === 'Right') {
+      return lPos === wall || lPos === 'Left & Right' || lPos === 'All Sides';
+    }
+    return lPos === wall || lPos === 'Front & Back' || lPos === 'All Sides';
+  };
+
+  const { numFrames } = getBaySpacingAndFrames(l, specs.autoOptimize);
+  const frameZPositions: number[] = [];
+  for (let i = 0; i < numFrames; i++) {
+    let zPos = (i / Math.max(1, numFrames - 1)) * l;
+    if (i === 0) zPos = 0.35;
+    else if (i === numFrames - 1) zPos = l - 0.35;
+    frameZPositions.push(zPos);
+  }
+  const numBaysZ = Math.max(1, numFrames - 1);
+
+  const numXBays = specs.frameType === 'Multi-Span' ? 2 : (w >= 12 ? Math.max(1, Math.round(w / 6)) : 1);
+  const colXPositions: number[] = [];
+  colXPositions.push(-w / 2 + 0.35);
+  if (numXBays > 1) {
+    const spanW = (w - 0.70) / numXBays;
+    for (let k = 1; k < numXBays; k++) {
+      colXPositions.push(-w / 2 + 0.35 + k * spanW);
+    }
+  }
+  colXPositions.push(w / 2 - 0.35);
+
+  let lCount = 0;
+  let wCount = 0;
+
+  // Sides (Left & Right)
+  for (let bay = 0; bay < numBaysZ; bay++) {
+    const zStart = frameZPositions[bay];
+    const zEnd = frameZPositions[bay + 1];
+    const vz = (zStart + zEnd) / 2;
+
+    // Left Wall
+    const inLeftGate = isLeftGate && wy <= gH + wh / 2 && vz >= l / 2 - gW / 2 - ww / 2 && vz <= l / 2 + gW / 2 + ww / 2;
+    if (!inLeftGate) {
+      const wLeft = isWindowOnWall('Left');
+      const lLeft = isLouverOnWall('Left');
+      if (wLeft && lLeft) {
+        if (numBaysZ === 1 && (zEnd - zStart) >= 4) {
+          wCount++;
+          lCount++;
+        } else {
+          if (bay % 2 === 0) wCount++;
+          else lCount++;
+        }
+      } else if (wLeft) {
+        wCount++;
+      } else if (lLeft) {
+        lCount++;
+      }
+    }
+
+    // Right Wall
+    const inRightGate = isRightGate && wy <= gH + wh / 2 && vz >= l / 2 - gW / 2 - ww / 2 && vz <= l / 2 + gW / 2 + ww / 2;
+    if (!inRightGate) {
+      const wRight = isWindowOnWall('Right');
+      const lRight = isLouverOnWall('Right');
+      if (wRight && lRight) {
+        if (numBaysZ === 1 && (zEnd - zStart) >= 4) {
+          lCount++;
+          wCount++;
+        } else {
+          if (bay % 2 === 0) lCount++;
+          else wCount++;
+        }
+      } else if (wRight) {
+        wCount++;
+      } else if (lRight) {
+        lCount++;
+      }
+    }
+  }
+
+  // Front / Back
+  for (let bayX = 0; bayX < colXPositions.length - 1; bayX++) {
+    const vx = (colXPositions[bayX] + colXPositions[bayX + 1]) / 2;
+
+    // Front Wall
+    const inFrontGate = isFrontGate && wy <= gH + wh / 2 && vx >= -gW / 2 - ww / 2 && vx <= gW / 2 + ww / 2;
+    if (!inFrontGate) {
+      const wFront = isWindowOnWall('Front');
+      const lFront = isLouverOnWall('Front');
+      if (wFront && lFront) {
+        if (numXBays === 1 && (colXPositions[1] - colXPositions[0]) >= 4) {
+          wCount++;
+          lCount++;
+        } else {
+          if (bayX % 2 === 0) wCount++;
+          else lCount++;
+        }
+      } else if (wFront) {
+        wCount++;
+      } else if (lFront) {
+        lCount++;
+      }
+    }
+
+    // Back Wall
+    const inBackGate = isBackGate && wy <= gH + wh / 2 && vx >= -gW / 2 - ww / 2 && vx <= gW / 2 + ww / 2;
+    if (!inBackGate) {
+      const wBack = isWindowOnWall('Back');
+      const lBack = isLouverOnWall('Back');
+      if (wBack && lBack) {
+        if (numXBays === 1 && (colXPositions[1] - colXPositions[0]) >= 4) {
+          lCount++;
+          wCount++;
+        } else {
+          if (bayX % 2 === 0) lCount++;
+          else wCount++;
+        }
+      } else if (wBack) {
+        wCount++;
+      } else if (lBack) {
+        lCount++;
+      }
+    }
+  }
+
+  return { louverCount: lCount, windowCount: wCount };
 }
 
 export function calculateSDScrews(specs: ProjectSpecs, type: 'roof' | 'wall' | 'all' = 'all'): number {
@@ -2898,7 +3063,12 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
     if (specs.hasRoof === false || specs.hasTurboVents === false) return false;
     const roofEffWidth = specs.roofProfile === '6v Profile' ? 0.99 : (specs.roofProfile === '7v Profile' ? 1.188 : 1.0);
     const numSheets = Math.max(1, Math.ceil(l / roofEffWidth - 0.001));
-    const numVents = Math.max(1, Math.floor(l / 4) - 1);
+    let polyCols = 0;
+    for (let i = 0; i < numSheets; i++) {
+       if (i % 6 === 3) polyCols++;
+    }
+    const polyInRow = polyCols > 0 ? polyCols : 1;
+    const numVents = Math.max(1, polyInRow - 1);
     for (let v = 1; v <= numVents; v++) {
       let targetIdx = Math.max(0, Math.min(numSheets - 1, Math.floor((v * numSheets) / (numVents + 1))));
       if (specs.hasPolySheets !== false) {
@@ -3709,9 +3879,14 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
   }
 
   if (specs.hasRoof !== false && specs.hasTurboVents !== false) {
-    const numVents = Math.max(1, Math.floor(l / 4) - 1);
     const roofEffWidth = specs.roofProfile === '6v Profile' ? 0.99 : (specs.roofProfile === '7v Profile' ? 1.188 : 1.0);
     const numSheets = Math.max(1, Math.ceil(l / roofEffWidth - 0.001));
+    let polyCols = 0;
+    for (let i = 0; i < numSheets; i++) {
+       if (i % 6 === 3) polyCols++;
+    }
+    const polyInRow = polyCols > 0 ? polyCols : 1;
+    const numVents = Math.max(1, polyInRow - 1);
 
     const panelYOffset = modelPurlinYOffset + 0.075;
 
@@ -8420,7 +8595,7 @@ function EditableAccessoryRow({
 }: {
   accKey: string; name: string; spec: string; defaultQty: number; defaultPrice: number; unit: string; specs: ProjectSpecs; setSpecs: (s: ProjectSpecs) => void;
 }) {
-  const overrides = specs.accessoryOverrides || {};
+  const overrides = specs.accessoryOverrides || specs.materialOverrides || {};
   const data = overrides[accKey] || {};
   const qty = data.qty !== undefined ? data.qty : defaultQty;
   const price = data.price !== undefined ? data.price : defaultPrice;
@@ -8429,7 +8604,8 @@ function EditableAccessoryRow({
     const val = e.target.value === '' ? undefined : Number(e.target.value);
     setSpecs({
       ...specs,
-      materialOverrides: { ...overrides, [accKey]: { ...data, qty: val } }
+      accessoryOverrides: { ...specs.accessoryOverrides, [accKey]: { ...data, qty: val } },
+      materialOverrides: { ...specs.materialOverrides, [accKey]: { ...data, qty: val } }
     });
   };
 
@@ -8437,11 +8613,14 @@ function EditableAccessoryRow({
     const val = e.target.value === '' ? undefined : Number(e.target.value);
     setSpecs({
       ...specs,
-      materialOverrides: { ...overrides, [accKey]: { ...data, price: val } }
+      accessoryOverrides: { ...specs.accessoryOverrides, [accKey]: { ...data, price: val } },
+      materialOverrides: { ...specs.materialOverrides, [accKey]: { ...data, price: val } }
     });
   };
 
-  const estCost = qty * price;
+  const qtyNum = (qty !== '' && qty !== undefined) ? Number(qty) : defaultQty;
+  const priceNum = (price !== '' && price !== undefined) ? Number(price) : defaultPrice;
+  const estCost = qtyNum * priceNum;
 
   return (
     <tr>
@@ -9049,14 +9228,16 @@ export default function App() {
   const roofSheetsPerSideLength = Math.ceil(specs.length / roofEffWidth);
   let totalRoofSegments = roofSheetsPerSideLength * roofSides * roofSegments;
 
+  let polyColsPerSide = 0;
+  for (let i = 0; i < roofSheetsPerSideLength; i++) {
+     if (i % 6 === 3) polyColsPerSide++;
+  }
+  const polySegmentsPerCol = roofSegments >= 3 ? 1 : roofSegments; 
+  const totalPolySheetsEstimate = (polyColsPerSide > 0 ? polyColsPerSide : 1) * roofSides * polySegmentsPerCol;
+
   let numPolySheets = 0;
   if (specs.hasPolySheets !== false) {
-    let polyColsPerSide = 0;
-    for (let i = 0; i < roofSheetsPerSideLength; i++) {
-       if (i % 6 === 3) polyColsPerSide++;
-    }
-    const polySegmentsPerCol = roofSegments >= 3 ? 1 : roofSegments; 
-    numPolySheets = polyColsPerSide * roofSides * polySegmentsPerCol;
+    numPolySheets = totalPolySheetsEstimate;
   }
 
   const numRoofSheets = totalRoofSegments - numPolySheets;
@@ -9102,11 +9283,14 @@ export default function App() {
     : autoTurboVentLenFt;
   const turboVentSheetLenMeters = turboVentSheetLenFt * 0.3048;
 
+  const polyInRow = polyColsPerSide > 0 ? polyColsPerSide : 1;
+  const numVentLocations = Math.max(1, polyInRow - 1);
+  const ventSheetsPerLoc = specs.roofType === 'Single Slope' ? 1 : (specs.width >= 7 ? 2 : 1);
+  const actualTurboVentCount = numVentLocations * ventSheetsPerLoc;
+
   let totalTurboVentSheets = 0;
   if (specs.hasTurboVents !== false) {
-    const numVents = Math.max(1, Math.floor(specs.length / 4) - 1);
-    const ventSheetsPerLoc = specs.roofType === 'Single Slope' ? 1 : (specs.width >= 7 ? 2 : 1);
-    totalTurboVentSheets = Math.min(numRoofSheets, numVents * ventSheetsPerLoc);
+    totalTurboVentSheets = Math.min(numRoofSheets, actualTurboVentCount * 2);
   }
   const totalStandardRoofSheets = Math.max(0, numRoofSheets - totalTurboVentSheets);
 
@@ -9488,26 +9672,8 @@ export default function App() {
     },
   ];
 
-  const louverCount = useMemo(() => {
-    if (specs.hasLouvers === false || specs.hasWalls === false) return 0;
-    const pos = specs.louversPosition || 'Left & Right';
-    let count = 0;
-    if (pos === 'Left' || pos === 'Right') count += Math.floor(specs.length / 6);
-    if (pos === 'Left & Right' || pos === 'All Sides') count += Math.floor(specs.length / 6) * 2;
-    if (pos === 'Front' || pos === 'Back') count += Math.floor(specs.width / 6);
-    if (pos === 'Front & Back' || pos === 'All Sides') count += Math.floor(specs.width / 6) * 2;
-    return count;
-  }, [specs]);
-
-  const windowCount = useMemo(() => {
-    if (specs.hasWindows === false || specs.hasWalls === false) return 0;
-    const pos = specs.windowsPosition || 'Left & Right';
-    let count = 0;
-    if (pos === 'Left' || pos === 'Right') count += Math.floor(specs.length / 5);
-    if (pos === 'Left & Right' || pos === 'All Sides') count += Math.floor(specs.length / 5) * 2;
-    if (pos === 'Front' || pos === 'Back') count += Math.floor(specs.width / 5);
-    if (pos === 'Front & Back' || pos === 'All Sides') count += Math.floor(specs.width / 5) * 2;
-    return count;
+  const { louverCount, windowCount } = useMemo(() => {
+    return calculateLouverAndWindowCounts(specs);
   }, [specs]);
 
   const totalPrimaryCost = specs.hasPrimarySteel !== false ? (primaryUnitCost + fabLaborCost + erectLaborCost) * primaryTons : 0;
@@ -9518,9 +9684,9 @@ export default function App() {
   const totalHardwareCost = (specs.hasPrimarySteel !== false || specs.hasSecondarySteel !== false) ? hardwareUnitCostPerKg * hardwareQty : 0;
 
   const getAcc = (key: string, defaultQty: number, defaultPrice: number) => {
-    const o = specs.accessoryOverrides?.[key];
-    const qty = o?.qty !== undefined ? o.qty : defaultQty;
-    const price = o?.price !== undefined ? o.price : defaultPrice;
+    const o = specs.accessoryOverrides?.[key] || (key.startsWith('insulation') ? specs.accessoryOverrides?.['insulation'] : undefined) || specs.materialOverrides?.[key] || (key.startsWith('insulation') ? specs.materialOverrides?.['insulation'] : undefined);
+    const qty = o?.qty !== undefined && o?.qty !== '' ? Number(o.qty) : defaultQty;
+    const price = o?.price !== undefined && o?.price !== '' ? Number(o.price) : defaultPrice;
     return qty * price;
   };
 
@@ -9574,7 +9740,9 @@ export default function App() {
       const seg = calcAcc([{len: specs.eaveHeight, runs}], 150);
       totalAccessoriesCost += getAcc("downPipes", seg.count, seg.piecePrice);
     }
-    if (specs.hasTurboVents !== false) totalAccessoriesCost += getAcc("turboVents", Math.floor(specs.length / 4), 3500);
+    if (specs.hasTurboVents !== false) {
+      totalAccessoriesCost += getAcc("turboVents", actualTurboVentCount, 3500);
+    }
   }
   if (specs.hasCornerFlashing !== false && specs.hasWalls !== false) {
     const seg = calcAcc([{len: specs.eaveHeight, runs: 4}], 250);
@@ -9585,7 +9753,10 @@ export default function App() {
     totalAccessoriesCost += getAcc("endFlashing", seg.count, seg.piecePrice);
   }
   if (specs.hasLouvers !== false && specs.hasWalls !== false && louverCount > 0) totalAccessoriesCost += getAcc("louvers", louverCount, 2500);
-  if (specs.hasInsulation !== false) totalAccessoriesCost += getAcc("insulation", Math.ceil(specs.width * specs.length * 1.1), 120);
+  if (specs.hasInsulation !== false) {
+    if (specs.hasRoof !== false) totalAccessoriesCost += getAcc("insulationRoof", Math.ceil(specs.width * specs.length * 1.1), 120);
+    if (specs.hasWalls !== false) totalAccessoriesCost += getAcc("insulationWall", Math.ceil(calculatedWallArea * 1.1), 120);
+  }
   if (specs.hasPolySheets !== false) totalAccessoriesCost += getAcc("polySheets", numPolySheets, 1200);
   if (specs.hasSDScrews !== false && specs.hasRoof !== false) totalAccessoriesCost += getAcc("sdScrewsRoof", calculateSDScrews(specs, 'roof'), 3.5);
   if (specs.hasSDScrews !== false && specs.hasWalls !== false) totalAccessoriesCost += getAcc("sdScrewsWall", calculateSDScrews(specs, 'wall'), 3.5);
@@ -9743,7 +9914,7 @@ export default function App() {
 
 
     const formatRow = (id: string, name: string, unit: string, defaultQty: number, defaultPrice: number) => {
-       const o = specs.materialOverrides?.[id];
+       const o = specs.materialOverrides?.[id] || (id.startsWith('insulation') ? specs.materialOverrides?.['insulation'] : undefined);
        const q = o?.qty !== undefined ? (o.qty === '' ? 0 : Number(o.qty)) : defaultQty;
        const p = o?.price !== undefined ? (o.price === '' ? 0 : Number(o.price)) : defaultPrice;
        if (q >= 0) {
@@ -10072,7 +10243,9 @@ export default function App() {
             const seg = calcAcc([{len: specs.eaveHeight, runs}], 150);
             accRows.push(override("downPipes", "Down Pipes", formatAccUnit(seg.cutLength), seg.count, seg.piecePrice));
         }
-        if (specs.hasTurboVents !== false) accRows.push(override("turboVents", "Turbo Vents", "units", Math.floor(specs.length / 4), 3500));
+        if (specs.hasTurboVents !== false) {
+            accRows.push(override("turboVents", "Turbo Vents", "units", actualTurboVentCount, 3500));
+        }
     }
     if (specs.hasCornerFlashing !== false && specs.hasWalls !== false) {
         const seg = calcAcc([{len: specs.eaveHeight, runs: 4}], 250);
@@ -10083,7 +10256,10 @@ export default function App() {
         accRows.push(override("endFlashing", "Bottom Trim", formatAccUnit(seg.cutLength), seg.count, seg.piecePrice));
     }
     if (specs.hasLouvers !== false && specs.hasWalls !== false && louverCount > 0) accRows.push(override("louvers", "Louvers", "units", louverCount, 2500));
-    if (specs.hasInsulation !== false) accRows.push(override("insulation", "Air Bubble Insulation", "sqm", Math.ceil(specs.width * specs.length * 1.1), 120));
+    if (specs.hasInsulation !== false) {
+      if (specs.hasRoof !== false) accRows.push(override("insulationRoof", "Air Bubble Insulation (Roof)", "sqm", Math.ceil(specs.width * specs.length * 1.1), 120));
+      if (specs.hasWalls !== false) accRows.push(override("insulationWall", "Air Bubble Insulation (Wall)", "sqm", Math.ceil(calculatedWallArea * 1.1), 120));
+    }
     if (specs.hasPolySheets !== false) {
         accRows.push(override("polySheets", "Polycarbonate Sheets", formatAccUnit(actualRoofSheetLength), numPolySheets, 1200));
     }

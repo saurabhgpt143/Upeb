@@ -6,7 +6,7 @@
 import React, { useState, useMemo, useEffect, useRef, useCallback } from 'react';
 import { PieChart, Pie, Cell, ResponsiveContainer, Tooltip as RechartsTooltip, Legend, BarChart, Bar, XAxis, YAxis, CartesianGrid, LineChart, Line } from 'recharts';
 import { Canvas, useThree, useFrame } from '@react-three/fiber';
-import { OrbitControls, Environment, ContactShadows, Center, Text, Line as DreiLine, Bounds, useBounds } from '@react-three/drei';
+import { OrbitControls, Environment, ContactShadows, Center, Text, Bounds, useBounds } from '@react-three/drei';
 import * as THREE from 'three';
 import {
   Building,
@@ -96,6 +96,13 @@ import VoiceChatAssistant from './components/VoiceChatAssistant';
 import { jsPDF } from 'jspdf';
 import autoTable from 'jspdf-autotable';
 import { MaterialIcon } from './components/MaterialIcons';
+import { ProposalContractSection } from './components/ProposalContractSection';
+import {
+  exportProposalPDF,
+  ProposalSettings,
+  DEFAULT_PROPOSAL_SETTINGS,
+  ProposalComputedData,
+} from './utils/proposalPdf';
 
 type Phase = 'planning' | 'engineering' | 'fabrication' | 'delivery' | 'erection';
 
@@ -199,6 +206,91 @@ export function getBaySpacingAndFrames(length: number, autoOptimize: boolean = t
   return { baySpacing: Math.round(spacing * 100) / 100, numFrames: numBays + 1 };
 }
 
+export function getPolycarbonateColIndices(
+  numSheets: number,
+  buildingLength: number,
+  roofEffWidth: number
+): number[] {
+  const indices: number[] = [];
+  for (let i = 1; i < numSheets - 1; i++) {
+    if (i % 6 === 3) {
+      // Ensure polycarbonate skylights are always full interior sheets with at least 0.5m of solid metal sheeting before the terminal gable end
+      const remainingToEnd = buildingLength - (i + 1) * roofEffWidth;
+      if (remainingToEnd >= 0.5) {
+        indices.push(i);
+      }
+    }
+  }
+  return indices;
+}
+
+export function getTurboVentColIndices(
+  numSheets: number,
+  buildingLength: number,
+  roofEffWidth: number,
+  hasPolySheets: boolean
+): number[] {
+  const polyIndices = getPolycarbonateColIndices(numSheets, buildingLength, roofEffWidth);
+  const polyInRow = polyIndices.length > 0 ? polyIndices.length : 1;
+  const numVents = Math.max(1, polyInRow - 1);
+
+  if (hasPolySheets && polyIndices.length >= 2) {
+    const vents: number[] = [];
+    for (let k = 0; k < polyIndices.length - 1; k++) {
+      let midIdx = Math.round((polyIndices[k] + polyIndices[k + 1]) / 2);
+      if (numSheets >= 3) {
+        midIdx = Math.max(1, Math.min(numSheets - 2, midIdx));
+      }
+      if (polyIndices.includes(midIdx)) {
+        midIdx = midIdx > 1 ? midIdx - 1 : Math.min(numSheets - 1, midIdx + 1);
+      }
+      vents.push(midIdx);
+    }
+    return vents;
+  }
+
+  const vents: number[] = [];
+  for (let v = 1; v <= numVents; v++) {
+    let targetIdx = Math.max(0, Math.min(numSheets - 1, Math.floor((v * numSheets) / (numVents + 1))));
+    if (numSheets >= 3) {
+      targetIdx = Math.max(1, Math.min(numSheets - 2, targetIdx));
+    }
+    if (hasPolySheets && polyIndices.includes(targetIdx)) {
+      if (targetIdx + 1 < numSheets - 1) targetIdx += 1;
+      else if (targetIdx > 1) targetIdx -= 1;
+    }
+    vents.push(targetIdx);
+  }
+  return vents;
+}
+
+export function getOpeningVerticalPlacement(h: number, girtSpacing: number): {
+  wy: number;
+  wh: number;
+  ly: number;
+  louverH: number;
+} {
+  // Girts sit at y = 0.05 and y = p * girtSpacing (0.15m tall, spanning ±0.075m)
+  const girtHalfH = 0.075;
+  const clearBayH = Math.max(0.4, girtSpacing - 2 * girtHalfH);
+
+  // Full vertical girt bays [k * girtSpacing, (k + 1) * girtSpacing] strictly below eave height h
+  const maxBayIdx = Math.max(0, Math.floor((h + 0.01) / girtSpacing) - 1);
+  const minBayIdx = maxBayIdx >= 1 ? 1 : 0;
+
+  // Position window strictly centered between two consecutive girts
+  const winBayIdx = Math.max(minBayIdx, Math.min(maxBayIdx, Math.floor((h * 0.45) / girtSpacing)));
+  const wy = (winBayIdx + 0.5) * girtSpacing;
+  const wh = Math.round(Math.min(0.9, Math.max(0.45, clearBayH - 0.18)) * 100) / 100;
+
+  // Position louver strictly centered between two consecutive girts
+  const louverBayIdx = Math.max(minBayIdx, Math.min(maxBayIdx, Math.floor((h * 0.55) / girtSpacing)));
+  const ly = (louverBayIdx + 0.5) * girtSpacing;
+  const louverH = Math.round(Math.min(1.34, Math.max(0.5, clearBayH - 0.16)) * 100) / 100;
+
+  return { wy, wh, ly, louverH };
+}
+
 export function calculateLouverAndWindowCounts(specs: ProjectSpecs): { louverCount: number; windowCount: number } {
   if (specs.hasWalls === false) return { louverCount: 0, windowCount: 0 };
 
@@ -214,9 +306,8 @@ export function calculateLouverAndWindowCounts(specs: ProjectSpecs): { louverCou
   if (!hasWindows && !hasLouvers) return { louverCount: 0, windowCount: 0 };
 
   const girtSpacing = specs.highWindVelocity || specs.snowLoad ? 1.0 : 1.5;
-  const wy = Math.max(girtSpacing, Math.min(h - 0.8, Math.round((h * 0.5) / girtSpacing) * girtSpacing));
+  const { wy, wh } = getOpeningVerticalPlacement(h, girtSpacing);
   const ww = 1.2;
-  const wh = 0.9;
 
   const isGateActive = specs.hasProfileGate !== false;
   const gPos = specs.profileGatePosition || 'Front';
@@ -1606,53 +1697,61 @@ interface WallSubSheetComponentProps {
   handlePanelClick: (e: any, key: string, color: string, type: 'wall' | 'roof') => void;
 }
 
-function useBubbleInsulationTexture() {
-  return useMemo(() => {
-    const canvas = document.createElement('canvas');
-    canvas.width = 256;
-    canvas.height = 256;
-    const ctx = canvas.getContext('2d');
-    if (ctx) {
-      const bgGrad = ctx.createLinearGradient(0, 0, 256, 256);
-      bgGrad.addColorStop(0, '#f8fafc');
-      bgGrad.addColorStop(0.3, '#e2e8f0');
-      bgGrad.addColorStop(0.7, '#cbd5e1');
-      bgGrad.addColorStop(1, '#94a3b8');
-      ctx.fillStyle = bgGrad;
-      ctx.fillRect(0, 0, 256, 256);
+let cachedBubbleInsulationTexture: THREE.CanvasTexture | null = null;
 
-      const radius = 5.5;
-      const spacing = 16;
-      for (let x = spacing / 2; x < 256; x += spacing) {
-        for (let y = spacing / 2; y < 256; y += spacing) {
-          ctx.beginPath();
-          ctx.arc(x + 0.5, y + 0.5, radius + 0.5, 0, Math.PI * 2);
-          ctx.fillStyle = '#64748b';
-          ctx.fill();
+function getBubbleInsulationTexture(): THREE.CanvasTexture {
+  if (cachedBubbleInsulationTexture) return cachedBubbleInsulationTexture;
 
-          const bGrad = ctx.createRadialGradient(x - 2, y - 2, 0.5, x, y, radius);
-          bGrad.addColorStop(0, '#ffffff');
-          bGrad.addColorStop(0.5, '#f1f5f9');
-          bGrad.addColorStop(0.85, '#cbd5e1');
-          bGrad.addColorStop(1, '#94a3b8');
-          ctx.beginPath();
-          ctx.arc(x, y, radius, 0, Math.PI * 2);
-          ctx.fillStyle = bGrad;
-          ctx.fill();
+  const canvas = document.createElement('canvas');
+  canvas.width = 256;
+  canvas.height = 256;
+  const ctx = canvas.getContext('2d');
+  if (ctx) {
+    const bgGrad = ctx.createLinearGradient(0, 0, 256, 256);
+    bgGrad.addColorStop(0, '#f8fafc');
+    bgGrad.addColorStop(0.3, '#e2e8f0');
+    bgGrad.addColorStop(0.7, '#cbd5e1');
+    bgGrad.addColorStop(1, '#94a3b8');
+    ctx.fillStyle = bgGrad;
+    ctx.fillRect(0, 0, 256, 256);
 
-          ctx.beginPath();
-          ctx.arc(x - 1.8, y - 1.8, 1.2, 0, Math.PI * 2);
-          ctx.fillStyle = 'rgba(255, 255, 255, 0.95)';
-          ctx.fill();
-        }
+    const radius = 5.5;
+    const spacing = 16;
+    for (let x = spacing / 2; x < 256; x += spacing) {
+      for (let y = spacing / 2; y < 256; y += spacing) {
+        ctx.beginPath();
+        ctx.arc(x + 0.5, y + 0.5, radius + 0.5, 0, Math.PI * 2);
+        ctx.fillStyle = '#64748b';
+        ctx.fill();
+
+        const bGrad = ctx.createRadialGradient(x - 2, y - 2, 0.5, x, y, radius);
+        bGrad.addColorStop(0, '#ffffff');
+        bGrad.addColorStop(0.5, '#f1f5f9');
+        bGrad.addColorStop(0.85, '#cbd5e1');
+        bGrad.addColorStop(1, '#94a3b8');
+        ctx.beginPath();
+        ctx.arc(x, y, radius, 0, Math.PI * 2);
+        ctx.fillStyle = bGrad;
+        ctx.fill();
+
+        ctx.beginPath();
+        ctx.arc(x - 1.8, y - 1.8, 1.2, 0, Math.PI * 2);
+        ctx.fillStyle = 'rgba(255, 255, 255, 0.95)';
+        ctx.fill();
       }
     }
-    const tex = new THREE.CanvasTexture(canvas);
-    tex.wrapS = THREE.RepeatWrapping;
-    tex.wrapT = THREE.RepeatWrapping;
-    tex.repeat.set(4, 4);
-    return tex;
-  }, []);
+  }
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.wrapS = THREE.RepeatWrapping;
+  tex.wrapT = THREE.RepeatWrapping;
+  tex.repeat.set(4, 4);
+  cachedBubbleInsulationTexture = tex;
+  return tex;
+}
+
+function useBubbleInsulationTexture() {
+  return useMemo(() => getBubbleInsulationTexture(), []);
 }
 
 function WallSubSheetComponent({
@@ -1751,6 +1850,12 @@ function WallSubSheetComponent({
     specs.frameType
   ]);
 
+  useEffect(() => {
+    return () => {
+      geometry.dispose();
+    };
+  }, [geometry]);
+
   const insulationShape = useMemo(() => {
     const shape = new THREE.Shape();
     if (hasSlope) {
@@ -1811,6 +1916,44 @@ function WallSubSheetComponent({
         </mesh>
       )}
     </group>
+  );
+}
+
+function SDScrewInstances({
+  positions,
+  geometry,
+  material,
+}: {
+  positions: [number, number, number][];
+  geometry: THREE.BufferGeometry;
+  material: THREE.Material;
+}) {
+  const meshRef = useRef<THREE.InstancedMesh>(null);
+
+  useEffect(() => {
+    const mesh = meshRef.current;
+    if (!mesh) return;
+    const dummy = new THREE.Object3D();
+    for (let i = 0; i < positions.length; i++) {
+      const [x, y, z] = positions[i];
+      dummy.position.set(x, y, z);
+      dummy.updateMatrix();
+      mesh.setMatrixAt(i, dummy.matrix);
+    }
+    mesh.instanceMatrix.needsUpdate = true;
+    mesh.computeBoundingSphere();
+  }, [positions, geometry, material]);
+
+  if (positions.length === 0) return null;
+
+  return (
+    <instancedMesh
+      key={`sd_inst_${positions.length}`}
+      ref={meshRef}
+      args={[geometry, material, positions.length]}
+      receiveShadow
+      frustumCulled={false}
+    />
   );
 }
 
@@ -2003,6 +2146,79 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
   const wallNormalTexCache = useRef<Record<string, THREE.Texture>>({});
   const roofTexCache = useRef<Record<string, THREE.Texture>>({});
 
+  useEffect(() => {
+    return () => {
+      panelTexH.dispose();
+    };
+  }, [panelTexH]);
+
+  useEffect(() => {
+    return () => {
+      panelNormalTexH.dispose();
+    };
+  }, [panelNormalTexH]);
+
+  useEffect(() => {
+    return () => {
+      panelTexV.dispose();
+    };
+  }, [panelTexV]);
+
+  useEffect(() => {
+    return () => {
+      Object.values(wallTexCache.current).forEach((t) => t.dispose());
+      Object.values(wallNormalTexCache.current).forEach((t) => t.dispose());
+      Object.values(roofTexCache.current).forEach((t) => t.dispose());
+      wallTexCache.current = {};
+      wallNormalTexCache.current = {};
+      roofTexCache.current = {};
+    };
+  }, []);
+
+  const hasSDCaps = specs.hasPVCCaps !== false;
+  const sdCapColor = specs.pvcCapColor || "#0089b6";
+  const sdResources = useMemo(() => {
+    const r = hasSDCaps ? 0.015 : 0.0075;
+    const d = hasSDCaps ? 0.01 : 0.005;
+    const geoX = new THREE.CylinderGeometry(r, r, d, 8);
+    geoX.rotateZ(Math.PI / 2);
+    const geoZ = new THREE.CylinderGeometry(r, r, d, 8);
+    geoZ.rotateX(Math.PI / 2);
+    const mat = hasSDCaps
+      ? new THREE.MeshStandardMaterial({ color: sdCapColor, roughness: 0.8 })
+      : new THREE.MeshStandardMaterial({ color: '#cbd5e1', roughness: 0.2, metalness: 0.9 });
+    return { geoX, geoZ, mat, d };
+  }, [hasSDCaps, sdCapColor]);
+
+  useEffect(() => {
+    return () => {
+      sdResources.geoX.dispose();
+      sdResources.geoZ.dispose();
+      sdResources.mat.dispose();
+    };
+  }, [sdResources]);
+
+  const curvedRafterTubeGeo = useMemo(() => {
+    if (specs.roofType !== 'Curved' || !w || !h || isNaN(w) || isNaN(h) || w <= 0 || h <= 0) {
+      return null;
+    }
+    const roofH = (w / 2) * (specs.roofSlope / 100) * 1.5;
+    const chordSize = Math.min(0.25, 0.15 + (w > 12 ? (w - 12) * 0.005 : 0));
+    const radius = specs.frameType === 'Truss' ? chordSize / 2 : 0.15;
+    const curvePath = new THREE.QuadraticBezierCurve3(
+      new THREE.Vector3(-w / 2, h + 0.1, 0),
+      new THREE.Vector3(0, h + roofH * 2 + 0.1, 0),
+      new THREE.Vector3(w / 2, h + 0.1, 0)
+    );
+    return new THREE.TubeGeometry(curvePath, 16, radius, 8, false);
+  }, [specs.roofType, specs.roofSlope, specs.frameType, w, h]);
+
+  useEffect(() => {
+    return () => {
+      curvedRafterTubeGeo?.dispose();
+    };
+  }, [curvedRafterTubeGeo]);
+
   if (!w || !l || !h || isNaN(w) || isNaN(l) || isNaN(h) || w <= 0 || l <= 0 || h <= 0) {
     return null;
   }
@@ -2092,6 +2308,56 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
     return rafterY + modelPurlinYOffset;
   };
 
+  const getEndwallGirtBounds = (py: number): { left: number; right: number } | null => {
+    const girtHalfH = 0.075;
+    const rafterCenterOffset = (specs.frameType === 'Truss' || specs.roofType === 'Curved') ? 0.10 : 0.25;
+    const targetBaseY = (py + girtHalfH) - rafterCenterOffset;
+    const slope = specs.roofSlope / 100;
+
+    let left = -w / 2;
+    let right = w / 2;
+
+    if (targetBaseY > h) {
+      if (slope <= 0.0001) return null;
+
+      if (specs.roofType === 'Single Slope') {
+        left = Math.max(-w / 2, -w / 2 + (targetBaseY - h) / slope);
+        right = w / 2;
+      } else if (specs.roofType === 'Multi-Sloped Hut') {
+        const h_steep = (w / 4) * (specs.roofSlope * 1.5 / 100);
+        const h_shallow = (w / 4) * (specs.roofSlope * 0.5 / 100);
+        let halfSpan = 0;
+        if (targetBaseY <= h + h_steep) {
+          const steepSlope = h_steep / (w / 4);
+          halfSpan = w / 2 - (targetBaseY - h) / steepSlope;
+        } else if (targetBaseY <= h + h_steep + h_shallow) {
+          const shallowSlope = h_shallow / (w / 4);
+          halfSpan = w / 4 - (targetBaseY - h - h_steep) / shallowSlope;
+        } else {
+          return null;
+        }
+        left = -Math.max(0, halfSpan);
+        right = Math.max(0, halfSpan);
+      } else if (specs.roofType === 'Curved') {
+        const roofH = (w / 2) * slope * 1.5;
+        if (targetBaseY >= h + roofH) return null;
+        const ratio = 1 - (targetBaseY - h) / roofH;
+        const halfSpan = ratio > 0 ? (w / 2) * Math.sqrt(ratio) : 0;
+        left = -halfSpan;
+        right = halfSpan;
+      } else {
+        // Hut-shaped (Standard Gable)
+        const halfSpan = w / 2 - (targetBaseY - h) / slope;
+        if (halfSpan <= 0) return null;
+        left = -halfSpan;
+        right = halfSpan;
+      }
+    }
+
+    if (right - left <= 0.2) return null;
+    return { left, right };
+  };
+
   const renderWallSheets = () => {
     if (specs.hasWalls === false) return null;
 
@@ -2120,16 +2386,14 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
     }
     colXPositions.push(w / 2 - 0.35);
 
-    const louverH = Math.min(1.68, Math.max(1.0, h - 1.20));
-    const louverYMin = (h - louverH) / 2;
-    const louverYMax = (h + louverH) / 2;
+    const girtSpacing = specs.highWindVelocity || specs.snowLoad ? 1.0 : 1.5;
+    const { wy, wh, ly, louverH } = getOpeningVerticalPlacement(h, girtSpacing);
+    const louverYMin = ly - louverH / 2;
+    const louverYMax = ly + louverH / 2;
     const louverPos = specs.louversPosition || 'Left & Right';
     const hasLouvers = specs.hasLouvers !== false;
 
-    const girtSpacing = specs.highWindVelocity || specs.snowLoad ? 1.0 : 1.5;
-    const wy = Math.max(girtSpacing, Math.min(h - 0.8, Math.round((h * 0.5) / girtSpacing) * girtSpacing));
     const ww = 1.2;
-    const wh = 0.9;
     const winYMin = wy - wh / 2;
     const winYMax = wy + wh / 2;
     const windowPos = specs.windowsPosition || 'Left & Right';
@@ -3063,23 +3327,10 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
     if (specs.hasRoof === false || specs.hasTurboVents === false) return false;
     const roofEffWidth = specs.roofProfile === '6v Profile' ? 0.99 : (specs.roofProfile === '7v Profile' ? 1.188 : 1.0);
     const numSheets = Math.max(1, Math.ceil(l / roofEffWidth - 0.001));
-    let polyCols = 0;
-    for (let i = 0; i < numSheets; i++) {
-       if (i % 6 === 3) polyCols++;
-    }
-    const polyInRow = polyCols > 0 ? polyCols : 1;
-    const numVents = Math.max(1, polyInRow - 1);
-    for (let v = 1; v <= numVents; v++) {
-      let targetIdx = Math.max(0, Math.min(numSheets - 1, Math.floor((v * numSheets) / (numVents + 1))));
-      if (specs.hasPolySheets !== false) {
-        let centeredIdx = Math.round(targetIdx / 6) * 6;
-        centeredIdx = Math.max(0, Math.min(numSheets - 1, centeredIdx));
-        if (centeredIdx % 6 === 3) {
-          if (centeredIdx > 0) centeredIdx -= 1;
-          else centeredIdx += 1;
-        }
-        targetIdx = centeredIdx;
-      }
+    const ventColIndices = getTurboVentColIndices(numSheets, l, roofEffWidth, specs.hasPolySheets !== false);
+    for (let idx = 0; idx < ventColIndices.length; idx++) {
+      const targetIdx = ventColIndices[idx];
+      const v = idx + 1;
       if (targetIdx === sheetIdx) {
         if (specs.roofType === 'Single Slope') return side === 'single';
         if (specs.roofType === 'Multi-Sloped Hut') return side === 'm1' || side === 'm4';
@@ -3102,79 +3353,105 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
 
     if (specs.roofType === 'Single Slope') {
       const totRoofH = w * (specs.roofSlope / 100);
-      const rl = Math.sqrt(w * w + totRoofH * totRoofH);
-      const runs = Math.max(1, Math.round(rl / purlinSpacing));
+      const base_rl = Math.sqrt(w * w + totRoofH * totRoofH);
+      const roofSegments = Math.ceil(base_rl / 6);
+      const L_seg = base_rl / roofSegments;
       const angleVal = Math.atan(totRoofH / w);
-      for (let p = 0; p <= runs; p++) {
-        const px = (-w/2 + inboardOffset) + ((w - 2 * inboardOffset) * (p / runs));
-        const dist = (px + w/2) / Math.cos(angleVal);
-        purlinDists.push(dist);
+
+      const dists: number[] = [];
+      for (let j = 0; j < roofSegments; j++) {
+        const start = j * L_seg;
+        const n_spaces = Math.max(1, Math.ceil(L_seg / purlinSpacing));
+        for (let k = 0; k <= n_spaces; k++) {
+          dists.push(start + k * (L_seg / n_spaces));
+        }
       }
+      const uniqueDists = Array.from(new Set(dists.map(d => Math.round(d * 1000) / 1000))).sort((a, b) => a - b);
+      uniqueDists.forEach((d, p) => {
+        let px = -w / 2 + d * Math.cos(angleVal);
+        if (p === 0) px = -w / 2 + inboardOffset;
+        else if (p === uniqueDists.length - 1) px = w / 2 - inboardOffset;
+        // Include modelEaveOverhang because roof panel local s = 0 starts at the low-eave overhang tip
+        purlinDists.push(modelEaveOverhang + (px + w / 2) / Math.cos(angleVal));
+      });
     } else if (specs.roofType === 'Multi-Sloped Hut') {
       const h_steep = (w / 4) * (specs.roofSlope * 1.5 / 100);
       const h_shallow = (w / 4) * (specs.roofSlope * 0.5 / 100);
       const rl_steep = Math.sqrt((w / 4) * (w / 4) + h_steep * h_steep);
       const rl_shallow = Math.sqrt((w / 4) * (w / 4) + h_shallow * h_shallow);
 
-      const runsSteep = Math.max(1, Math.round(rl_steep / purlinSpacing));
-      const runsShallow = Math.max(1, Math.round(rl_shallow / purlinSpacing));
-
       const a_steep = Math.atan(h_steep / (w / 4));
       const a_shallow = Math.atan(h_shallow / (w / 4));
 
       if (keyPrefix === 'm1' || keyPrefix === 'm4') {
-        for (let p = 0; p < runsSteep; p++) {
-          const side = keyPrefix === 'm1' ? -1 : 1;
-          const startX = side * (w/2 - inboardOffset);
-          const endX = side * (w/4);
-          const t = p / runsSteep;
-          const px = startX + (endX - startX) * t;
-          const dist = (w/2 - Math.abs(px)) / Math.cos(a_steep);
-          purlinDists.push(dist);
+        const roofSegmentsSteep = Math.ceil((rl_steep + modelEaveOverhang) / 6);
+        const L_seg_steep = (rl_steep + modelEaveOverhang) / roofSegmentsSteep;
+        const distsSteep: number[] = [];
+        for (let j = 0; j < roofSegmentsSteep; j++) {
+          const start = j * L_seg_steep;
+          const n_spaces = Math.max(1, Math.ceil(L_seg_steep / purlinSpacing));
+          for (let k = 0; k <= n_spaces; k++) {
+            distsSteep.push(start + k * (L_seg_steep / n_spaces));
+          }
         }
+        const uniqueDistsSteep = Array.from(new Set(distsSteep.map(d => Math.round(d * 1000) / 1000))).sort((a, b) => a - b);
+        uniqueDistsSteep.forEach((d) => {
+          const distFromWall = d - modelEaveOverhang;
+          if (distFromWall < -0.01) return;
+          let px = -(w / 2 - distFromWall * Math.cos(a_steep));
+          if (distFromWall < 0.1) px = -(w / 2 - inboardOffset);
+          purlinDists.push(modelEaveOverhang + (w / 2 - Math.abs(px)) / Math.cos(a_steep));
+        });
       } else if (keyPrefix === 'm2' || keyPrefix === 'm3') {
-        for (let p = 0; p < runsShallow; p++) {
-          const side = keyPrefix === 'm2' ? -1 : 1;
-          const px = side * (w/4 - (w/4 * (p / runsShallow)));
-          const dist = (w/4 - Math.abs(px)) / Math.cos(a_shallow);
-          purlinDists.push(dist);
+        const roofSegmentsShallow = Math.ceil(rl_shallow / 6);
+        const L_seg_shallow = rl_shallow / roofSegmentsShallow;
+        const distsShallow: number[] = [];
+        for (let j = 0; j < roofSegmentsShallow; j++) {
+          const start = j * L_seg_shallow;
+          const n_spaces = Math.max(1, Math.ceil(L_seg_shallow / purlinSpacing));
+          for (let k = 0; k <= n_spaces; k++) {
+            distsShallow.push(start + k * (L_seg_shallow / n_spaces));
+          }
         }
+        const uniqueDistsShallow = Array.from(new Set(distsShallow.map(d => Math.round(d * 1000) / 1000))).sort((a, b) => a - b);
+        uniqueDistsShallow.forEach((d) => {
+          if (d >= rl_shallow - 0.15) return;
+          purlinDists.push(d);
+        });
         const ridgeOffsethut = 0.15;
-        const px_ridge = (keyPrefix === 'm2' ? -1 : 1) * ridgeOffsethut;
-        const dist_ridge = (w/4 - Math.abs(px_ridge)) / Math.cos(a_shallow);
-        purlinDists.push(dist_ridge);
+        purlinDists.push((w / 4 - ridgeOffsethut) / Math.cos(a_shallow));
       }
     } else {
       // Standard Gable / Double Slope
       const roofH = (w / 2) * (specs.roofSlope / 100);
-      const rl = Math.sqrt((w / 2) * (w / 2) + roofH * roofH);
-      const runs = Math.max(1, Math.round(rl / purlinSpacing));
+      const base_rl = Math.sqrt((w / 2) * (w / 2) + roofH * roofH);
+      const roofSegments = Math.ceil(base_rl / 6);
+      const L_seg = base_rl / roofSegments;
       const angleVal = Math.atan(roofH / (w / 2));
 
-      for (let p = 0; p < runs; p++) {
-        const side = keyPrefix === 'd1' ? -1 : 1;
-        const startX = side * (w/2 - inboardOffset);
-        const endX = 0;
-        const t = p / runs;
-        const px = startX + (endX - startX) * t;
-        const dist = (w/2 - Math.abs(px)) / Math.cos(angleVal);
-        purlinDists.push(dist);
+      const dists: number[] = [];
+      for (let j = 0; j < roofSegments; j++) {
+        const start = j * L_seg;
+        const n_spaces = Math.max(1, Math.ceil(L_seg / purlinSpacing));
+        for (let k = 0; k <= n_spaces; k++) {
+          dists.push(start + k * (L_seg / n_spaces));
+        }
       }
+      const uniqueDists = Array.from(new Set(dists.map(d => Math.round(d * 1000) / 1000))).sort((a, b) => a - b);
+      uniqueDists.forEach((d, idx) => {
+        if (d >= base_rl - 0.15) return;
+        let px = -(w / 2 - d * Math.cos(angleVal));
+        if (idx === 0) px = -(w / 2 - inboardOffset);
+        purlinDists.push(modelEaveOverhang + (px + w / 2) / Math.cos(angleVal));
+      });
       const ridgeOffsetGable = 0.15;
-      const dist_ridge = (w/2 - ridgeOffsetGable) / Math.cos(angleVal);
-      purlinDists.push(dist_ridge);
+      purlinDists.push(modelEaveOverhang + (w / 2 - ridgeOffsetGable) / Math.cos(angleVal));
     }
 
     const sortedDists = Array.from(new Set(purlinDists.map(d => Math.round(d * 1000) / 1000))).sort((a, b) => a - b);
-    if (sortedDists.length === 0 || sortedDists[0] > 0.01) {
-      sortedDists.unshift(0);
-    } else {
-      sortedDists[0] = 0;
-    }
-    if (sortedDists[sortedDists.length - 1] < length - 0.01) {
-      sortedDists.push(length);
-    } else {
-      sortedDists[sortedDists.length - 1] = length;
+    if (sortedDists.length < 2) {
+      if (sortedDists.length === 0 || sortedDists[0] > 0.01) sortedDists.unshift(modelEaveOverhang);
+      if (sortedDists[sortedDists.length - 1] < length - 0.01) sortedDists.push(length);
     }
 
     const lapDeductionM = purlinSpacing * 0.43;
@@ -3185,14 +3462,15 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
       : autoTurboVentLenFt;
     const ventSheetLenMeters = ventSheetLenFt * 0.3048;
 
-    // Reposition vent target to center of the Turbo Vent cut sheet
-    const target = Math.min(length - 0.3, Math.max(0.3, length - ventSheetLenMeters / 2));
-    let d_vent = target;
+    // Reposition vent target to center of the Turbo Vent cut sheet, snapping strictly to a bay between two consecutive actual purlins
+    const target = Math.min(length - 0.3, Math.max(modelEaveOverhang + 0.3, length - ventSheetLenMeters / 2));
+    let d_vent = (sortedDists[0] + sortedDists[sortedDists.length - 1]) / 2;
     let ventSpan = purlinSpacing;
     let bestDistToCenter = Infinity;
 
     for (let k = 0; k < sortedDists.length - 1; k++) {
       const baySpan = sortedDists[k + 1] - sortedDists[k];
+      if (baySpan < 0.65 && sortedDists.length > 2) continue;
       const bayMid = (sortedDists[k] + sortedDists[k + 1]) / 2;
       const distToCenter = Math.abs(bayMid - target);
       if (distToCenter < bestDistToCenter) {
@@ -3234,6 +3512,8 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
     const cutStart = Math.max(0, s_vent - halfSpan + 0.10);
     const cutEnd = Math.min(length, s_vent + halfSpan - 0.10);
 
+    const polyColSet = new Set(getPolycarbonateColIndices(numSheets, l, roofEffWidth));
+
     return Array.from({ length: numSheets }).map((_, i) => {
       const isLast = i === numSheets - 1;
       let wSheet = roofEffWidth;
@@ -3248,7 +3528,7 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
       }
 
       const key = `${keyPrefix}_sheet_${i}`;
-      const isSkylightCol = specs.hasPolySheets !== false && (i % 6 === 3);
+      const isSkylightCol = specs.hasPolySheets !== false && polyColSet.has(i);
       const isVentSheet = isVentSheetForSide(i, keyPrefix);
 
       return (
@@ -3277,7 +3557,7 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
                   const locX = -length / 2 + sStart + segD / 2;
                   const segKey = `${key}_seg_${j}_${subIdx}`;
                   return (
-                    <group key={`sub_${subIdx}`}>
+                    <group key={`sub_${subIdx}_${isSkylight ? 'poly' : 'metal'}_${isVentSheet ? 'vent' : 'solid'}`}>
                       <mesh receiveShadow 
                         position={[-length / 2 + sStart, 0, (wSheet - overlapGap) / 2]} 
                         rotation={[0, Math.PI / 2, 0]}
@@ -3288,12 +3568,16 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
                           { depth: segD - overlapGap, bevelEnabled: false }
                         ]} />
                         {isSkylight ? (
-                          <meshStandardMaterial color="#e0f2fe" roughness={0.1} metalness={0.1} transparent opacity={0.6} depthWrite={false} side={THREE.DoubleSide} />
+                          <meshStandardMaterial key="poly-mat" color="#e0f2fe" roughness={0.1} metalness={0.1} transparent={true} opacity={0.6} depthWrite={false} side={THREE.DoubleSide} />
                         ) : (
                           <meshStandardMaterial 
+                            key="roof-mat"
                             color={getPanelColor(segKey, specs.roofColor || '#0089b6', 'roof', specs, panelColors)} 
                             metalness={0.6} 
                             roughness={0.3} 
+                            transparent={false}
+                            opacity={1}
+                            depthWrite={true}
                             envMapIntensity={1.2} 
                             side={THREE.DoubleSide}
                           />
@@ -3478,6 +3762,8 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
     const runsCurved = Math.ceil(baseRuns / totalSegs) * totalSegs;
     const t_boundaries = Array.from({ length: totalSegs + 1 }).map((_, j) => j / totalSegs);
 
+    const curvedPolyColSet = new Set(getPolycarbonateColIndices(numSheets, l, roofEffWidth));
+
     const curvedSheets = Array.from({ length: numSheets }).map((_, i) => {
       const isLast = i === numSheets - 1;
       let wSheet = roofEffWidth;
@@ -3491,7 +3777,7 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
         zStart = 0;
       }
 
-      const isSkylight = specs.hasPolySheets !== false && (i % 6 === 3);
+      const isSkylight = specs.hasPolySheets !== false && curvedPolyColSet.has(i);
       const overlapGap = 0.0;
 
       return (
@@ -3517,15 +3803,15 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
             curveShape.closePath();
 
             return (
-              <group key={key}>
+              <group key={`${key}_${isSkylight ? 'poly' : 'metal'}`}>
                 <mesh receiveShadow 
                   onClick={(e) => handlePanelClick(e, key, isSkylight ? 'transparent' : (specs.roofColor || '#0089b6'), 'roof')}
                 >
                   <extrudeGeometry args={[curveShape, { depth: Math.max(0.01, wSheet - overlapGap), bevelEnabled: false }]} />
                   {isSkylight ? (
-                    <meshStandardMaterial color="#e0f2fe" roughness={0.1} metalness={0.1} transparent opacity={0.6} depthWrite={false} side={THREE.DoubleSide} />
+                    <meshStandardMaterial key="curved-poly-mat" color="#e0f2fe" roughness={0.1} metalness={0.1} transparent={true} opacity={0.6} depthWrite={false} side={THREE.DoubleSide} />
                   ) : (
-                    <meshStandardMaterial color={getPanelColor(key, specs.roofColor || '#0089b6', 'roof', specs, panelColors)} metalness={0.6} roughness={0.3} bumpMap={getRoofTexture(wSheet, zStart)} envMapIntensity={1.2} bumpScale={0.025} side={THREE.DoubleSide} />
+                    <meshStandardMaterial key="curved-roof-mat" color={getPanelColor(key, specs.roofColor || '#0089b6', 'roof', specs, panelColors)} metalness={0.6} roughness={0.3} transparent={false} opacity={1} depthWrite={true} bumpMap={getRoofTexture(wSheet, zStart)} envMapIntensity={1.2} bumpScale={0.025} side={THREE.DoubleSide} />
                   )}
                 </mesh>
                 {specs.hasInsulation !== false && !isSkylight && (
@@ -3643,18 +3929,20 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
   if (specs.hasRoof !== false && specs.hasGables !== false) {
     const gw = 0.25;
     const gt = 0.015;
+    const gableOutZ = 0.016; // Clears wall corner trim (o = 0.015) by 1mm to prevent Z-fighting
+    const roofPeakH = specs.roofProfile === '6v Profile' ? 0.036 : (specs.roofProfile === '7v Profile' ? 0.030 : 0.020);
     
     const renderGable = (key: string, zPos: number, cx: number, cy: number, length: number, angle: number, isFront: boolean) => {
-      const hzCenter = isFront ? gw / 2 : -gw / 2;
-      const vzCenter = isFront ? -gt / 2 : gt / 2;
+      const hzCenter = isFront ? (gw / 2 - gableOutZ - gt) : (-gw / 2 + gableOutZ + gt);
+      const vzCenter = isFront ? (-gableOutZ - gt / 2) : (gableOutZ + gt / 2);
 
       return (
         <group key={key} position={[cx, cy, zPos]} rotation={[0, 0, angle]}>
-          <mesh receiveShadow position={[0, gt / 2, hzCenter]}>
+          <mesh receiveShadow position={[0, roofPeakH + gt / 2, hzCenter]}>
             <boxGeometry args={[length, gt, gw]} />
             <meshStandardMaterial color={specs.gableColor || '#0089b6'} roughness={0.7} />
           </mesh>
-          <mesh receiveShadow position={[0, -gw / 2 + gt, vzCenter]}>
+          <mesh receiveShadow position={[0, roofPeakH + gt - gw / 2, vzCenter]}>
             <boxGeometry args={[length, gw, gt]} />
             <meshStandardMaterial color={specs.gableColor || '#0089b6'} roughness={0.7} />
           </mesh>
@@ -3662,17 +3950,22 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
       );
     };
 
-    const renderLengthGable = (key: string, cx: number, cy: number, length: number, rotZ: number, isRight: boolean) => {
-      const hxCenter = isRight ? -gw / 2 : gw / 2;
+    const renderLengthGable = (key: string, cx: number, cy: number, length: number, slopeAngle: number, isRight: boolean) => {
+      const topOffset = roofPeakH + gt;
+      const uEdge = topOffset * Math.tan(slopeAngle);
+      const hxCenter = isRight ? (uEdge - gw / 2) : (-uEdge + gw / 2);
       const vxCenter = isRight ? gt / 2 : -gt / 2;
+      const vTopY = topOffset / Math.cos(slopeAngle);
 
       return (
-        <group key={key} position={[cx, cy, l / 2]} rotation={[0, 0, rotZ]}>
-          <mesh receiveShadow position={[hxCenter, gt / 2, 0]}>
-            <boxGeometry args={[gw, gt, length]} />
-            <meshStandardMaterial color={specs.gableColor || '#0089b6'} roughness={0.7} />
-          </mesh>
-          <mesh receiveShadow position={[vxCenter, -gw / 2 + gt, 0]}>
+        <group key={key} position={[cx, cy, l / 2]}>
+          <group rotation={[0, 0, slopeAngle]}>
+            <mesh receiveShadow position={[hxCenter, roofPeakH + gt / 2, 0]}>
+              <boxGeometry args={[gw, gt, length]} />
+              <meshStandardMaterial color={specs.gableColor || '#0089b6'} roughness={0.7} />
+            </mesh>
+          </group>
+          <mesh receiveShadow position={[vxCenter, vTopY - gw / 2, 0]}>
             <boxGeometry args={[gt, gw, length]} />
             <meshStandardMaterial color={specs.gableColor || '#0089b6'} roughness={0.7} />
           </mesh>
@@ -3689,9 +3982,18 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
       const rl = base_rl + modelEaveOverhang;
       const cx = -modelHalfOverhang * Math.cos(angle) - panelYOffset * Math.sin(angle);
       const cy = h + totRoofH / 2 - modelHalfOverhang * Math.sin(angle) + panelYOffset * Math.cos(angle);
-      ancillaryElements.push(renderGable('gable_front_single', 0, cx, cy, rl, angle, true));
-      ancillaryElements.push(renderGable('gable_back_single', l, cx, cy, rl, angle, false));
-      ancillaryElements.push(renderLengthGable('gable_high_single', w / 2, h + totRoofH + panelYOffset, l, 0, true));
+
+      // Extend Single Slope gable trims cleanly to the outer face of the high-eave flashing so the corner forms a flush miter
+      const highEdgeX = w / 2 + gableOutZ;
+      const extraHighSlope = (panelYOffset * Math.sin(angle) + gableOutZ + gt) / Math.cos(angle);
+      const gableRl = rl + extraHighSlope;
+      const gableCx = cx + (extraHighSlope / 2) * Math.cos(angle);
+      const gableCy = cy + (extraHighSlope / 2) * Math.sin(angle);
+      const highEdgeY = h + totRoofH + panelYOffset / Math.cos(angle) + gableOutZ * Math.tan(angle);
+
+      ancillaryElements.push(renderGable('gable_front_single', 0, gableCx, gableCy, gableRl, angle, true));
+      ancillaryElements.push(renderGable('gable_back_single', l, gableCx, gableCy, gableRl, angle, false));
+      ancillaryElements.push(renderLengthGable('gable_high_single', highEdgeX, highEdgeY, l + 2 * (gableOutZ + gt), angle, true));
     } else if (specs.roofType === 'Multi-Sloped Hut') {
       const h_steep = (w / 4) * (specs.roofSlope * 1.5 / 100);
       const h_shallow = (w / 4) * (specs.roofSlope * 0.5 / 100);
@@ -3750,13 +4052,13 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
       curveShape.closePath();
       
       ancillaryElements.push(
-        <mesh receiveShadow key="gable_front_curved" position={[0, 0, -gt]}>
+        <mesh receiveShadow key="gable_front_curved" position={[0, 0, -gableOutZ - gt]}>
           <extrudeGeometry args={[curveShape, { depth: gt, bevelEnabled: false }]} />
           <meshStandardMaterial color={specs.gableColor || '#0089b6'} roughness={0.7} />
         </mesh>
       );
       ancillaryElements.push(
-        <mesh receiveShadow key="gable_back_curved" position={[0, 0, l]}>
+        <mesh receiveShadow key="gable_back_curved" position={[0, 0, l + gableOutZ]}>
           <extrudeGeometry args={[curveShape, { depth: gt, bevelEnabled: false }]} />
           <meshStandardMaterial color={specs.gableColor || '#0089b6'} roughness={0.7} />
         </mesh>
@@ -3796,8 +4098,8 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
         </group>
       );
 
-      const hL = getRoofY(-w / 2);
-      const hR = getRoofY(w / 2);
+      const hL = getWallTopY(-w / 2);
+      const hR = getWallTopY(w / 2);
 
       ancillaryElements.push(renderCorner('wall_corner_lf', -w / 2 - o, -o, hL, 1, 1));
       ancillaryElements.push(renderCorner('wall_corner_rf', w / 2 + o, -o, hR, -1, 1));
@@ -3881,27 +4183,13 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
   if (specs.hasRoof !== false && specs.hasTurboVents !== false) {
     const roofEffWidth = specs.roofProfile === '6v Profile' ? 0.99 : (specs.roofProfile === '7v Profile' ? 1.188 : 1.0);
     const numSheets = Math.max(1, Math.ceil(l / roofEffWidth - 0.001));
-    let polyCols = 0;
-    for (let i = 0; i < numSheets; i++) {
-       if (i % 6 === 3) polyCols++;
-    }
-    const polyInRow = polyCols > 0 ? polyCols : 1;
-    const numVents = Math.max(1, polyInRow - 1);
+    const ventColIndices = getTurboVentColIndices(numSheets, l, roofEffWidth, specs.hasPolySheets !== false);
 
     const panelYOffset = modelPurlinYOffset + 0.075;
 
-    for (let i = 1; i <= numVents; i++) {
-      // Ensure proper centering between the polycarbonate sheets (multiples of 6: 0, 6, 12, 18, 24...)
-      let targetSheetIndex = Math.max(0, Math.min(numSheets - 1, Math.floor((i * numSheets) / (numVents + 1))));
-      if (specs.hasPolySheets !== false) {
-        let centeredIdx = Math.round(targetSheetIndex / 6) * 6;
-        centeredIdx = Math.max(0, Math.min(numSheets - 1, centeredIdx));
-        if (centeredIdx % 6 === 3) {
-          if (centeredIdx > 0) centeredIdx -= 1;
-          else centeredIdx += 1;
-        }
-        targetSheetIndex = centeredIdx;
-      }
+    for (let idx = 0; idx < ventColIndices.length; idx++) {
+      const i = idx + 1;
+      const targetSheetIndex = ventColIndices[idx];
       let wSheet = roofEffWidth;
       let vz = targetSheetIndex * roofEffWidth + wSheet / 2;
       if (targetSheetIndex === numSheets - 1) {
@@ -3950,9 +4238,15 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
         const purlinSpacing = specs.highWindVelocity || specs.snowLoad ? 1.0 : 1.5;
         const arcLen = w * 1.1;
         const runs = Math.max(1, Math.round(arcLen / purlinSpacing));
-        const midP = Math.max(1, Math.floor(runs / 4));
-        const t_mid = (midP - 0.5) / runs;
-        const vx1 = (-w / 2 + 0.15) + (w - 0.3) * t_mid;
+        const midP = Math.max(1, Math.min(runs, Math.floor(runs / 4) || 1));
+        const pxPrev = (-w / 2 + 0.15) + (w - 0.3) * ((midP - 1) / runs);
+        const pxNext = (-w / 2 + 0.15) + (w - 0.3) * (midP / runs);
+        const tPrev = pxPrev / w + 0.5;
+        const tNext = pxNext / w + 0.5;
+        const yPrev = h + 4 * roofH * (tPrev - tPrev * tPrev);
+        const yNext = h + 4 * roofH * (tNext - tNext * tNext);
+        const actualCurvedSpan = Math.sqrt((pxNext - pxPrev) ** 2 + (yNext - yPrev) ** 2);
+        const vx1 = (pxPrev + pxNext) / 2;
         const vxs = w >= 7 ? [vx1, -vx1] : [(i % 2 === 1 ? -1 : 1) * Math.abs(vx1)];
         ventLocations = vxs.map(vx => {
           const t = vx / w + 0.5;
@@ -3961,7 +4255,7 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
           const theta = Math.atan(slope);
           const cx = vx - panelYOffset * Math.sin(theta);
           const cy = yArc + panelYOffset * Math.cos(theta);
-          return { cx, cy, rotZ: theta, rotY: 0, sheetKey: `curved_sheet_${targetSheetIndex}_seg_0`, ventSpan: purlinSpacing };
+          return { cx, cy, rotZ: theta, rotY: 0, sheetKey: `curved_sheet_${targetSheetIndex}_seg_0`, ventSpan: actualCurvedSpan };
         });
       } else {
         // Double Slope / Standard Gable
@@ -4006,13 +4300,9 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
     const hasLouvers = specs.hasLouvers !== false;
 
     const girtSpacing = specs.highWindVelocity || specs.snowLoad ? 1.0 : 1.5;
-    const wy = Math.max(girtSpacing, Math.min(h - 0.8, Math.round((h * 0.5) / girtSpacing) * girtSpacing));
+    const { wy, wh, ly, louverH } = getOpeningVerticalPlacement(h, girtSpacing);
     const ww = 1.2;
-    const wh = 0.9;
     const awningRadius = 0.35;
-
-    const louverH = Math.min(1.68, Math.max(1.0, h - 1.20));
-    const ly = h / 2;
 
     // Gate collision checking variables
     const isGateActive = specs.hasProfileGate !== false;
@@ -4550,18 +4840,13 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
           }
         } else if (isCurved) {
           const roofH = (w / 2) * (specs.roofSlope / 100) * 1.5;
-          const curvePath = new THREE.QuadraticBezierCurve3(
-            new THREE.Vector3(-w/2, h + 0.1, z),
-            new THREE.Vector3(0, h + roofH * 2 + 0.1, z),
-            new THREE.Vector3(w/2, h + 0.1, z)
-          );
-          const tubeGeo = new THREE.TubeGeometry(curvePath, 16, chordSize / 2, 8, false);
-
-          structuralElements.push(
-            <mesh receiveShadow key={`truss_curved_top_${i}`} geometry={tubeGeo}>
-              {rafterMaterial}
-            </mesh>
-          );
+          if (curvedRafterTubeGeo) {
+            structuralElements.push(
+              <mesh receiveShadow key={`truss_curved_top_${i}`} position={[0, 0, z]} geometry={curvedRafterTubeGeo}>
+                {rafterMaterial}
+              </mesh>
+            );
+          }
 
           structuralElements.push(
             <mesh receiveShadow key={`truss_curved_bot_${i}`} position={[0, h + chordSize / 2, z]}>
@@ -4838,18 +5123,13 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
           </mesh>
         );
       } else if (specs.roofType === 'Curved') {
-         const roofH = (w / 2) * (specs.roofSlope / 100) * 1.5;
-         const curvePath = new THREE.QuadraticBezierCurve3(
-           new THREE.Vector3(-w/2, h + 0.1, z),
-           new THREE.Vector3(0, h + roofH * 2 + 0.1, z),
-           new THREE.Vector3(w/2, h + 0.1, z)
-         );
-         const tubeGeo = new THREE.TubeGeometry(curvePath, 16, 0.15, 8, false);
-         structuralElements.push(
-           <mesh receiveShadow key={`raf_${i}`} geometry={tubeGeo}>
-             {rafterMaterial}
-           </mesh>
-         );
+         if (curvedRafterTubeGeo) {
+           structuralElements.push(
+             <mesh receiveShadow key={`raf_${i}`} position={[0, 0, z]} geometry={curvedRafterTubeGeo}>
+               {rafterMaterial}
+             </mesh>
+           );
+         }
       } else {
         const roofH = (w / 2) * (specs.roofSlope / 100);
         const rl = Math.sqrt((w / 2) * (w / 2) + roofH * roofH);
@@ -5258,21 +5538,10 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
           }
         }
         if (py <= maxFBH) {
-          // Instead of drawing the full width which extends out of the roof shape, 
-          // we use getRoofY bounds.
-          let rxLeftFront = -w/2; let rxRightFront = w/2;
-          // Approximate the width clipping to keep it inside the roof bounds.
-          if (py > h) {
-             const step = w / 40;
-             let newLeft = -w/2;
-             while (getRoofY(newLeft) < py && newLeft < w/2) newLeft += step;
-             let newRight = w/2;
-             while (getRoofY(newRight) < py && newRight > -w/2) newRight -= step;
-             rxLeftFront = newLeft;
-             rxRightFront = newRight;
-          }
-          
-          if (rxLeftFront < rxRightFront) {
+          const endwallBounds = getEndwallGirtBounds(py);
+          if (endwallBounds) {
+            const rxLeftFront = endwallBounds.left;
+            const rxRightFront = endwallBounds.right;
             const fw = rxRightFront - rxLeftFront;
             const fcx = (rxLeftFront + rxRightFront) / 2;
             
@@ -5324,31 +5593,9 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
   }
 
   if (specs.hasSDScrews !== false && (specs.hasWalls !== false || specs.hasRoof !== false)) {
-    const hasCaps = specs.hasPVCCaps !== false;
-    const r = hasCaps ? 0.015 : 0.0075;
-    const d = hasCaps ? 0.01 : 0.005;
-    
-    // Left/Right Wall Screw Geometry
-    const sdGeoL = new THREE.CylinderGeometry(r, r, d, 8);
-    sdGeoL.rotateZ(Math.PI / 2);
-    const sdGeoR = new THREE.CylinderGeometry(r, r, d, 8);
-    sdGeoR.rotateZ(Math.PI / 2);
-
-    // Front/Back Wall Screw Geometry
-    const sdGeoF = new THREE.CylinderGeometry(r, r, d, 8);
-    sdGeoF.rotateX(Math.PI / 2);
-    
-    // Roof Screws Geometry
-    const sdGeoRoofL = new THREE.CylinderGeometry(r, r, d, 8);
-    const roofAngle = Math.atan((specs.roofSlope || 0) / 100);
-    sdGeoRoofL.rotateZ(-roofAngle);
-    
-    const sdGeoRoofR = new THREE.CylinderGeometry(r, r, d, 8);
-    sdGeoRoofR.rotateZ(roofAngle);
-
-    const sdMat = hasCaps ? <meshStandardMaterial color={specs.pvcCapColor || "#0089b6"} roughness={0.8} /> : <meshStandardMaterial color="#cbd5e1" roughness={0.2} metalness={0.9} />;
-    const sdElements = [];
-    const stepZ = 0.33; // Approx pitch distance along panels
+    const { geoX: sdGeoX, geoZ: sdGeoZ, mat: sdSharedMat, d } = sdResources;
+    const sdPositionsX: [number, number, number][] = [];
+    const sdPositionsZ: [number, number, number][] = [];
 
     const girtSpacing = specs.highWindVelocity || specs.snowLoad ? 1.0 : 1.5;
     let rightWallH = h;
@@ -5443,12 +5690,7 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
             if (!(specs.frameType === 'Truss' && isFinalGirtOfLeftWall)) {
               const inLeftGate = isLeftGate && py <= gateH && pz >= l/2 - gateWL/2 && pz <= l/2 + gateWL/2;
               if (!inLeftGate) {
-                sdElements.push(
-                  <mesh receiveShadow key={`sd_L_${py}_${pz}`} position={[-w/2 - wallOffset, py, pz]}>
-                    <primitive object={sdGeoL} />
-                    {sdMat}
-                  </mesh>
-                );
+                sdPositionsX.push([-w/2 - wallOffset, py, pz]);
               }
             }
           }
@@ -5457,12 +5699,7 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
             if (!(specs.frameType === 'Truss' && isFinalGirtOfRightWall)) {
               const inRightGate = isRightGate && py <= gateH && pz >= l/2 - gateWL/2 && pz <= l/2 + gateWL/2;
               if (!inRightGate) {
-                sdElements.push(
-                  <mesh receiveShadow key={`sd_R_${py}_${pz}`} position={[w/2 + wallOffset, py, pz]}>
-                    <primitive object={sdGeoR} />
-                    {sdMat}
-                  </mesh>
-                );
+                sdPositionsX.push([w/2 + wallOffset, py, pz]);
               }
             }
           }
@@ -5517,39 +5754,31 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
           }
         }
 
+        const endwallScrewBounds = getEndwallGirtBounds(py);
         for (const px of wallXPXValues) {
-          const roofYFront = (specs.roofType === 'Single Slope') ? h + (px - (-w/2)) * Math.tan(roofAngle) : (px < 0 ? h + (px - (-w/2)) * Math.tan(roofAngle) : h + (w/2 - px) * Math.tan(roofAngle));
-          
-          if (py <= roofYFront) {
+          if (endwallScrewBounds && px >= endwallScrewBounds.left && px <= endwallScrewBounds.right) {
             // Front Wall Skip
             const inFrontGate = isFrontGate && py <= gateH && px >= -gateW/2 && px <= gateW/2;
             if (!inFrontGate) {
-              sdElements.push(
-                <mesh receiveShadow key={`sd_F_${py}_${px}`} position={[px, py, -wallOffset]}>
-                  <primitive object={sdGeoF} />
-                  {sdMat}
-                </mesh>
-              );
+              sdPositionsZ.push([px, py, -wallOffset]);
             }
             
             // Back Wall Skip
             const inBackGate = isBackGate && py <= gateH && px >= -gateW/2 && px <= gateW/2;
             if (!inBackGate) {
-              sdElements.push(
-                <mesh receiveShadow key={`sd_B_${py}_${px}`} position={[px, py, l + wallOffset]}>
-                  <primitive object={sdGeoF} />
-                  {sdMat}
-                </mesh>
-              );
+              sdPositionsZ.push([px, py, l + wallOffset]);
             }
           }
         }
       }
     }
 
-
-    
-    ancillaryElements.push(<group key="sd_screws_group">{sdElements}</group>);
+    ancillaryElements.push(
+      <group key="sd_screws_group">
+        <SDScrewInstances positions={sdPositionsX} geometry={sdGeoX} material={sdSharedMat} />
+        <SDScrewInstances positions={sdPositionsZ} geometry={sdGeoZ} material={sdSharedMat} />
+      </group>
+    );
   }
 
   return (
@@ -5639,6 +5868,43 @@ function UpdateBounds({ specs }: { specs: ProjectSpecs }) {
   }, [specs.width, specs.length, specs.eaveHeight, specs.roofSlope, specs.roofType, bounds]);
   
   return null;
+}
+
+function DimensionLine3D({
+  points,
+  color = '#3b82f6',
+  thickness = 0.05,
+}: {
+  points: [[number, number, number], [number, number, number]];
+  color?: string;
+  thickness?: number;
+}) {
+  const [p1, p2] = points;
+  const dx = p2[0] - p1[0];
+  const dy = p2[1] - p1[1];
+  const dz = p2[2] - p1[2];
+  const length = Math.sqrt(dx * dx + dy * dy + dz * dz);
+  if (length < 1e-4) return null;
+
+  const mid: [number, number, number] = [
+    (p1[0] + p2[0]) / 2,
+    (p1[1] + p2[1]) / 2,
+    (p1[2] + p2[2]) / 2,
+  ];
+  const isX = Math.abs(dx) >= Math.abs(dy) && Math.abs(dx) >= Math.abs(dz);
+  const isY = !isX && Math.abs(dy) >= Math.abs(dz);
+  const args: [number, number, number] = isX
+    ? [length, thickness, thickness]
+    : isY
+    ? [thickness, length, thickness]
+    : [thickness, thickness, length];
+
+  return (
+    <mesh position={mid}>
+      <boxGeometry args={args} />
+      <meshBasicMaterial color={color} />
+    </mesh>
+  );
 }
 
 function Building3DVisualizer({ specs, dimensionUnit, panelColors, setPanelColors, framingOnly = false, weatherType = 'clear' }: { specs: ProjectSpecs, dimensionUnit: 'm' | 'ft', panelColors: Record<string, string>, setPanelColors: React.Dispatch<React.SetStateAction<Record<string, string>>>, framingOnly?: boolean, weatherType?: string }) {
@@ -5766,11 +6032,22 @@ function Building3DVisualizer({ specs, dimensionUnit, panelColors, setPanelColor
         </div>
       </div>
 
-      <Canvas id="peb-3d-canvas" shadows gl={{ preserveDrawingBuffer: true }} camera={{ position: [specs.width * 1.5, specs.eaveHeight * 2, specs.length * 1.5], fov: 45 }}>
+      <Canvas
+        id="peb-3d-canvas"
+        dpr={[1, 1.5]}
+        shadows
+        gl={{ preserveDrawingBuffer: true, antialias: true, powerPreference: 'high-performance' }}
+        onCreated={({ gl }) => {
+          gl.domElement.addEventListener('webglcontextlost', (e) => {
+            e.preventDefault();
+          }, false);
+        }}
+        camera={{ position: [specs.width * 1.5, specs.eaveHeight * 2, specs.length * 1.5], fov: 45 }}
+      >
         <CameraManager isInside={isInside} specs={specs} />
         <ambientLight intensity={weatherType === 'storm' ? 0.3 : (weatherType === 'rain' ? 0.5 : (isInside ? 0.8 : 0.7))} />
         {isInside && <pointLight position={[0, specs.eaveHeight / 2, specs.length / 2]} intensity={2.0} distance={Math.max(specs.width, specs.length) * 2} decay={1.5} />}
-        <directionalLight position={[20, 30, 20]} intensity={weatherType === 'storm' ? 0.4 : (weatherType === 'rain' ? 0.6 : 1.2)} castShadow shadow-bias={-0.0005} shadow-mapSize={[2048, 2048]}>
+        <directionalLight position={[20, 30, 20]} intensity={weatherType === 'storm' ? 0.4 : (weatherType === 'rain' ? 0.6 : 1.2)} castShadow shadow-bias={-0.0005} shadow-mapSize={[1024, 1024]}>
           <orthographicCamera attach="shadow-camera" args={[-Math.max(specs.width, specs.length, 20), Math.max(specs.width, specs.length, 20), Math.max(specs.width, specs.length, 20), -Math.max(specs.width, specs.length, 20), 0.1, 100]} />
         </directionalLight>
         <directionalLight position={[-10, 10, -10]} intensity={weatherType === 'storm' ? 0.2 : (weatherType === 'rain' ? 0.3 : 0.5)} />
@@ -5780,48 +6057,55 @@ function Building3DVisualizer({ specs, dimensionUnit, panelColors, setPanelColor
         <WeatherEffects weatherType={weatherType} specs={specs} />
         {!isInside && <ForceVectorArrows weatherType={weatherType} specs={specs} />}
 
-        {!isInside ? (
-          <Bounds margin={1.2}>
-            <UpdateBounds specs={specs} />
-            <Building3DModel specs={specs} panelColors={panelColors} setPanelColors={setPanelColors} framingOnly={framingOnly} weatherType={weatherType} />
-          </Bounds>
-        ) : (
+        <Bounds margin={1.2}>
+          {!isInside && <UpdateBounds specs={specs} />}
           <Building3DModel specs={specs} panelColors={panelColors} setPanelColors={setPanelColors} framingOnly={framingOnly} weatherType={weatherType} />
-        )}
+        </Bounds>
 
         {/* Precision Guidelines / Dimensions */}
         {!isInside && (
           <group>
             {/* Width Dimension */}
-            <DreiLine points={[[-specs.width / 2, 0.1, specs.length / 2 + 1], [specs.width / 2, 0.1, specs.length / 2 + 1]]} color="#3b82f6" lineWidth={2} />
-            <DreiLine points={[[-specs.width / 2, 0.1, specs.length / 2 + 0.5], [-specs.width / 2, 0.1, specs.length / 2 + 1.5]]} color="#3b82f6" lineWidth={2} />
-            <DreiLine points={[[specs.width / 2, 0.1, specs.length / 2 + 0.5], [specs.width / 2, 0.1, specs.length / 2 + 1.5]]} color="#3b82f6" lineWidth={2} />
+            <DimensionLine3D points={[[-specs.width / 2, 0.1, specs.length / 2 + 1], [specs.width / 2, 0.1, specs.length / 2 + 1]]} color="#3b82f6" />
+            <DimensionLine3D points={[[-specs.width / 2, 0.1, specs.length / 2 + 0.5], [-specs.width / 2, 0.1, specs.length / 2 + 1.5]]} color="#3b82f6" />
+            <DimensionLine3D points={[[specs.width / 2, 0.1, specs.length / 2 + 0.5], [specs.width / 2, 0.1, specs.length / 2 + 1.5]]} color="#3b82f6" />
             <Text position={[0, 0.1, specs.length / 2 + 1.5]} rotation={[-Math.PI / 2, 0, 0]} fontSize={Math.max(1, specs.width * 0.05)} color="#1e293b" anchorX="center" anchorY="top">
               {dimensionUnit === 'ft' ? (specs.width * 3.28084).toFixed(2) : specs.width}{dimensionUnit === 'ft' ? 'ft' : 'm'} Width
             </Text>
 
             {/* Length Dimension */}
-            <DreiLine points={[[specs.width / 2 + 1, 0.1, specs.length / 2], [specs.width / 2 + 1, 0.1, -specs.length / 2]]} color="#3b82f6" lineWidth={2} />
-            <DreiLine points={[[specs.width / 2 + 0.5, 0.1, specs.length / 2], [specs.width / 2 + 1.5, 0.1, specs.length / 2]]} color="#3b82f6" lineWidth={2} />
-            <DreiLine points={[[specs.width / 2 + 0.5, 0.1, -specs.length / 2], [specs.width / 2 + 1.5, 0.1, -specs.length / 2]]} color="#3b82f6" lineWidth={2} />
+            <DimensionLine3D points={[[specs.width / 2 + 1, 0.1, specs.length / 2], [specs.width / 2 + 1, 0.1, -specs.length / 2]]} color="#3b82f6" />
+            <DimensionLine3D points={[[specs.width / 2 + 0.5, 0.1, specs.length / 2], [specs.width / 2 + 1.5, 0.1, specs.length / 2]]} color="#3b82f6" />
+            <DimensionLine3D points={[[specs.width / 2 + 0.5, 0.1, -specs.length / 2], [specs.width / 2 + 1.5, 0.1, -specs.length / 2]]} color="#3b82f6" />
             <Text position={[specs.width / 2 + 1.5, 0.1, 0]} rotation={[-Math.PI / 2, 0, Math.PI / 2]} fontSize={Math.max(1, Math.min(specs.length * 0.05, 3))} color="#1e293b" anchorX="center" anchorY="bottom">
               {dimensionUnit === 'ft' ? (specs.length * 3.28084).toFixed(2) : specs.length}{dimensionUnit === 'ft' ? 'ft' : 'm'} Length
             </Text>
 
             {/* Eave Height Dimension */}
-            <DreiLine points={[[-specs.width / 2 - 1, 0, specs.length / 2], [-specs.width / 2 - 1, specs.eaveHeight, specs.length / 2]]} color="#3b82f6" lineWidth={2} />
-            <DreiLine points={[[-specs.width / 2 - 1.5, 0, specs.length / 2], [-specs.width / 2 - 0.5, 0, specs.length / 2]]} color="#3b82f6" lineWidth={2} />
-            <DreiLine points={[[-specs.width / 2 - 1.5, specs.eaveHeight, specs.length / 2], [-specs.width / 2 - 0.5, specs.eaveHeight, specs.length / 2]]} color="#3b82f6" lineWidth={2} />
+            <DimensionLine3D points={[[-specs.width / 2 - 1, 0, specs.length / 2], [-specs.width / 2 - 1, specs.eaveHeight, specs.length / 2]]} color="#3b82f6" />
+            <DimensionLine3D points={[[-specs.width / 2 - 1.5, 0, specs.length / 2], [-specs.width / 2 - 0.5, 0, specs.length / 2]]} color="#3b82f6" />
+            <DimensionLine3D points={[[-specs.width / 2 - 1.5, specs.eaveHeight, specs.length / 2], [-specs.width / 2 - 0.5, specs.eaveHeight, specs.length / 2]]} color="#3b82f6" />
             <Text position={[-specs.width / 2 - 1.5, specs.eaveHeight / 2, specs.length / 2]} rotation={[0, -Math.PI / 2, 0]} fontSize={Math.max(1, Math.min(specs.eaveHeight * 0.15, 3))} color="#1e293b" anchorX="center" anchorY="bottom">
               {dimensionUnit === 'ft' ? (specs.eaveHeight * 3.28084).toFixed(2) : specs.eaveHeight}{dimensionUnit === 'ft' ? 'ft' : 'm'} Height
             </Text>
           </group>
         )}
 
-        {!isInside && <ContactShadows position={[0, -0.1, 0]} opacity={0.4} scale={Math.max(specs.width, specs.length) * 3} blur={2} far={10} />}
+        {!isInside && (
+          <ContactShadows
+            key={`cs_${specs.width}_${specs.length}_${specs.eaveHeight}_${specs.roofType}_${specs.hasWalls}`}
+            position={[0, -0.1, 0]}
+            opacity={0.4}
+            scale={Math.max(specs.width, specs.length) * 3}
+            blur={2}
+            far={10}
+            frames={1}
+            resolution={256}
+          />
+        )}
         <OrbitControls makeDefault enableZoom={true} enablePan={true} minPolarAngle={0} maxPolarAngle={isInside ? Math.PI : Math.PI / 2 - 0.05} target={[0, specs.eaveHeight / 2, 0]} />
       </Canvas>
-      <div className="absolute bottom-4 right-4 z-10 pointer-events-none opacity-50 bg-white/30 px-2 py-1 rounded backdrop-blur-sm">
+      <div className="absolute bottom-4 right-4 z-10 pointer-events-none opacity-60 bg-white/60 px-2 py-1 rounded">
         <p className="text-xs font-semibold text-slate-800">UPEB by M.G. INDUSTRIES<br/>9752556113</p>
       </div>
     </div>
@@ -8856,6 +9140,7 @@ export default function App() {
   const [is3DMode, setIs3DMode] = useState(true);
   const [visualizerTab, setVisualizerTab] = useState<'3d-model' | '3d-frame' | 'front-elevation' | 'side-elevation' | 'top-plan' | 'truss-view'>('3d-model');
   const [searchQuery, setSearchQuery] = useState('');
+  const [proposalSettings, setProposalSettings] = useState<ProposalSettings>(DEFAULT_PROPOSAL_SETTINGS);
   const [weatherType, setWeatherType] = useState<'clear' | 'rain' | 'snow' | 'storm'>('clear');
   const [activeLeakSymptom, setActiveLeakSymptom] = useState<'overlap' | 'screw' | 'ridge' | 'gutter' | null>(null);
 
@@ -9225,15 +9510,12 @@ export default function App() {
   const roofOverlap = 0.2; // 200mm end overlap
   const actualRoofSheetLength = roofSegments > 1 ? (sheetLengthRoof + (roofSegments - 1) * roofOverlap) / roofSegments : sheetLengthRoof;
   
-  const roofSheetsPerSideLength = Math.ceil(specs.length / roofEffWidth);
+  const roofSheetsPerSideLength = Math.max(1, Math.ceil(specs.length / roofEffWidth - 0.001));
   let totalRoofSegments = roofSheetsPerSideLength * roofSides * roofSegments;
 
-  let polyColsPerSide = 0;
-  for (let i = 0; i < roofSheetsPerSideLength; i++) {
-     if (i % 6 === 3) polyColsPerSide++;
-  }
+  const polyColsPerSide = getPolycarbonateColIndices(roofSheetsPerSideLength, specs.length, roofEffWidth).length;
   const polySegmentsPerCol = roofSegments >= 3 ? 1 : roofSegments; 
-  const totalPolySheetsEstimate = (polyColsPerSide > 0 ? polyColsPerSide : 1) * roofSides * polySegmentsPerCol;
+  const totalPolySheetsEstimate = polyColsPerSide * roofSides * polySegmentsPerCol;
 
   let numPolySheets = 0;
   if (specs.hasPolySheets !== false) {
@@ -9283,8 +9565,7 @@ export default function App() {
     : autoTurboVentLenFt;
   const turboVentSheetLenMeters = turboVentSheetLenFt * 0.3048;
 
-  const polyInRow = polyColsPerSide > 0 ? polyColsPerSide : 1;
-  const numVentLocations = Math.max(1, polyInRow - 1);
+  const numVentLocations = getTurboVentColIndices(roofSheetsPerSideLength, specs.length, roofEffWidth, specs.hasPolySheets !== false).length;
   const ventSheetsPerLoc = specs.roofType === 'Single Slope' ? 1 : (specs.width >= 7 ? 2 : 1);
   const actualTurboVentCount = numVentLocations * ventSheetsPerLoc;
 
@@ -9785,10 +10066,52 @@ export default function App() {
   const costPerJourney = ((specs.deliveryDistance || 0) * (specs.dieselPrice || 0)) / 2; 
   const logisticsCost = numberOfJourneys * costPerJourney;
 
-  const totalBeforeTax = subTotal + civilFoundationCost + logisticsCost;
+  const erectionPrimaryCost = specs.hasPrimarySteel !== false ? erectLaborCost * primaryTons : 0;
+  const erectionSecondaryCost = specs.hasSecondarySteel !== false ? secondaryErectLaborCost * secondaryTons : 0;
+  const erectionRoofCost = specs.hasRoof !== false ? laborPerRoofSheet * numRoofSheets : 0;
+  const erectionWallCost = specs.hasWalls !== false ? laborPerWallSheet * totalWallSheets : 0;
+  const erectionAmountBeforeGst = erectionPrimaryCost + erectionSecondaryCost + erectionRoofCost + erectionWallCost;
+  const supplyAmountBeforeGst = Math.max(0, subTotal - erectionAmountBeforeGst) + logisticsCost;
+
+  const activeErectionCost = proposalSettings.includeErectionInQuote ? erectionAmountBeforeGst : 0;
+  const activeCivilCost = proposalSettings.includeCivilInQuote ? civilFoundationCost : 0;
+
+  const totalBeforeTax = supplyAmountBeforeGst + activeErectionCost + activeCivilCost;
   const taxAmount = totalBeforeTax * 0.18; // 18% GST
 
   const grandTotal = totalBeforeTax + taxAmount;
+
+  const endBayCount = specs.frameType === 'Multi-Span' ? 2 : (specs.width >= 12 ? Math.max(1, Math.round(specs.width / 6)) : 1);
+  const endBaySpacing = endBayCount > 0 ? specs.width / endBayCount : specs.width;
+
+  const turboVentOverridePrice = specs.materialOverrides?.['turboVents']?.price ?? specs.accessoryOverrides?.['turboVents']?.price;
+  const turboVentUnitRate = (turboVentOverridePrice !== undefined && turboVentOverridePrice !== '') ? Number(turboVentOverridePrice) : 3500;
+  const pcpOverridePrice = specs.materialOverrides?.['polySheets']?.price ?? specs.accessoryOverrides?.['polySheets']?.price;
+  const pcpSheetUnitRate = (pcpOverridePrice !== undefined && pcpOverridePrice !== '') ? Number(pcpOverridePrice) : 1200;
+
+  const proposalComputedData: ProposalComputedData = {
+    specs,
+    dimensionUnit,
+    areaSqM: area,
+    areaSqFt: area * 10.7639,
+    baySpacing,
+    numFrames,
+    endBayCount,
+    endBaySpacing,
+    totalSteelWeightMT: targetSteelWeight,
+    supplyAmountBeforeGst,
+    erectionAmountBeforeGst,
+    civilAmountBeforeGst: civilFoundationCost,
+    totalBeforeGst: totalBeforeTax,
+    gstAmount: taxAmount,
+    grandTotalWithGst: grandTotal,
+    supplyWithGst: supplyAmountBeforeGst * 1.18,
+    erectionWithGst: activeErectionCost * 1.18,
+    turboVentUnitRate,
+    pcpSheetUnitRate,
+    roofColorName,
+    wallColorName,
+  };
 
   const annualComparativeData = useMemo(() => {
     const data = [];
@@ -9876,12 +10199,13 @@ export default function App() {
        }
        const roofTotal = Math.max(0, Math.ceil((6 * specs.length * purlinRunsPerFrame) - ((specs.length - 1) * purlinRunsPerFrame)));
        
-       const roofSheets = Math.ceil(specs.length / effRoof - 0.001);
+       const roofSheets = Math.max(1, Math.ceil(specs.length / effRoof - 0.001));
+       const roofPolyColSet = new Set(getPolycarbonateColIndices(roofSheets, specs.length, effRoof));
        let numSections = specs.roofType === 'Single Slope' || specs.roofType === 'Curved' ? 1 : (specs.roofType === 'Multi-Sloped Hut' ? 4 : 2);
        const perRoofShoot = roofTotal / (roofSheets * numSections);
        
        for (let i = 0; i < roofSheets; i++) {
-           const isSkylightCol = specs.hasPolySheets !== false && (i % 6 === 3);
+           const isSkylightCol = specs.hasPolySheets !== false && roofPolyColSet.has(i);
            for (let sec = 0; sec < numSections; sec++) {
                let pfx = 'roof';
                if (specs.roofType === 'Single Slope') pfx = 'single';
@@ -10457,157 +10781,7 @@ export default function App() {
   };
 
   const handleExportPDF = async () => {
-    const doc = new jsPDF();
-    const pageWidth = doc.internal.pageSize.getWidth();
-    const pageHeight = doc.internal.pageSize.getHeight();
-
-    const addWatermark = () => {
-      doc.setTextColor(248, 248, 250);
-      doc.setFontSize(18);
-      doc.text("UPEB by M.G. INDUSTRIES 9752556113", pageWidth / 2, pageHeight / 2, { angle: 45, align: 'center' });
-      doc.setTextColor(0, 0, 0);
-    };
-
-    addWatermark();
-    
-    doc.setFontSize(20);
-    doc.setTextColor(15, 23, 42); // slate-900
-    doc.text("TURNKEY CONTRACT AGREEMENT", pageWidth / 2, 22, { align: 'center' });
-    
-    doc.setFontSize(14);
-    doc.text("Universe Pre-Engineered Building (UPEB)", pageWidth / 2, 30, { align: 'center' });
-    doc.setFontSize(11);
-    doc.text("by M.G. Industries", pageWidth / 2, 36, { align: 'center' });
-
-    doc.setFontSize(12);
-    doc.setFont("helvetica", "bold");
-    doc.text(`1. Project Specifications`, 14, 50);
-    
-    doc.setFontSize(10);
-    doc.setFont("helvetica", "normal");
-    doc.text(`Building Dimensions (W x L): ${specs.width}m x ${specs.length}m`, 14, 57);
-    doc.text(`Eave Height: ${specs.eaveHeight}m`, 14, 63);
-    doc.text(`Roof Slope: ${specs.roofSlope}:10`, 14, 69);
-    doc.text(`Total Floor Area: ${Math.round(specs.width * specs.length).toLocaleString('en-IN')} sqm`, 14, 75);
-    
-    let currentY = 85;
-
-    doc.setFontSize(12);
-    doc.setFont("helvetica", "bold");
-    doc.text(`2. Commercials & Turnkey Quote`, 14, currentY);
-    
-    currentY += 8;
-    
-    autoTable(doc, {
-      startY: currentY,
-      head: [['Description', 'Amount (INR)']],
-      body: [
-        ['Primary & Secondary Steel Framing', `Rs. ${Math.round(primaryMaterialTotal + totalSecondaryCost).toLocaleString('en-IN')}`],
-        ['Roof & Wall Cladding Solutions', `Rs. ${Math.round(totalRoofCost + totalWallCost).toLocaleString('en-IN')}`],
-        ['Fasteners, Accessories & Hardware', `Rs. ${Math.round(totalHardwareCost + totalAccessoriesCost).toLocaleString('en-IN')}`],
-        ['Fabrication & Preparation', `Rs. ${Math.round(fabLaborCost * primaryTons).toLocaleString('en-IN')}`],
-        ['Delivery & Logistics', `Rs. ${Math.round(logisticsCost).toLocaleString('en-IN')}`],
-        ['Erection Details & Labor', `Rs. ${Math.round(erectLaborCost * primaryTons).toLocaleString('en-IN')}`],
-        ['Overall PEB Turnkey Total', `Rs. ${Math.round(grandTotal).toLocaleString('en-IN')}`],
-      ],
-      theme: 'grid',
-      headStyles: { fillColor: [15, 23, 42], cellPadding: 2 },
-      bodyStyles: { cellPadding: 2 },
-      margin: { bottom: 10 }
-    });
-
-    currentY = (doc as any).lastAutoTable.finalY + 8;
-
-    if (currentY > pageHeight - 95) {
-      doc.addPage();
-      addWatermark();
-      currentY = 20;
-    }
-
-    doc.setFontSize(11);
-    doc.setFont("helvetica", "bold");
-    doc.text(`3. Payment Terms`, 14, currentY);
-    doc.setFontSize(9);
-    doc.setFont("helvetica", "normal");
-    
-    const paymentTerms = [
-      "• 40% Advance accompanied by the formalized work order.",
-      "• 30% After the primary materials are delivered to the site.",
-      "• 20% After the secondary materials and sheeting are delivered to the site.",
-      "• 10% Upon completion of erection and hand-over."
-    ];
-    
-    paymentTerms.forEach(term => {
-      currentY += 5;
-      doc.text(term, 14, currentY);
-    });
-
-    currentY += 8;
-    
-    doc.setFontSize(11);
-    doc.setFont("helvetica", "bold");
-    doc.text(`4. Standard Terms & Conditions`, 14, currentY);
-    doc.setFontSize(9);
-    doc.setFont("helvetica", "normal");
-    
-    const tnc = [
-      "1. Taxes (GST) and unforeseen local levies as applicable are charged separately.",
-      "2. Estimated timeline: 4 to 6 weeks from the receipt of clearance and advance.",
-      "3. Scope strictly excludes any civil foundation works or masonry execution unless mutually specified.",
-      "4. The delivery site must be cleared, leveled, and prepared before deployment for erection.",
-      "5. Necessary utilities (power, water) at the erection site shall be supplied by the client directly.",
-      "6. Delays occurring due to unavoidable natural occurrences (force majeure) remain excluded."
-    ];
-    
-    tnc.forEach(term => {
-      currentY += 5;
-      const splitTerm = doc.splitTextToSize(term, pageWidth - 28);
-      doc.text(splitTerm, 14, currentY);
-      currentY += (splitTerm.length - 1) * 4;
-    });
-
-    // Provide enough space for stamp/signatures but avoid forced pagination if possible
-    currentY = Math.max(currentY + 25, pageHeight - 35);
-    
-    const sigWidth = 50;
-    const margin = 20;
-    
-    doc.line(margin, currentY, margin + sigWidth, currentY); // Authorized Signatory line
-    doc.line(pageWidth - margin - sigWidth, currentY, pageWidth - margin, currentY); // Client Signature line
-    
-    currentY += 5;
-    doc.setFontSize(10);
-    doc.setFont("helvetica", "bold");
-    doc.text("For M.G. INDUSTRIES", margin + (sigWidth / 2), currentY, { align: 'center' });
-    doc.text("Accepted By Client", pageWidth - margin - (sigWidth / 2), currentY, { align: 'center' });
-    
-    currentY += 5;
-    doc.setFontSize(9);
-    doc.setFont("helvetica", "normal");
-    doc.text("Authorized Signatory", margin + (sigWidth / 2), currentY, { align: 'center' });
-    doc.text("Signature / Client Seal", pageWidth - margin - (sigWidth / 2), currentY, { align: 'center' });
-    
-    // Additional Page for Supplementary Notes
-    doc.addPage();
-    addWatermark();
-    
-    doc.setFontSize(14);
-    doc.setFont("helvetica", "bold");
-    doc.text("5. Supplementary Notes & Details", 14, 25);
-    
-    doc.setFontSize(10);
-    doc.setFont("helvetica", "normal");
-    doc.text("Please use this space for any additional arrangements, sketches, or specific requirements:", 14, 35);
-    
-    // Draw lines for notes
-    let notesY = 45;
-    for (let i = 0; i < 20; i++) {
-        doc.setDrawColor(200, 200, 200);
-        doc.line(14, notesY, pageWidth - 14, notesY);
-        notesY += 10;
-    }
-    
-    doc.save('UPEB_Turnkey_Contract_Agreement.pdf');
+    await exportProposalPDF(proposalSettings, proposalComputedData);
   };
 
   const handleExportModalPDF = (title: string, data: { label: string; value: string; category: string }[]) => {
@@ -10662,8 +10836,8 @@ export default function App() {
         <div className="flex items-center gap-3">
           <Building className="w-6 h-6 text-blue-400 shrink-0" />
           <div className="flex flex-col">
-            <h1 className="text-xl font-semibold tracking-tight leading-tight">UPEB</h1>
-            <span className="text-[10px] text-slate-400 font-medium tracking-wider uppercase">by M.G. Industries</span>
+            <h1 className="text-lg sm:text-xl font-semibold tracking-tight leading-tight">M.G. Industries: UPEB</h1>
+            <span className="text-[10px] text-blue-300 font-medium tracking-wider uppercase">Strengthening the Universe</span>
           </div>
         </div>
         <div className="flex flex-wrap items-center gap-2 sm:gap-4 text-sm font-medium text-slate-300">
@@ -10905,7 +11079,29 @@ export default function App() {
                       />
                     </div>
                   </div>
-                  <div className="grid grid-cols-2 gap-4 pb-4 border-b border-slate-100">
+                  <div className="grid grid-cols-2 gap-4">
+                    <div className="flex flex-col gap-1">
+                      <label className="text-xs font-semibold text-slate-600 uppercase tracking-wider">Client Name</label>
+                      <input 
+                        type="text" 
+                        value={proposalSettings.clientName} 
+                        onChange={(e) => setProposalSettings(prev => ({ ...prev, clientName: e.target.value }))}
+                        placeholder="e.g. M/s – Client Name"
+                        className="p-2 border border-slate-300 rounded focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                      />
+                    </div>
+                    <div className="flex flex-col gap-1">
+                      <label className="text-xs font-semibold text-slate-600 uppercase tracking-wider">Client Email</label>
+                      <input 
+                        type="email" 
+                        value={proposalSettings.clientEmail} 
+                        onChange={(e) => setProposalSettings(prev => ({ ...prev, clientEmail: e.target.value }))}
+                        placeholder="e.g. client@company.com"
+                        className="p-2 border border-slate-300 rounded focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                      />
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-1 gap-4 pb-4 border-b border-slate-100">
                     <div className="flex flex-col gap-1">
                       <label className="text-xs font-semibold text-slate-600 uppercase tracking-wider">Delivery Address with Pincode</label>
                       <input 
@@ -12468,76 +12664,75 @@ export default function App() {
                              </div>
                              <span>₹{Math.round(subTotal).toLocaleString('en-IN')}</span>
                           </div>
-                          <div className="flex justify-between text-slate-600 pt-1"><span>Target Civil Foundation (₹1,500/sqm{dimensionUnit === 'ft' ? ' or ~₹139/sq.ft' : ''})</span> <span>₹{Math.round(civilFoundationCost).toLocaleString('en-IN')}</span></div>
+                          <div className="flex justify-between text-slate-600 pt-1">
+                            <span>Target Civil Foundation ({proposalSettings.includeCivilInQuote ? 'Included' : 'Excluded from PEB Quote'})</span>
+                            <span>{proposalSettings.includeCivilInQuote ? `₹${Math.round(civilFoundationCost).toLocaleString('en-IN')}` : `₹${Math.round(civilFoundationCost).toLocaleString('en-IN')} (Est.)`}</span>
+                          </div>
                           <div className="flex justify-between text-slate-600"><span>Estimated Logistics ({numberOfJourneys} journeys)</span> <span>₹{Math.round(logisticsCost).toLocaleString('en-IN')}</span></div>
                           <div className="flex justify-between text-slate-600 pb-1 border-b border-slate-100"><span>GST (18%)</span> <span>₹{Math.round(taxAmount).toLocaleString('en-IN')}</span></div>
                       </div>
                    </div>
                    
                    <div className="md:w-72 bg-gradient-to-br from-slate-50 to-slate-100 p-6 rounded-xl border border-slate-200 flex flex-col justify-center shadow-sm">
-                      <h4 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">Total Turnkey Estimate</h4>
+                      <h4 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">Total Proposal Estimate</h4>
                       <div className="text-3xl font-bold text-slate-900 mb-1">₹{Math.round(grandTotal).toLocaleString('en-IN')}</div>
                       <div className="text-sm font-medium text-slate-600 mb-6 pl-1">
                          ≈ ₹{Math.round(grandTotal / area).toLocaleString('en-IN')} / sqm | ₹{Math.round(grandTotal / (area * 10.7639)).toLocaleString('en-IN')} / sq.ft
                       </div>
-                      <div className="text-xs text-slate-500 mb-6">Includes civil foundation works, taxes, and freight.</div>
+                      <div className="text-xs text-slate-500 mb-6">
+                        {proposalSettings.includeCivilInQuote ? 'Includes civil foundation, 18% GST, and freight.' : 'Includes 18% GST and freight. Civil works excluded.'}
+                      </div>
                       <button 
                         className="w-full bg-slate-900 hover:bg-slate-800 text-white py-2.5 rounded-lg text-sm font-medium transition-colors border border-slate-700 shadow-sm"
                         onClick={handleExportPDF}
                       >
-                        Proceed to Contract
+                        Download 9-Page Proposal PDF
                       </button>
                    </div>
                 </div>
 
-                <div className="mt-8 pt-8 border-t border-slate-100">
-                  <h4 className="text-sm font-semibold text-slate-800 uppercase tracking-wider border-b border-slate-100 pb-2 mb-4">Payment Terms Schedule</h4>
-                  <div className="bg-slate-50 border border-slate-200 rounded-lg overflow-hidden">
-                    <table className="w-full text-sm">
-                      <thead className="bg-slate-100/50 text-slate-500 uppercase text-xs">
-                        <tr>
-                          <th className="px-4 py-3 text-left font-medium">Milestone</th>
-                          <th className="px-4 py-3 text-right font-medium">Payment %</th>
-                          <th className="px-4 py-3 text-right font-medium">Amount (Est.)</th>
-                        </tr>
-                      </thead>
-                      <tbody className="divide-y divide-slate-100 text-slate-600">
-                        <tr>
-                          <td className="px-4 py-3">Upon agreement</td>
-                          <td className="px-4 py-3 text-right font-medium text-slate-800">25% Advance</td>
-                          <td className="px-4 py-3 text-right text-slate-800 font-medium">₹{Math.round(grandTotal * 0.25).toLocaleString('en-IN')}</td>
-                        </tr>
-                        <tr className="bg-white">
-                          <td className="px-4 py-3">Prior to the commencement of the primary structure</td>
-                          <td className="px-4 py-3 text-right font-medium text-slate-800">25% Advance</td>
-                          <td className="px-4 py-3 text-right text-slate-800 font-medium">₹{Math.round(grandTotal * 0.25).toLocaleString('en-IN')}</td>
-                        </tr>
-                        <tr>
-                          <td className="px-4 py-3">Before the construction of the supporting structure</td>
-                          <td className="px-4 py-3 text-right font-medium text-slate-800">25% Advance</td>
-                          <td className="px-4 py-3 text-right text-slate-800 font-medium">₹{Math.round(grandTotal * 0.25).toLocaleString('en-IN')}</td>
-                        </tr>
-                        <tr className="bg-white">
-                          <td className="px-4 py-3">Before the initiation of roofing or walling</td>
-                          <td className="px-4 py-3 text-right font-medium text-slate-800">25% Advance</td>
-                          <td className="px-4 py-3 text-right text-slate-800 font-medium">₹{Math.round(grandTotal * 0.25).toLocaleString('en-IN')}</td>
-                        </tr>
-                      </tbody>
-                    </table>
-                  </div>
-                </div>
-
-                <div className="mt-8 pt-8 border-t border-slate-100">
-                  <h4 className="text-sm font-semibold text-slate-800 uppercase tracking-wider border-b border-slate-100 pb-2 mb-4">Terms and Conditions</h4>
-                  <ul className="list-disc pl-5 space-y-2 text-sm text-slate-600">
-                    <li>A tolerance of ±1% is acceptable on dimensions, weights, and positioning.</li>
-                    <li>Pricing is subject to standard manufacturing tolerances and fluctuations.</li>
-                    <li>All estimates are provisional and subject to final, certified engineering calculations.</li>
-                    <li>The client bears full responsibility for preliminary soil analysis and securing necessary local permits.</li>
-                    <li>Pre-Engineered Building (PEB) design conforms strictly to ASCE standard specifications.</li>
-                    <li>Delays caused by force majeure, severe weather, or unforeseen logistical issues are excluded from the timeline.</li>
-                  </ul>
-                </div>
+                <ProposalContractSection
+                  settings={proposalSettings}
+                  setSettings={setProposalSettings}
+                  data={proposalComputedData}
+                  onApplySampleShed={() => {
+                    setDimensionUnit('ft');
+                    setProjectName('Factory Shed (127ft × 140ft)');
+                    setSpecs((prev) => ({
+                      ...prev,
+                      width: Number((127 * 0.3048).toFixed(2)),
+                      length: Number((140 * 0.3048).toFixed(2)),
+                      eaveHeight: Number((25 * 0.3048).toFixed(2)),
+                      roofSlope: 10,
+                      roofType: 'Single Slope',
+                      frameType: 'Clear Span',
+                      hasPrimarySteel: true,
+                      hasSecondarySteel: true,
+                      hasGirts: true,
+                      hasRoof: true,
+                      hasWalls: true,
+                      hasRidgeCap: false,
+                      hasGutters: true,
+                      hasGables: true,
+                      hasDownPipes: true,
+                      hasCornerFlashing: true,
+                      hasEndFlashing: true,
+                      hasPolySheets: true,
+                      hasTurboVents: true,
+                      hasSDScrews: true,
+                      hasSilicon: true,
+                      hasFlanges: true,
+                    }));
+                    setProposalSettings((prev) => ({
+                      ...prev,
+                      buildingQuantity: '01',
+                      buildingUsage: 'FACTORY SHED',
+                      canopyCount: 1,
+                      brickWallHeight: 'N/A',
+                      endFramesType: 'Non expandable',
+                    }));
+                  }}
+                />
 
                 {/* Monthly Spending Progression Chart */}
                 <div className="mt-10 pt-8 border-t border-slate-100">

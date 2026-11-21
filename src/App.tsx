@@ -6,8 +6,9 @@
 import React, { useState, useMemo, useEffect, useRef, useCallback } from 'react';
 import { PieChart, Pie, Cell, ResponsiveContainer, Tooltip as RechartsTooltip, Legend, BarChart, Bar, XAxis, YAxis, CartesianGrid, LineChart, Line } from 'recharts';
 import { Canvas, useThree, useFrame } from '@react-three/fiber';
-import { OrbitControls, Environment, ContactShadows, Center, Text, Bounds, useBounds } from '@react-three/drei';
+import { OrbitControls, Text, Bounds, useBounds } from '@react-three/drei';
 import * as THREE from 'three';
+import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import {
   Building,
   Ruler,
@@ -291,23 +292,51 @@ export function getOpeningVerticalPlacement(h: number, girtSpacing: number): {
   return { wy, wh, ly, louverH };
 }
 
-export function calculateLouverAndWindowCounts(specs: ProjectSpecs): { louverCount: number; windowCount: number } {
-  if (specs.hasWalls === false) return { louverCount: 0, windowCount: 0 };
+export interface WallOpeningPlacement {
+  wall: 'Left' | 'Right' | 'Front' | 'Back';
+  type: 'window' | 'louver';
+  colIdx: number;
+  sheetStart: number;
+  sheetWidth: number;
+  centerCoord: number;
+  yCenter: number;
+  height: number;
+  yMin: number;
+  yMax: number;
+  wallHeightAtCol: number;
+  bottomSheetLen: number;
+  topSheetLen: number;
+}
+
+export function getWallOpeningsLayout(specs: ProjectSpecs): WallOpeningPlacement[] {
+  if (specs.hasWalls === false) return [];
 
   const l = specs.length;
   const w = specs.width;
   const h = specs.eaveHeight;
+  if (!l || !w || !h || isNaN(l) || isNaN(w) || isNaN(h) || l <= 0 || w <= 0 || h <= 0) {
+    return [];
+  }
 
   const wPos = specs.windowsPosition || 'Left & Right';
   const lPos = specs.louversPosition || 'Left & Right';
   const hasWindows = specs.hasWindows !== false;
   const hasLouvers = specs.hasLouvers !== false;
-
-  if (!hasWindows && !hasLouvers) return { louverCount: 0, windowCount: 0 };
+  if (!hasWindows && !hasLouvers) return [];
 
   const girtSpacing = specs.highWindVelocity || specs.snowLoad ? 1.0 : 1.5;
-  const { wy, wh } = getOpeningVerticalPlacement(h, girtSpacing);
-  const ww = 1.2;
+  const { wy, wh, ly, louverH } = getOpeningVerticalPlacement(h, girtSpacing);
+  const winYMin = wy - wh / 2;
+  const winYMax = wy + wh / 2;
+  const louverYMin = ly - louverH / 2;
+  const louverYMax = ly + louverH / 2;
+
+  const wallEffWidth = specs.wallProfile === '6v Profile' ? 0.99 : (specs.wallProfile === '7v Profile' ? 1.188 : 1.0);
+  const roofEffWidth = specs.roofProfile === '6v Profile' ? 0.99 : (specs.roofProfile === '7v Profile' ? 1.188 : 1.0);
+
+  const numZSheets = Math.ceil(l / wallEffWidth - 0.001);
+  const numXSheets = Math.ceil(w / wallEffWidth - 0.001);
+  const numRoofSheets = Math.ceil(l / roofEffWidth - 0.001);
 
   const isGateActive = specs.hasProfileGate !== false;
   const gPos = specs.profileGatePosition || 'Front';
@@ -336,123 +365,161 @@ export function calculateLouverAndWindowCounts(specs: ProjectSpecs): { louverCou
     return lPos === wall || lPos === 'Front & Back' || lPos === 'All Sides';
   };
 
-  const { numFrames } = getBaySpacingAndFrames(l, specs.autoOptimize);
-  const frameZPositions: number[] = [];
-  for (let i = 0; i < numFrames; i++) {
-    let zPos = (i / Math.max(1, numFrames - 1)) * l;
-    if (i === 0) zPos = 0.35;
-    else if (i === numFrames - 1) zPos = l - 0.35;
-    frameZPositions.push(zPos);
-  }
-  const numBaysZ = Math.max(1, numFrames - 1);
-
-  const numXBays = specs.frameType === 'Multi-Span' ? 2 : (w >= 12 ? Math.max(1, Math.round(w / 6)) : 1);
-  const colXPositions: number[] = [];
-  colXPositions.push(-w / 2 + 0.35);
-  if (numXBays > 1) {
-    const spanW = (w - 0.70) / numXBays;
-    for (let k = 1; k < numXBays; k++) {
-      colXPositions.push(-w / 2 + 0.35 + k * spanW);
+  const getWallHeightAtX = (xVal: number) => {
+    if (specs.roofType === 'Single Slope') {
+      return h + (xVal + w / 2) * (specs.roofSlope / 100);
+    } else if (specs.roofType === 'Multi-Sloped Hut') {
+      const h_steep = (w / 4) * (specs.roofSlope * 1.5 / 100);
+      const h_shallow = (w / 4) * (specs.roofSlope * 0.5 / 100);
+      const absX = Math.abs(xVal);
+      if (absX >= w / 4) {
+        return h + (w / 2 - absX) * (h_steep / (w / 4));
+      }
+      return h + h_steep + (w / 4 - absX) * (h_shallow / (w / 4));
+    } else if (specs.roofType === 'Curved') {
+      const roofH = (w / 2) * (specs.roofSlope / 100) * 1.5;
+      const t = xVal / w + 0.5;
+      return h + 4 * roofH * (t - t * t);
     }
+    const roofH = (w / 2) * (specs.roofSlope / 100);
+    return h + (w / 2 - Math.abs(xVal)) * (roofH / (w / 2));
+  };
+
+  // Map roof turbo ventilator column centers directly onto vertical wall sheet columns along length
+  const roofVentCols = getTurboVentColIndices(numRoofSheets, l, roofEffWidth, specs.hasPolySheets !== false);
+  const sideColSet = new Set<number>();
+  for (const vIdx of roofVentCols) {
+    const ventZ = (vIdx + 0.5) * roofEffWidth;
+    let wallCol = Math.floor(ventZ / wallEffWidth);
+    if (numZSheets >= 3) {
+      wallCol = Math.max(1, Math.min(numZSheets - 2, wallCol));
+    } else {
+      wallCol = Math.max(0, Math.min(numZSheets - 1, wallCol));
+    }
+    sideColSet.add(wallCol);
   }
-  colXPositions.push(w / 2 - 0.35);
+  const sideBaseCols = Array.from(sideColSet).sort((a, b) => a - b);
 
-  let lCount = 0;
-  let wCount = 0;
+  // Follow the same turbo-ventilator sheet-column placement rule along endwall width
+  const endBaseCols = Array.from(
+    new Set(
+      getTurboVentColIndices(numXSheets, w, wallEffWidth, specs.hasPolySheets !== false).map((col) =>
+        numXSheets >= 3 ? Math.max(1, Math.min(numXSheets - 2, col)) : Math.max(0, Math.min(numXSheets - 1, col))
+      )
+    )
+  ).sort((a, b) => a - b);
 
-  // Sides (Left & Right)
-  for (let bay = 0; bay < numBaysZ; bay++) {
-    const zStart = frameZPositions[bay];
-    const zEnd = frameZPositions[bay + 1];
-    const vz = (zStart + zEnd) / 2;
+  const openings: WallOpeningPlacement[] = [];
 
-    // Left Wall
-    const inLeftGate = isLeftGate && wy <= gH + wh / 2 && vz >= l / 2 - gW / 2 - ww / 2 && vz <= l / 2 + gW / 2 + ww / 2;
-    if (!inLeftGate) {
-      const wLeft = isWindowOnWall('Left');
-      const lLeft = isLouverOnWall('Left');
-      if (wLeft && lLeft) {
-        if (numBaysZ === 1 && (zEnd - zStart) >= 4) {
-          wCount++;
-          lCount++;
-        } else {
-          if (bay % 2 === 0) wCount++;
-          else lCount++;
-        }
-      } else if (wLeft) {
-        wCount++;
-      } else if (lLeft) {
-        lCount++;
+  const populateWall = (
+    wall: 'Left' | 'Right' | 'Front' | 'Back',
+    baseCols: number[],
+    numSheets: number,
+    isSideWall: boolean,
+    hasGate: boolean,
+    gateStart: number,
+    gateEnd: number
+  ) => {
+    const wOn = isWindowOnWall(wall);
+    const lOn = isLouverOnWall(wall);
+    if (!wOn && !lOn) return;
+
+    const getSheetSpan = (colIdx: number) => {
+      const isLast = colIdx === numSheets - 1;
+      const spanLen = isSideWall ? l : w;
+      const sheetWidth = isLast ? Math.max(0.05, spanLen - (numSheets - 1) * wallEffWidth) : wallEffWidth;
+      const sheetStart = isSideWall ? colIdx * wallEffWidth : -w / 2 + colIdx * wallEffWidth;
+      const centerCoord = sheetStart + sheetWidth / 2;
+      return { sheetStart, sheetWidth, centerCoord };
+    };
+
+    const overlapsGate = (colIdx: number, openingYMin: number) => {
+      if (!hasGate || openingYMin > gH) return false;
+      const { sheetStart, sheetWidth } = getSheetSpan(colIdx);
+      return sheetStart < gateEnd && (sheetStart + sheetWidth) > gateStart;
+    };
+
+    const candidateCols = [...baseCols];
+    // If both windows and louvers are enabled on this wall but only 1 turbo-vent column fits, add a second interior column when space permits
+    if (wOn && lOn && candidateCols.length === 1 && numSheets >= 4) {
+      const existing = candidateCols[0];
+      const altCol = existing + 2 <= numSheets - 2
+        ? existing + 2
+        : existing - 2 >= 1
+        ? existing - 2
+        : existing + 1 <= numSheets - 2
+        ? existing + 1
+        : Math.max(1, existing - 1);
+      if (altCol !== existing) {
+        candidateCols.push(altCol);
+        candidateCols.sort((a, b) => a - b);
       }
     }
 
-    // Right Wall
-    const inRightGate = isRightGate && wy <= gH + wh / 2 && vz >= l / 2 - gW / 2 - ww / 2 && vz <= l / 2 + gW / 2 + ww / 2;
-    if (!inRightGate) {
-      const wRight = isWindowOnWall('Right');
-      const lRight = isLouverOnWall('Right');
-      if (wRight && lRight) {
-        if (numBaysZ === 1 && (zEnd - zStart) >= 4) {
-          lCount++;
-          wCount++;
-        } else {
-          if (bay % 2 === 0) lCount++;
-          else wCount++;
-        }
-      } else if (wRight) {
-        wCount++;
-      } else if (lRight) {
-        lCount++;
+    const startWithWindow = wall === 'Left' || wall === 'Front';
+
+    candidateCols.forEach((colIdx, idx) => {
+      let type: 'window' | 'louver';
+      if (wOn && lOn) {
+        type = (idx % 2 === 0) ? (startWithWindow ? 'window' : 'louver') : (startWithWindow ? 'louver' : 'window');
+      } else if (wOn) {
+        type = 'window';
+      } else {
+        type = 'louver';
       }
-    }
+
+      const yCenter = type === 'window' ? wy : ly;
+      const height = type === 'window' ? wh : louverH;
+      const yMin = type === 'window' ? winYMin : louverYMin;
+      const yMax = type === 'window' ? winYMax : louverYMax;
+
+      if (overlapsGate(colIdx, yMin)) return;
+
+      const { sheetStart, sheetWidth, centerCoord } = getSheetSpan(colIdx);
+      const wallHeightAtCol = wall === 'Left'
+        ? h
+        : wall === 'Right'
+        ? (specs.roofType === 'Single Slope' ? h + w * (specs.roofSlope / 100) : h)
+        : getWallHeightAtX(centerCoord);
+
+      const bottomSheetLen = Math.max(0, yMin);
+      const topSheetLen = Math.max(0, wallHeightAtCol - yMax);
+
+      openings.push({
+        wall,
+        type,
+        colIdx,
+        sheetStart,
+        sheetWidth,
+        centerCoord,
+        yCenter,
+        height,
+        yMin,
+        yMax,
+        wallHeightAtCol,
+        bottomSheetLen,
+        topSheetLen,
+      });
+    });
+  };
+
+  populateWall('Left', sideBaseCols, numZSheets, true, isLeftGate, l / 2 - gW / 2, l / 2 + gW / 2);
+  populateWall('Right', sideBaseCols, numZSheets, true, isRightGate, l / 2 - gW / 2, l / 2 + gW / 2);
+  populateWall('Front', endBaseCols, numXSheets, false, isFrontGate, -gW / 2, gW / 2);
+  populateWall('Back', endBaseCols, numXSheets, false, isBackGate, -gW / 2, gW / 2);
+
+  return openings;
+}
+
+export function calculateLouverAndWindowCounts(specs: ProjectSpecs): { louverCount: number; windowCount: number } {
+  const openings = getWallOpeningsLayout(specs);
+  let louverCount = 0;
+  let windowCount = 0;
+  for (const o of openings) {
+    if (o.type === 'louver') louverCount++;
+    else windowCount++;
   }
-
-  // Front / Back
-  for (let bayX = 0; bayX < colXPositions.length - 1; bayX++) {
-    const vx = (colXPositions[bayX] + colXPositions[bayX + 1]) / 2;
-
-    // Front Wall
-    const inFrontGate = isFrontGate && wy <= gH + wh / 2 && vx >= -gW / 2 - ww / 2 && vx <= gW / 2 + ww / 2;
-    if (!inFrontGate) {
-      const wFront = isWindowOnWall('Front');
-      const lFront = isLouverOnWall('Front');
-      if (wFront && lFront) {
-        if (numXBays === 1 && (colXPositions[1] - colXPositions[0]) >= 4) {
-          wCount++;
-          lCount++;
-        } else {
-          if (bayX % 2 === 0) wCount++;
-          else lCount++;
-        }
-      } else if (wFront) {
-        wCount++;
-      } else if (lFront) {
-        lCount++;
-      }
-    }
-
-    // Back Wall
-    const inBackGate = isBackGate && wy <= gH + wh / 2 && vx >= -gW / 2 - ww / 2 && vx <= gW / 2 + ww / 2;
-    if (!inBackGate) {
-      const wBack = isWindowOnWall('Back');
-      const lBack = isLouverOnWall('Back');
-      if (wBack && lBack) {
-        if (numXBays === 1 && (colXPositions[1] - colXPositions[0]) >= 4) {
-          lCount++;
-          wCount++;
-        } else {
-          if (bayX % 2 === 0) lCount++;
-          else wCount++;
-        }
-      } else if (wBack) {
-        wCount++;
-      } else if (lBack) {
-        lCount++;
-      }
-    }
-  }
-
-  return { louverCount: lCount, windowCount: wCount };
+  return { louverCount, windowCount };
 }
 
 export function calculateSDScrews(specs: ProjectSpecs, type: 'roof' | 'wall' | 'all' = 'all'): number {
@@ -1754,6 +1821,39 @@ function useBubbleInsulationTexture() {
   return useMemo(() => getBubbleInsulationTexture(), []);
 }
 
+let cachedBubbleInsulationMaterial: THREE.MeshStandardMaterial | null = null;
+function getBubbleInsulationMaterial(): THREE.MeshStandardMaterial {
+  if (cachedBubbleInsulationMaterial) return cachedBubbleInsulationMaterial;
+  const tex = getBubbleInsulationTexture();
+  cachedBubbleInsulationMaterial = new THREE.MeshStandardMaterial({
+    color: '#f8fafc',
+    metalness: 0.88,
+    roughness: 0.18,
+    map: tex,
+    bumpMap: tex,
+    bumpScale: 0.03,
+    side: THREE.DoubleSide,
+    envMapIntensity: 1.5,
+  });
+  return cachedBubbleInsulationMaterial;
+}
+
+const wallPanelMaterialCache = new Map<string, THREE.MeshStandardMaterial>();
+function getWallPanelMaterial(colorHex: string): THREE.MeshStandardMaterial {
+  let mat = wallPanelMaterialCache.get(colorHex);
+  if (!mat) {
+    mat = new THREE.MeshStandardMaterial({
+      color: colorHex,
+      metalness: 0.6,
+      roughness: 0.3,
+      envMapIntensity: 1.2,
+      side: THREE.DoubleSide,
+    });
+    wallPanelMaterialCache.set(colorHex, mat);
+  }
+  return mat;
+}
+
 function WallSubSheetComponent({
   sub,
   idx,
@@ -1876,23 +1976,19 @@ function WallSubSheetComponent({
     return shape;
   }, [hasSlope, sub.xStart, sub.yEnd, sub.yStart, startX, wSub, hSub, specs.width, specs.eaveHeight, specs.roofSlope, specs.roofType, specs.frameType]);
 
+  const resolvedWallColor = getPanelColor(panelKey, color, 'wall', specs, panelColors);
+  const wallPanelMat = useMemo(() => getWallPanelMaterial(resolvedWallColor), [resolvedWallColor]);
+  const bubbleInsulationMat = useMemo(() => getBubbleInsulationMaterial(), []);
+
   return (
     <group key={idx} position={[sub.xStart, sub.yStart, 0]}>
       <mesh
         receiveShadow
-        castShadow
         rotation={[-Math.PI / 2, 0, 0]}
         geometry={geometry}
+        material={wallPanelMat}
         onClick={(e) => handlePanelClick(e, panelKey, color, 'wall')}
-      >
-        <meshStandardMaterial
-          color={getPanelColor(panelKey, color, 'wall', specs, panelColors)}
-          metalness={0.6}
-          roughness={0.3}
-          envMapIntensity={1.2}
-          side={THREE.DoubleSide}
-        />
-      </mesh>
+      />
 
       {/* Air Bubble Insulation Layer within Wall Structure */}
       {specs.hasInsulation !== false && (
@@ -1901,18 +1997,9 @@ function WallSubSheetComponent({
           rotation={invertY ? [0, Math.PI, 0] : [0, 0, 0]}
           scale={invertY ? [-1, 1, 1] : [1, 1, 1]}
           receiveShadow
+          material={bubbleInsulationMat}
         >
           <shapeGeometry args={[insulationShape]} />
-          <meshStandardMaterial
-            color="#f8fafc"
-            metalness={0.88}
-            roughness={0.18}
-            map={bubbleTex}
-            bumpMap={bubbleTex}
-            bumpScale={0.03}
-            side={THREE.DoubleSide}
-            envMapIntensity={1.5}
-          />
         </mesh>
       )}
     </group>
@@ -2386,34 +2473,7 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
     }
     colXPositions.push(w / 2 - 0.35);
 
-    const girtSpacing = specs.highWindVelocity || specs.snowLoad ? 1.0 : 1.5;
-    const { wy, wh, ly, louverH } = getOpeningVerticalPlacement(h, girtSpacing);
-    const louverYMin = ly - louverH / 2;
-    const louverYMax = ly + louverH / 2;
-    const louverPos = specs.louversPosition || 'Left & Right';
-    const hasLouvers = specs.hasLouvers !== false;
-
-    const ww = 1.2;
-    const winYMin = wy - wh / 2;
-    const winYMax = wy + wh / 2;
-    const windowPos = specs.windowsPosition || 'Left & Right';
-    const hasWindows = specs.hasWindows !== false;
-
-    const isWindowOnWall = (wall: 'Left' | 'Right' | 'Front' | 'Back') => {
-      if (!hasWindows) return false;
-      if (wall === 'Left' || wall === 'Right') {
-        return windowPos === wall || windowPos === 'Left & Right' || windowPos === 'All Sides';
-      }
-      return windowPos === wall || windowPos === 'Front & Back' || windowPos === 'All Sides';
-    };
-
-    const isLouverOnWall = (wall: 'Left' | 'Right' | 'Front' | 'Back') => {
-      if (!hasLouvers) return false;
-      if (wall === 'Left' || wall === 'Right') {
-        return louverPos === wall || louverPos === 'Left & Right' || louverPos === 'All Sides';
-      }
-      return louverPos === wall || louverPos === 'Front & Back' || louverPos === 'All Sides';
-    };
+    const wallOpeningsLayout = getWallOpeningsLayout(specs);
 
     const gateW = Math.min(4, l * 0.6);
     const gateWFront = Math.min(4, w * 0.6);
@@ -2445,124 +2505,14 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
           cutEndZ = Math.min(wSheet - overlapGap, gateEndZ - zStartX);
       }
 
-      // Calculate Left Cutouts (Louvers & Windows) for this sheet
-      const leftCutouts: { xMin: number; xMax: number; yMin: number; yMax: number }[] = [];
-      // Calculate Right Cutouts (Louvers & Windows) for this sheet
-      const rightCutouts: { xMin: number; xMax: number; yMin: number; yMax: number }[] = [];
+      // Sheet-aligned cutouts: openings occupy the full width [0, wSheet] of their assigned vertical sheet column
+      const leftCutouts: { xMin: number; xMax: number; yMin: number; yMax: number }[] = wallOpeningsLayout
+        .filter((o) => o.wall === 'Left' && o.colIdx === i)
+        .map((o) => ({ xMin: 0, xMax: wSheet - overlapGap, yMin: o.yMin, yMax: o.yMax }));
 
-      for (let bay = 0; bay < numBaysZ; bay++) {
-        const zStart = frameZPositions[bay];
-        const zEnd = frameZPositions[bay + 1];
-        const vz = (zStart + zEnd) / 2;
-
-        // Left Wall Cutouts
-        const wLeft = isWindowOnWall('Left');
-        const lLeft = isLouverOnWall('Left');
-
-        const addLeftWindow = (cz: number) => {
-          const inGate = isLeftGate && winYMin <= gateH && cz >= l / 2 - gateW / 2 - 0.8 && cz <= l / 2 + gateW / 2 + 0.8;
-          if (!inGate) {
-            const zMin = cz - ww / 2;
-            const zMax = cz + ww / 2;
-            if (zMax > zStartX && zMin < zEndX) {
-              leftCutouts.push({
-                xMin: Math.max(0, zMin - zStartX),
-                xMax: Math.min(wSheet - overlapGap, zMax - zStartX),
-                yMin: winYMin,
-                yMax: winYMax
-              });
-            }
-          }
-        };
-
-        const addLeftLouver = (cz: number) => {
-          const inGate = isLeftGate && louverYMin <= gateH && cz >= l / 2 - gateW / 2 - 0.8 && cz <= l / 2 + gateW / 2 + 0.8;
-          if (!inGate) {
-            const zMin = cz - 0.65;
-            const zMax = cz + 0.65;
-            if (zMax > zStartX && zMin < zEndX) {
-              leftCutouts.push({
-                xMin: Math.max(0, zMin - zStartX),
-                xMax: Math.min(wSheet - overlapGap, zMax - zStartX),
-                yMin: louverYMin,
-                yMax: louverYMax
-              });
-            }
-          }
-        };
-
-        if (wLeft && lLeft) {
-          if (numBaysZ === 1 && (zEnd - zStart) >= 4) {
-            addLeftWindow(vz - 1.0);
-            addLeftLouver(vz + 1.0);
-          } else {
-            const winZ = (bay === numBaysZ - 1 && numBaysZ > 1) ? vz - 0.15 : vz;
-            if (bay % 2 === 0) addLeftWindow(winZ);
-            else addLeftLouver(vz);
-          }
-        } else if (wLeft) {
-          const winZ = (bay === numBaysZ - 1 && numBaysZ > 1) ? vz - 0.15 : vz;
-          addLeftWindow(winZ);
-        } else if (lLeft) {
-          addLeftLouver(vz);
-        }
-
-        // Right Wall Cutouts
-        const wRight = isWindowOnWall('Right');
-        const lRight = isLouverOnWall('Right');
-
-        const addRightWindow = (cz: number) => {
-          const inGate = isRightGate && winYMin <= gateH && cz >= l / 2 - gateW / 2 - 0.8 && cz <= l / 2 + gateW / 2 + 0.8;
-          if (!inGate) {
-            const zMin = cz - ww / 2;
-            const zMax = cz + ww / 2;
-            if (zMax > zStartX && zMin < zEndX) {
-              const x1 = zEndX - zMax;
-              const x2 = zEndX - zMin;
-              rightCutouts.push({
-                xMin: Math.max(0, Math.min(x1, x2)),
-                xMax: Math.min(wSheet - overlapGap, Math.max(x1, x2)),
-                yMin: winYMin,
-                yMax: winYMax
-              });
-            }
-          }
-        };
-
-        const addRightLouver = (cz: number) => {
-          const inGate = isRightGate && louverYMin <= gateH && cz >= l / 2 - gateW / 2 - 0.8 && cz <= l / 2 + gateW / 2 + 0.8;
-          if (!inGate) {
-            const zMin = cz - 0.65;
-            const zMax = cz + 0.65;
-            if (zMax > zStartX && zMin < zEndX) {
-              const x1 = zEndX - zMax;
-              const x2 = zEndX - zMin;
-              rightCutouts.push({
-                xMin: Math.max(0, Math.min(x1, x2)),
-                xMax: Math.min(wSheet - overlapGap, Math.max(x1, x2)),
-                yMin: louverYMin,
-                yMax: louverYMax
-              });
-            }
-          }
-        };
-
-        if (wRight && lRight) {
-          if (numBaysZ === 1 && (zEnd - zStart) >= 4) {
-            addRightLouver(vz - 1.0);
-            addRightWindow(vz + 0.8);
-          } else {
-            const winZ = (bay === numBaysZ - 1 && numBaysZ > 1) ? vz - 0.15 : vz;
-            if (bay % 2 === 0) addRightLouver(vz);
-            else addRightWindow(winZ);
-          }
-        } else if (wRight) {
-          const winZ = (bay === numBaysZ - 1 && numBaysZ > 1) ? vz - 0.15 : vz;
-          addRightWindow(winZ);
-        } else if (lRight) {
-          addRightLouver(vz);
-        }
-      }
+      const rightCutouts: { xMin: number; xMax: number; yMin: number; yMax: number }[] = wallOpeningsLayout
+        .filter((o) => o.wall === 'Right' && o.colIdx === i)
+        .map((o) => ({ xMin: 0, xMax: wSheet - overlapGap, yMin: o.yMin, yMax: o.yMax }));
 
       const keyLeft = `wall_l_${i}`;
       const segmentsLeft = Math.ceil(heightLeft / 6);
@@ -2663,10 +2613,14 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
           }
       }
 
-      // Calculate Front Cutouts (Louvers & Windows) for this sheet
-      const frontCutouts: { xMin: number; xMax: number; yMin: number; yMax: number }[] = [];
-      // Calculate Back Cutouts (Louvers & Windows) for this sheet
-      const backCutouts: { xMin: number; xMax: number; yMin: number; yMax: number }[] = [];
+      // Sheet-aligned cutouts on Front & Back endwalls: openings occupy the full width [0, wShape] of their assigned vertical sheet column
+      const frontCutouts: { xMin: number; xMax: number; yMin: number; yMax: number }[] = wallOpeningsLayout
+        .filter((o) => o.wall === 'Front' && o.colIdx === i)
+        .map((o) => ({ xMin: 0, xMax: wShape, yMin: o.yMin, yMax: o.yMax }));
+
+      const backCutouts: { xMin: number; xMax: number; yMin: number; yMax: number }[] = wallOpeningsLayout
+        .filter((o) => o.wall === 'Back' && o.colIdx === i)
+        .map((o) => ({ xMin: 0, xMax: wShape, yMin: o.yMin, yMax: o.yMax }));
 
       let cutStartXBack = -1;
       let cutEndXBack = -1;
@@ -2680,114 +2634,6 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
               cutStartXBack = Math.max(0, gateStartX - startX);
               cutEndXBack = Math.min(wShape, gateEndX - startX);
           }
-      }
-
-      for (let bayX = 0; bayX < colXPositions.length - 1; bayX++) {
-        const vx = (colXPositions[bayX] + colXPositions[bayX + 1]) / 2;
-
-        // Front Wall Cutouts
-        const wFront = isWindowOnWall('Front');
-        const lFront = isLouverOnWall('Front');
-
-        const addFrontWindow = (cx: number) => {
-          const inGate = isFrontGate && winYMin <= gateH && cx >= -gateWFront / 2 - 0.8 && cx <= gateWFront / 2 + 0.8;
-          if (!inGate) {
-            const xMinVal = cx - ww / 2;
-            const xMaxVal = cx + ww / 2;
-            if (xMaxVal > startX && xMinVal < endX) {
-              frontCutouts.push({
-                xMin: Math.max(0, xMinVal - startX),
-                xMax: Math.min(wShape, xMaxVal - startX),
-                yMin: winYMin,
-                yMax: winYMax
-              });
-            }
-          }
-        };
-
-        const addFrontLouver = (cx: number) => {
-          const inGate = isFrontGate && louverYMin <= gateH && cx >= -gateWFront / 2 - 0.8 && cx <= gateWFront / 2 + 0.8;
-          if (!inGate) {
-            const xMinVal = cx - 0.65;
-            const xMaxVal = cx + 0.65;
-            if (xMaxVal > startX && xMinVal < endX) {
-              frontCutouts.push({
-                xMin: Math.max(0, xMinVal - startX),
-                xMax: Math.min(wShape, xMaxVal - startX),
-                yMin: louverYMin,
-                yMax: louverYMax
-              });
-            }
-          }
-        };
-
-        if (wFront && lFront) {
-          if (numXBays === 1 && (colXPositions[1] - colXPositions[0]) >= 4) {
-            addFrontWindow(vx - 1.0);
-            addFrontLouver(vx + 1.0);
-          } else {
-            const winX = (bayX === colXPositions.length - 2 && numXBays > 1) ? vx - 0.15 : vx;
-            if (bayX % 2 === 0) addFrontWindow(winX);
-            else addFrontLouver(vx);
-          }
-        } else if (wFront) {
-          const winX = (bayX === colXPositions.length - 2 && numXBays > 1) ? vx - 0.15 : vx;
-          addFrontWindow(winX);
-        } else if (lFront) {
-          addFrontLouver(vx);
-        }
-
-        // Back Wall Cutouts
-        const wBack = isWindowOnWall('Back');
-        const lBack = isLouverOnWall('Back');
-
-        const addBackWindow = (cx: number) => {
-          const inGate = isBackGate && winYMin <= gateHBack && cx >= -gateWFront / 2 - 0.8 && cx <= gateWFront / 2 + 0.8;
-          if (!inGate) {
-            const xMinVal = cx - ww / 2;
-            const xMaxVal = cx + ww / 2;
-            if (xMaxVal > startX && xMinVal < endX) {
-              backCutouts.push({
-                xMin: Math.max(0, xMinVal - startX),
-                xMax: Math.min(wShape, xMaxVal - startX),
-                yMin: winYMin,
-                yMax: winYMax
-              });
-            }
-          }
-        };
-
-        const addBackLouver = (cx: number) => {
-          const inGate = isBackGate && louverYMin <= gateHBack && cx >= -gateWFront / 2 - 0.8 && cx <= gateWFront / 2 + 0.8;
-          if (!inGate) {
-            const xMinVal = cx - 0.65;
-            const xMaxVal = cx + 0.65;
-            if (xMaxVal > startX && xMinVal < endX) {
-              backCutouts.push({
-                xMin: Math.max(0, xMinVal - startX),
-                xMax: Math.min(wShape, xMaxVal - startX),
-                yMin: louverYMin,
-                yMax: louverYMax
-              });
-            }
-          }
-        };
-
-        if (wBack && lBack) {
-          if (numXBays === 1 && (colXPositions[1] - colXPositions[0]) >= 4) {
-            addBackLouver(vx - 1.0);
-            addBackWindow(vx + 0.8);
-          } else {
-            const winX = (bayX === colXPositions.length - 2 && numXBays > 1) ? vx - 0.15 : vx;
-            if (bayX % 2 === 0) addBackLouver(vx);
-            else addBackWindow(winX);
-          }
-        } else if (wBack) {
-          const winX = (bayX === colXPositions.length - 2 && numXBays > 1) ? vx - 0.15 : vx;
-          addBackWindow(winX);
-        } else if (lBack) {
-          addBackLouver(vx);
-        }
       }
 
       const maxHFront = Math.max(getWallTopY(startX), getWallTopY(startX + wShape));
@@ -4294,17 +4140,9 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
   }
 
   if (specs.hasWalls !== false && (specs.hasWindows !== false || specs.hasLouvers !== false || specs.hasProfileGate !== false)) {
-    const wPos = specs.windowsPosition || 'Left & Right';
-    const lPos = specs.louversPosition || 'Left & Right';
-    const hasWindows = specs.hasWindows !== false;
-    const hasLouvers = specs.hasLouvers !== false;
-
-    const girtSpacing = specs.highWindVelocity || specs.snowLoad ? 1.0 : 1.5;
-    const { wy, wh, ly, louverH } = getOpeningVerticalPlacement(h, girtSpacing);
-    const ww = 1.2;
     const awningRadius = 0.35;
 
-    // Gate collision checking variables
+    // Gate variables
     const isGateActive = specs.hasProfileGate !== false;
     const gPos = specs.profileGatePosition || 'Front';
     const isFrontOrBackGate = gPos === 'Front' || gPos === 'Back';
@@ -4316,44 +4154,30 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
     const isFrontGate = isGateActive && gPos === 'Front';
     const isBackGate = isGateActive && gPos === 'Back';
 
-    const isWindowOnWall = (wall: 'Left' | 'Right' | 'Front' | 'Back') => {
-      if (!hasWindows) return false;
-      if (wall === 'Left' || wall === 'Right') {
-        return wPos === wall || wPos === 'Left & Right' || wPos === 'All Sides';
-      }
-      return wPos === wall || wPos === 'Front & Back' || wPos === 'All Sides';
-    };
-
-    const isLouverOnWall = (wall: 'Left' | 'Right' | 'Front' | 'Back') => {
-      if (!hasLouvers) return false;
-      if (wall === 'Left' || wall === 'Right') {
-        return lPos === wall || lPos === 'Left & Right' || lPos === 'All Sides';
-      }
-      return lPos === wall || lPos === 'Front & Back' || lPos === 'All Sides';
-    };
-
-    const renderWindow = (keyStr: string, px: number, py: number, pz: number, rotY: number, side: 'Left' | 'Right' | 'Front' | 'Back') => {
+    const renderWindow = (keyStr: string, px: number, py: number, pz: number, rotY: number, openingW: number, openingH: number) => {
+      const glassW = Math.max(0.2, openingW - 0.06);
+      const canopyW = openingW + 0.04;
       ancillaryElements.push(
         <group key={keyStr} position={[px, py, pz]} rotation={[0, rotY, 0]}>
-          {/* Glass plane */}
+          {/* Glass plane flush inside single vertical sheet width */}
           <mesh receiveShadow position={[0, 0, 0]}>
-            <planeGeometry args={[ww, wh]} />
+            <planeGeometry args={[glassW, openingH]} />
             <meshStandardMaterial color="#87CEEB" roughness={0.1} metalness={0.8} transparent opacity={0.7} side={THREE.DoubleSide} />
           </mesh>
-          {/* Outer Frame */}
+          {/* Outer Frame matching exact sheet width */}
           <mesh position={[0, 0, 0]}>
-            <boxGeometry args={[ww + 0.08, wh + 0.08, 0.03]} />
+            <boxGeometry args={[openingW, openingH + 0.06, 0.03]} />
             <meshStandardMaterial color="#334155" roughness={0.5} metalness={0.8} />
           </mesh>
           {/* Crimped Sheet Awning Canopy */}
           {specs.hasCrimpedSheets !== false && (
-            <group position={[0, wh / 2 + 0.05 - awningRadius, 0]}>
+            <group position={[0, openingH / 2 + 0.05 - awningRadius, 0]}>
               <mesh receiveShadow rotation={[0, 0, Math.PI / 2]}>
-                <cylinderGeometry args={[awningRadius, awningRadius, ww + 0.3, 32, 1, true, 0, Math.PI / 2]} />
+                <cylinderGeometry args={[awningRadius, awningRadius, canopyW, 24, 1, true, 0, Math.PI / 2]} />
                 <meshStandardMaterial color={specs.crimpedSheetsColor || specs.roofColor || '#0089b6'} side={THREE.DoubleSide} roughness={0.3} />
               </mesh>
               {/* Structural End Brackets */}
-              {[- (ww + 0.26) / 2, (ww + 0.26) / 2].map((bx, idx) => (
+              {[-openingW / 2 + 0.02, openingW / 2 - 0.02].map((bx, idx) => (
                 <group key={idx} position={[bx, 0, 0]}>
                   <mesh position={[0, awningRadius / 2, 0.01]}>
                     <boxGeometry args={[0.02, awningRadius, 0.02]} />
@@ -4371,15 +4195,15 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
       );
     };
 
-    const renderLouver = (keyStr: string, px: number, py: number, pz: number, rotY: number) => {
+    const renderLouver = (keyStr: string, px: number, py: number, pz: number, rotY: number, openingW: number, openingH: number) => {
       ancillaryElements.push(
         <PolycarbonateLouver
           key={keyStr}
           keyStr={keyStr}
           position={[px, py, pz]}
           rotation={[0, rotY, 0]}
-          width={1.3}
-          height={louverH}
+          width={openingW}
+          height={openingH}
           wallProfile={specs.wallProfile || '7v Profile'}
           specs={specs}
         />
@@ -4488,128 +4312,36 @@ function Building3DModel({ specs, panelColors, setPanelColors, framingOnly = fal
       );
     };
 
-    // Calculate column Z positions along building length to position windows/louvers directly in each bay row
-    const { numFrames } = getBaySpacingAndFrames(l, specs.autoOptimize);
-    const frameZPositions: number[] = [];
-    for (let i = 0; i < numFrames; i++) {
-      let zPos = (i / Math.max(1, numFrames - 1)) * l;
-      if (i === 0) zPos = 0.35;
-      else if (i === numFrames - 1) zPos = l - 0.35;
-      frameZPositions.push(zPos);
-    }
-    const numBaysZ = Math.max(1, numFrames - 1);
-
-    // Calculate column X positions along building width for endwalls
-    const numXBays = specs.frameType === 'Multi-Span' ? 2 : (w >= 12 ? Math.max(1, Math.round(w / 6)) : 1);
-    const colXPositions: number[] = [];
-    colXPositions.push(-w / 2 + 0.35);
-    if (numXBays > 1) {
-      const spanW = (w - 0.70) / numXBays;
-      for (let k = 1; k < numXBays; k++) {
-        colXPositions.push(-w / 2 + 0.35 + k * spanW);
-      }
-    }
-    colXPositions.push(w / 2 - 0.35);
-
-    // Sides (Left & Right)
-    for (let bay = 0; bay < numBaysZ; bay++) {
-      const zStart = frameZPositions[bay];
-      const zEnd = frameZPositions[bay + 1];
-      const vz = (zStart + zEnd) / 2;
-
-      // Left Wall
-      const inLeftGate = isLeftGate && wy <= gH + wh / 2 && vz >= l / 2 - gW / 2 - ww / 2 && vz <= l / 2 + gW / 2 + ww / 2;
-      if (!inLeftGate) {
-        const wLeft = isWindowOnWall('Left');
-        const lLeft = isLouverOnWall('Left');
-        if (wLeft && lLeft) {
-          if (numBaysZ === 1 && (zEnd - zStart) >= 4) {
-            renderWindow('window_L_0_a', -w / 2 - 0.01, wy, vz - 1.0, -Math.PI / 2, 'Left');
-            renderLouver('louver_L_0_b', -w / 2 - 0.011, ly, vz + 1.0, -Math.PI / 2);
-          } else {
-            const winZ = (bay === numBaysZ - 1 && numBaysZ > 1) ? vz - 0.15 : vz;
-            if (bay % 2 === 0) renderWindow(`window_L_${bay}`, -w / 2 - 0.01, wy, winZ, -Math.PI / 2, 'Left');
-            else renderLouver(`louver_L_${bay}`, -w / 2 - 0.011, ly, vz, -Math.PI / 2);
-          }
-        } else if (wLeft) {
-          const winZ = (bay === numBaysZ - 1 && numBaysZ > 1) ? vz - 0.15 : vz;
-          renderWindow(`window_L_${bay}`, -w / 2 - 0.01, wy, winZ, -Math.PI / 2, 'Left');
-        } else if (lLeft) {
-          renderLouver(`louver_L_${bay}`, -w / 2 - 0.011, ly, vz, -Math.PI / 2);
+    // Place every window & louver flush within its single turbo-vent-aligned vertical wall sheet column
+    const wallOpenings3D = getWallOpeningsLayout(specs);
+    wallOpenings3D.forEach((o, idx) => {
+      const keyStr = `${o.type}_${o.wall}_${o.colIdx}_${idx}`;
+      if (o.wall === 'Left') {
+        if (o.type === 'window') {
+          renderWindow(keyStr, -w / 2 - 0.01, o.yCenter, o.centerCoord, -Math.PI / 2, o.sheetWidth, o.height);
+        } else {
+          renderLouver(keyStr, -w / 2 - 0.011, o.yCenter, o.centerCoord, -Math.PI / 2, o.sheetWidth, o.height);
+        }
+      } else if (o.wall === 'Right') {
+        if (o.type === 'window') {
+          renderWindow(keyStr, w / 2 + 0.01, o.yCenter, o.centerCoord, Math.PI / 2, o.sheetWidth, o.height);
+        } else {
+          renderLouver(keyStr, w / 2 + 0.011, o.yCenter, o.centerCoord, Math.PI / 2, o.sheetWidth, o.height);
+        }
+      } else if (o.wall === 'Front') {
+        if (o.type === 'window') {
+          renderWindow(keyStr, o.centerCoord, o.yCenter, -0.01, 0, o.sheetWidth, o.height);
+        } else {
+          renderLouver(keyStr, o.centerCoord, o.yCenter, -0.011, Math.PI, o.sheetWidth, o.height);
+        }
+      } else {
+        if (o.type === 'window') {
+          renderWindow(keyStr, o.centerCoord, o.yCenter, l + 0.01, Math.PI, o.sheetWidth, o.height);
+        } else {
+          renderLouver(keyStr, o.centerCoord, o.yCenter, l + 0.011, 0, o.sheetWidth, o.height);
         }
       }
-
-      // Right Wall
-      const inRightGate = isRightGate && wy <= gH + wh / 2 && vz >= l / 2 - gW / 2 - ww / 2 && vz <= l / 2 + gW / 2 + ww / 2;
-      if (!inRightGate) {
-        const wRight = isWindowOnWall('Right');
-        const lRight = isLouverOnWall('Right');
-        if (wRight && lRight) {
-          if (numBaysZ === 1 && (zEnd - zStart) >= 4) {
-            renderLouver('louver_R_0_a', w / 2 + 0.011, ly, vz - 1.0, Math.PI / 2);
-            renderWindow('window_R_0_b', w / 2 + 0.01, wy, vz + 0.8, Math.PI / 2, 'Right');
-          } else {
-            const winZ = (bay === numBaysZ - 1 && numBaysZ > 1) ? vz - 0.15 : vz;
-            if (bay % 2 === 0) renderLouver(`louver_R_${bay}`, w / 2 + 0.011, ly, vz, Math.PI / 2);
-            else renderWindow(`window_R_${bay}`, w / 2 + 0.01, wy, winZ, Math.PI / 2, 'Right');
-          }
-        } else if (wRight) {
-          const winZ = (bay === numBaysZ - 1 && numBaysZ > 1) ? vz - 0.15 : vz;
-          renderWindow(`window_R_${bay}`, w / 2 + 0.01, wy, winZ, Math.PI / 2, 'Right');
-        } else if (lRight) {
-          renderLouver(`louver_R_${bay}`, w / 2 + 0.011, ly, vz, Math.PI / 2);
-        }
-      }
-    }
-
-    // Front / Back
-    for (let bayX = 0; bayX < colXPositions.length - 1; bayX++) {
-      const vx = (colXPositions[bayX] + colXPositions[bayX + 1]) / 2;
-
-      // Front Wall
-      const inFrontGate = isFrontGate && wy <= gH + wh / 2 && vx >= -gW / 2 - ww / 2 && vx <= gW / 2 + ww / 2;
-      if (!inFrontGate) {
-        const wFront = isWindowOnWall('Front');
-        const lFront = isLouverOnWall('Front');
-        if (wFront && lFront) {
-          if (numXBays === 1 && (colXPositions[1] - colXPositions[0]) >= 4) {
-            renderWindow('window_F_0_a', vx - 1.0, wy, -0.01, 0, 'Front');
-            renderLouver('louver_F_0_b', vx + 1.0, ly, -0.011, Math.PI);
-          } else {
-            const winX = (bayX === colXPositions.length - 2 && numXBays > 1) ? vx - 0.15 : vx;
-            if (bayX % 2 === 0) renderWindow(`window_F_${bayX}`, winX, wy, -0.01, 0, 'Front');
-            else renderLouver(`louver_F_${bayX}`, vx, ly, -0.011, Math.PI);
-          }
-        } else if (wFront) {
-          const winX = (bayX === colXPositions.length - 2 && numXBays > 1) ? vx - 0.15 : vx;
-          renderWindow(`window_F_${bayX}`, winX, wy, -0.01, 0, 'Front');
-        } else if (lFront) {
-          renderLouver(`louver_F_${bayX}`, vx, ly, -0.011, Math.PI);
-        }
-      }
-
-      // Back Wall
-      const inBackGate = isBackGate && wy <= gH + wh / 2 && vx >= -gW / 2 - ww / 2 && vx <= gW / 2 + ww / 2;
-      if (!inBackGate) {
-        const wBack = isWindowOnWall('Back');
-        const lBack = isLouverOnWall('Back');
-        if (wBack && lBack) {
-          if (numXBays === 1 && (colXPositions[1] - colXPositions[0]) >= 4) {
-            renderLouver('louver_B_0_a', vx - 1.0, ly, l + 0.011, 0);
-            renderWindow('window_B_0_b', vx + 0.8, wy, l + 0.01, Math.PI, 'Back');
-          } else {
-            const winX = (bayX === colXPositions.length - 2 && numXBays > 1) ? vx - 0.15 : vx;
-            if (bayX % 2 === 0) renderLouver(`louver_B_${bayX}`, vx, ly, l + 0.011, 0);
-            else renderWindow(`window_B_${bayX}`, winX, wy, l + 0.01, Math.PI, 'Back');
-          }
-        } else if (wBack) {
-          const winX = (bayX === colXPositions.length - 2 && numXBays > 1) ? vx - 0.15 : vx;
-          renderWindow(`window_B_${bayX}`, winX, wy, l + 0.01, Math.PI, 'Back');
-        } else if (lBack) {
-          renderLouver(`louver_B_${bayX}`, vx, ly, l + 0.011, 0);
-        }
-      }
-    }
+    });
 
     if (isGateActive) {
       if (isFrontGate) {
@@ -5907,14 +5639,138 @@ function DimensionLine3D({
   );
 }
 
+function StudioEnvironment({ intensity = 1.0 }: { intensity?: number }) {
+  const { gl, scene } = useThree();
+
+  useEffect(() => {
+    let envRT: THREE.WebGLRenderTarget | null = null;
+    const prevEnv = scene.environment;
+    try {
+      const pmremGenerator = new THREE.PMREMGenerator(gl);
+      const roomEnv = new RoomEnvironment();
+      envRT = pmremGenerator.fromScene(roomEnv, 0.04);
+      scene.environment = envRT.texture;
+      if ('environmentIntensity' in scene) {
+        (scene as any).environmentIntensity = intensity;
+      }
+      roomEnv.dispose();
+      pmremGenerator.dispose();
+    } catch {
+      // Gracefully skip IBL if WebGL context is constrained
+    }
+
+    return () => {
+      if (envRT && scene.environment === envRT.texture) {
+        scene.environment = prevEnv;
+      }
+      envRT?.dispose();
+    };
+  }, [gl, scene]);
+
+  useEffect(() => {
+    if ('environmentIntensity' in scene) {
+      (scene as any).environmentIntensity = intensity;
+    }
+  }, [scene, intensity]);
+
+  return null;
+}
+
+let cachedContactShadowTex: THREE.CanvasTexture | null = null;
+function getContactShadowTexture(): THREE.CanvasTexture {
+  if (cachedContactShadowTex) return cachedContactShadowTex;
+  const canvas = document.createElement('canvas');
+  canvas.width = 256;
+  canvas.height = 256;
+  const ctx = canvas.getContext('2d');
+  if (ctx) {
+    const grad = ctx.createRadialGradient(128, 128, 24, 128, 128, 128);
+    grad.addColorStop(0, 'rgba(15, 23, 42, 0.34)');
+    grad.addColorStop(0.55, 'rgba(15, 23, 42, 0.14)');
+    grad.addColorStop(1, 'rgba(15, 23, 42, 0)');
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, 256, 256);
+  }
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  cachedContactShadowTex = tex;
+  return tex;
+}
+
+function GroundContactShadow({ width, length }: { width: number; length: number }) {
+  const shadowTex = useMemo(() => getContactShadowTexture(), []);
+  return (
+    <mesh position={[0, -0.06, 0]} rotation={[-Math.PI / 2, 0, 0]} renderOrder={-1}>
+      <planeGeometry args={[Math.max(width * 1.9, 12), Math.max(length * 1.9, 12)]} />
+      <meshBasicMaterial map={shadowTex} transparent opacity={0.85} depthWrite={false} />
+    </mesh>
+  );
+}
+
+class WebGLErrorBoundary extends React.Component<
+  { children: React.ReactNode; onRetry: () => void },
+  { hasError: boolean }
+> {
+  constructor(props: { children: React.ReactNode; onRetry: () => void }) {
+    super(props);
+    this.state = { hasError: false };
+  }
+
+  static getDerivedStateFromError() {
+    return { hasError: true };
+  }
+
+  componentDidCatch(error: Error) {
+    console.warn('3D WebGL view fallback triggered:', error?.message);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="w-full h-full flex flex-col items-center justify-center p-6 text-center bg-slate-50">
+          <div className="max-w-md bg-white border border-slate-200 rounded-xl shadow-sm p-6 space-y-3">
+            <p className="text-sm font-semibold text-slate-800">3D Graphics Temporarily Paused</p>
+            <p className="text-xs text-slate-600 leading-relaxed">
+              Your browser temporarily blocked WebGL context creation for this tab after a GPU reset. Click Retry below, refresh the browser tab to clear the browser lock, or switch to the 2D Elevation, Top Plan, or Truss views.
+            </p>
+            <button
+              type="button"
+              onClick={() => {
+                this.setState({ hasError: false });
+                this.props.onRetry();
+              }}
+              className="inline-flex items-center justify-center px-4 py-2 text-xs font-semibold rounded-lg bg-slate-900 text-white hover:bg-slate-800 transition-colors"
+            >
+              Retry 3D View
+            </button>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
 function Building3DVisualizer({ specs, dimensionUnit, panelColors, setPanelColors, framingOnly = false, weatherType = 'clear' }: { specs: ProjectSpecs, dimensionUnit: 'm' | 'ft', panelColors: Record<string, string>, setPanelColors: React.Dispatch<React.SetStateAction<Record<string, string>>>, framingOnly?: boolean, weatherType?: string }) {
   const [isInside, setIsInside] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
+  const [contextLost, setContextLost] = useState(false);
+  const [canvasRetryKey, setCanvasRetryKey] = useState(0);
   const containerRef = useRef<HTMLDivElement>(null);
+  const r3fStateRef = useRef<{ gl: THREE.WebGLRenderer; scene: THREE.Scene; camera: THREE.Camera } | null>(null);
+  const contextCleanupRef = useRef<(() => void) | null>(null);
 
   useEffect(() => {
     rainSynthesizer.setInside(isInside);
   }, [isInside]);
+
+  useEffect(() => {
+    return () => {
+      contextCleanupRef.current?.();
+      contextCleanupRef.current = null;
+      r3fStateRef.current = null;
+    };
+  }, []);
 
   const toggleFullscreen = () => {
     if (!document.fullscreenElement) {
@@ -5942,6 +5798,11 @@ function Building3DVisualizer({ specs, dimensionUnit, panelColors, setPanelColor
     if (!canvas) return;
     
     try {
+      // Force an immediate render frame before capture so preserveDrawingBuffer is not needed
+      if (r3fStateRef.current) {
+        r3fStateRef.current.gl.render(r3fStateRef.current.scene, r3fStateRef.current.camera);
+      }
+
       // Create a new canvas to draw the WebGL canvas and add the watermark
       const watermarkedCanvas = document.createElement('canvas');
       watermarkedCanvas.width = canvas.width;
@@ -5992,7 +5853,7 @@ function Building3DVisualizer({ specs, dimensionUnit, panelColors, setPanelColor
   return (
     <div ref={containerRef} className={isFullscreen ? "fixed inset-0 z-50 bg-slate-50 flex flex-col cursor-grab active:cursor-grabbing" : "relative w-full h-[50vh] md:h-[60vh] lg:h-[70vh] min-h-[400px] max-h-[800px] bg-slate-50 cursor-grab active:cursor-grabbing"}>
       <div className="absolute top-4 inset-x-4 z-10 flex flex-wrap justify-between gap-2 pointer-events-none">
-        <div className="flex bg-white/80 backdrop-blur-sm shadow-sm rounded-lg p-1 border border-slate-200 pointer-events-auto">
+        <div className="flex bg-white/95 shadow-sm rounded-lg p-1 border border-slate-200 pointer-events-auto">
           <button
             onClick={() => setIsInside(false)}
             className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${!isInside ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}
@@ -6010,21 +5871,21 @@ function Building3DVisualizer({ specs, dimensionUnit, panelColors, setPanelColor
         <div className="flex flex-wrap gap-2 pointer-events-auto">
           <button
             onClick={toggleFullscreen}
-            className="flex items-center gap-2 px-3 py-1.5 bg-white/80 backdrop-blur-sm border border-slate-200 text-slate-700 text-xs font-medium rounded-md shadow-sm hover:bg-white hover:text-slate-900 transition-colors"
+            className="flex items-center gap-2 px-3 py-1.5 bg-white/95 border border-slate-200 text-slate-700 text-xs font-medium rounded-md shadow-sm hover:bg-white hover:text-slate-900 transition-colors"
           >
             {isFullscreen ? <Minimize className="w-3.5 h-3.5" /> : <Maximize className="w-3.5 h-3.5" />}
             <span className="hidden sm:inline">{isFullscreen ? 'Exit Full Screen' : 'Fit to Screen'}</span>
           </button>
           <button
             onClick={() => setPanelColors({})}
-            className="flex items-center gap-2 px-3 py-1.5 bg-white/80 backdrop-blur-sm border border-slate-200 text-slate-700 text-xs font-medium rounded-md shadow-sm hover:bg-white hover:text-slate-900 transition-colors"
+            className="flex items-center gap-2 px-3 py-1.5 bg-white/95 border border-slate-200 text-slate-700 text-xs font-medium rounded-md shadow-sm hover:bg-white hover:text-slate-900 transition-colors"
           >
             <Paintbrush className="w-3.5 h-3.5" />
             Reset Colors
           </button>
           <button
             onClick={handleShare}
-            className="flex items-center gap-2 px-3 py-1.5 bg-white/80 backdrop-blur-sm border border-slate-200 text-slate-700 text-xs font-medium rounded-md shadow-sm hover:bg-white hover:text-slate-900 transition-colors"
+            className="flex items-center gap-2 px-3 py-1.5 bg-white/95 border border-slate-200 text-slate-700 text-xs font-medium rounded-md shadow-sm hover:bg-white hover:text-slate-900 transition-colors"
           >
             <Share2 className="w-3.5 h-3.5" />
             Share View
@@ -6032,79 +5893,104 @@ function Building3DVisualizer({ specs, dimensionUnit, panelColors, setPanelColor
         </div>
       </div>
 
-      <Canvas
-        id="peb-3d-canvas"
-        dpr={[1, 1.5]}
-        shadows
-        gl={{ preserveDrawingBuffer: true, antialias: true, powerPreference: 'high-performance' }}
-        onCreated={({ gl }) => {
-          gl.domElement.addEventListener('webglcontextlost', (e) => {
-            e.preventDefault();
-          }, false);
-        }}
-        camera={{ position: [specs.width * 1.5, specs.eaveHeight * 2, specs.length * 1.5], fov: 45 }}
-      >
-        <CameraManager isInside={isInside} specs={specs} />
-        <ambientLight intensity={weatherType === 'storm' ? 0.3 : (weatherType === 'rain' ? 0.5 : (isInside ? 0.8 : 0.7))} />
-        {isInside && <pointLight position={[0, specs.eaveHeight / 2, specs.length / 2]} intensity={2.0} distance={Math.max(specs.width, specs.length) * 2} decay={1.5} />}
-        <directionalLight position={[20, 30, 20]} intensity={weatherType === 'storm' ? 0.4 : (weatherType === 'rain' ? 0.6 : 1.2)} castShadow shadow-bias={-0.0005} shadow-mapSize={[1024, 1024]}>
-          <orthographicCamera attach="shadow-camera" args={[-Math.max(specs.width, specs.length, 20), Math.max(specs.width, specs.length, 20), Math.max(specs.width, specs.length, 20), -Math.max(specs.width, specs.length, 20), 0.1, 100]} />
-        </directionalLight>
-        <directionalLight position={[-10, 10, -10]} intensity={weatherType === 'storm' ? 0.2 : (weatherType === 'rain' ? 0.3 : 0.5)} />
-        <Environment preset={weatherType === 'storm' || weatherType === 'rain' ? "night" : "city"} environmentIntensity={weatherType === 'storm' ? 0.3 : (weatherType === 'rain' ? 0.5 : 1.0)} />
+      {contextLost && (
+        <div className="absolute inset-0 z-20 flex items-center justify-center bg-slate-50/90 p-6 text-center">
+          <div className="max-w-sm bg-white border border-slate-200 rounded-xl shadow-sm p-5 space-y-3">
+            <p className="text-sm font-semibold text-slate-800">3D Graphics Context Reset</p>
+            <p className="text-xs text-slate-600">
+              The browser reset the 3D GPU context. Click below to reload the 3D viewer.
+            </p>
+            <button
+              type="button"
+              onClick={() => {
+                setContextLost(false);
+                setCanvasRetryKey((k) => k + 1);
+              }}
+              className="px-4 py-2 text-xs font-semibold rounded-lg bg-slate-900 text-white hover:bg-slate-800 transition-colors"
+            >
+              Reload 3D View
+            </button>
+          </div>
+        </div>
+      )}
 
-        {weatherType === 'storm' && <LightningController />}
-        <WeatherEffects weatherType={weatherType} specs={specs} />
-        {!isInside && <ForceVectorArrows weatherType={weatherType} specs={specs} />}
+      <WebGLErrorBoundary key={`webgl_eb_${canvasRetryKey}`} onRetry={() => setCanvasRetryKey((k) => k + 1)}>
+        <Canvas
+          key={`peb_canvas_${canvasRetryKey}`}
+          id="peb-3d-canvas"
+          dpr={[1, 1.25]}
+          shadows
+          gl={{ antialias: true, powerPreference: 'default', failIfMajorPerformanceCaveat: false }}
+          onCreated={({ gl, scene, camera }) => {
+            r3fStateRef.current = { gl, scene, camera };
+            contextCleanupRef.current?.();
+            const handleContextLost = (e: Event) => {
+              e.preventDefault();
+              setContextLost(true);
+            };
+            const handleContextRestored = () => {
+              setContextLost(false);
+            };
+            gl.domElement.addEventListener('webglcontextlost', handleContextLost, false);
+            gl.domElement.addEventListener('webglcontextrestored', handleContextRestored, false);
+            contextCleanupRef.current = () => {
+              gl.domElement.removeEventListener('webglcontextlost', handleContextLost, false);
+              gl.domElement.removeEventListener('webglcontextrestored', handleContextRestored, false);
+            };
+          }}
+          camera={{ position: [specs.width * 1.5, specs.eaveHeight * 2, specs.length * 1.5], fov: 45 }}
+        >
+          <CameraManager isInside={isInside} specs={specs} />
+          <ambientLight intensity={weatherType === 'storm' ? 0.3 : (weatherType === 'rain' ? 0.5 : (isInside ? 0.8 : 0.7))} />
+          {isInside && <pointLight position={[0, specs.eaveHeight / 2, specs.length / 2]} intensity={2.0} distance={Math.max(specs.width, specs.length) * 2} decay={1.5} />}
+          <directionalLight position={[20, 30, 20]} intensity={weatherType === 'storm' ? 0.4 : (weatherType === 'rain' ? 0.6 : 1.2)} castShadow shadow-bias={-0.0005} shadow-mapSize={[1024, 1024]}>
+            <orthographicCamera attach="shadow-camera" args={[-Math.max(specs.width, specs.length, 20), Math.max(specs.width, specs.length, 20), Math.max(specs.width, specs.length, 20), -Math.max(specs.width, specs.length, 20), 0.1, 100]} />
+          </directionalLight>
+          <directionalLight position={[-10, 10, -10]} intensity={weatherType === 'storm' ? 0.2 : (weatherType === 'rain' ? 0.3 : 0.5)} />
+          <StudioEnvironment intensity={weatherType === 'storm' ? 0.3 : (weatherType === 'rain' ? 0.5 : 0.9)} />
 
-        <Bounds margin={1.2}>
-          {!isInside && <UpdateBounds specs={specs} />}
-          <Building3DModel specs={specs} panelColors={panelColors} setPanelColors={setPanelColors} framingOnly={framingOnly} weatherType={weatherType} />
-        </Bounds>
+          {weatherType === 'storm' && <LightningController />}
+          <WeatherEffects weatherType={weatherType} specs={specs} />
+          {!isInside && <ForceVectorArrows weatherType={weatherType} specs={specs} />}
 
-        {/* Precision Guidelines / Dimensions */}
-        {!isInside && (
-          <group>
-            {/* Width Dimension */}
-            <DimensionLine3D points={[[-specs.width / 2, 0.1, specs.length / 2 + 1], [specs.width / 2, 0.1, specs.length / 2 + 1]]} color="#3b82f6" />
-            <DimensionLine3D points={[[-specs.width / 2, 0.1, specs.length / 2 + 0.5], [-specs.width / 2, 0.1, specs.length / 2 + 1.5]]} color="#3b82f6" />
-            <DimensionLine3D points={[[specs.width / 2, 0.1, specs.length / 2 + 0.5], [specs.width / 2, 0.1, specs.length / 2 + 1.5]]} color="#3b82f6" />
-            <Text position={[0, 0.1, specs.length / 2 + 1.5]} rotation={[-Math.PI / 2, 0, 0]} fontSize={Math.max(1, specs.width * 0.05)} color="#1e293b" anchorX="center" anchorY="top">
-              {dimensionUnit === 'ft' ? (specs.width * 3.28084).toFixed(2) : specs.width}{dimensionUnit === 'ft' ? 'ft' : 'm'} Width
-            </Text>
+          <Bounds margin={1.2}>
+            {!isInside && <UpdateBounds specs={specs} />}
+            <Building3DModel specs={specs} panelColors={panelColors} setPanelColors={setPanelColors} framingOnly={framingOnly} weatherType={weatherType} />
+          </Bounds>
 
-            {/* Length Dimension */}
-            <DimensionLine3D points={[[specs.width / 2 + 1, 0.1, specs.length / 2], [specs.width / 2 + 1, 0.1, -specs.length / 2]]} color="#3b82f6" />
-            <DimensionLine3D points={[[specs.width / 2 + 0.5, 0.1, specs.length / 2], [specs.width / 2 + 1.5, 0.1, specs.length / 2]]} color="#3b82f6" />
-            <DimensionLine3D points={[[specs.width / 2 + 0.5, 0.1, -specs.length / 2], [specs.width / 2 + 1.5, 0.1, -specs.length / 2]]} color="#3b82f6" />
-            <Text position={[specs.width / 2 + 1.5, 0.1, 0]} rotation={[-Math.PI / 2, 0, Math.PI / 2]} fontSize={Math.max(1, Math.min(specs.length * 0.05, 3))} color="#1e293b" anchorX="center" anchorY="bottom">
-              {dimensionUnit === 'ft' ? (specs.length * 3.28084).toFixed(2) : specs.length}{dimensionUnit === 'ft' ? 'ft' : 'm'} Length
-            </Text>
+          {/* Precision Guidelines / Dimensions */}
+          {!isInside && (
+            <group>
+              {/* Width Dimension */}
+              <DimensionLine3D points={[[-specs.width / 2, 0.1, specs.length / 2 + 1], [specs.width / 2, 0.1, specs.length / 2 + 1]]} color="#3b82f6" />
+              <DimensionLine3D points={[[-specs.width / 2, 0.1, specs.length / 2 + 0.5], [-specs.width / 2, 0.1, specs.length / 2 + 1.5]]} color="#3b82f6" />
+              <DimensionLine3D points={[[specs.width / 2, 0.1, specs.length / 2 + 0.5], [specs.width / 2, 0.1, specs.length / 2 + 1.5]]} color="#3b82f6" />
+              <Text position={[0, 0.1, specs.length / 2 + 1.5]} rotation={[-Math.PI / 2, 0, 0]} fontSize={Math.max(1, specs.width * 0.05)} color="#1e293b" anchorX="center" anchorY="top">
+                {dimensionUnit === 'ft' ? (specs.width * 3.28084).toFixed(2) : specs.width}{dimensionUnit === 'ft' ? 'ft' : 'm'} Width
+              </Text>
 
-            {/* Eave Height Dimension */}
-            <DimensionLine3D points={[[-specs.width / 2 - 1, 0, specs.length / 2], [-specs.width / 2 - 1, specs.eaveHeight, specs.length / 2]]} color="#3b82f6" />
-            <DimensionLine3D points={[[-specs.width / 2 - 1.5, 0, specs.length / 2], [-specs.width / 2 - 0.5, 0, specs.length / 2]]} color="#3b82f6" />
-            <DimensionLine3D points={[[-specs.width / 2 - 1.5, specs.eaveHeight, specs.length / 2], [-specs.width / 2 - 0.5, specs.eaveHeight, specs.length / 2]]} color="#3b82f6" />
-            <Text position={[-specs.width / 2 - 1.5, specs.eaveHeight / 2, specs.length / 2]} rotation={[0, -Math.PI / 2, 0]} fontSize={Math.max(1, Math.min(specs.eaveHeight * 0.15, 3))} color="#1e293b" anchorX="center" anchorY="bottom">
-              {dimensionUnit === 'ft' ? (specs.eaveHeight * 3.28084).toFixed(2) : specs.eaveHeight}{dimensionUnit === 'ft' ? 'ft' : 'm'} Height
-            </Text>
-          </group>
-        )}
+              {/* Length Dimension */}
+              <DimensionLine3D points={[[specs.width / 2 + 1, 0.1, specs.length / 2], [specs.width / 2 + 1, 0.1, -specs.length / 2]]} color="#3b82f6" />
+              <DimensionLine3D points={[[specs.width / 2 + 0.5, 0.1, specs.length / 2], [specs.width / 2 + 1.5, 0.1, specs.length / 2]]} color="#3b82f6" />
+              <DimensionLine3D points={[[specs.width / 2 + 0.5, 0.1, -specs.length / 2], [specs.width / 2 + 1.5, 0.1, -specs.length / 2]]} color="#3b82f6" />
+              <Text position={[specs.width / 2 + 1.5, 0.1, 0]} rotation={[-Math.PI / 2, 0, Math.PI / 2]} fontSize={Math.max(1, Math.min(specs.length * 0.05, 3))} color="#1e293b" anchorX="center" anchorY="bottom">
+                {dimensionUnit === 'ft' ? (specs.length * 3.28084).toFixed(2) : specs.length}{dimensionUnit === 'ft' ? 'ft' : 'm'} Length
+              </Text>
 
-        {!isInside && (
-          <ContactShadows
-            key={`cs_${specs.width}_${specs.length}_${specs.eaveHeight}_${specs.roofType}_${specs.hasWalls}`}
-            position={[0, -0.1, 0]}
-            opacity={0.4}
-            scale={Math.max(specs.width, specs.length) * 3}
-            blur={2}
-            far={10}
-            frames={1}
-            resolution={256}
-          />
-        )}
-        <OrbitControls makeDefault enableZoom={true} enablePan={true} minPolarAngle={0} maxPolarAngle={isInside ? Math.PI : Math.PI / 2 - 0.05} target={[0, specs.eaveHeight / 2, 0]} />
-      </Canvas>
+              {/* Eave Height Dimension */}
+              <DimensionLine3D points={[[-specs.width / 2 - 1, 0, specs.length / 2], [-specs.width / 2 - 1, specs.eaveHeight, specs.length / 2]]} color="#3b82f6" />
+              <DimensionLine3D points={[[-specs.width / 2 - 1.5, 0, specs.length / 2], [-specs.width / 2 - 0.5, 0, specs.length / 2]]} color="#3b82f6" />
+              <DimensionLine3D points={[[-specs.width / 2 - 1.5, specs.eaveHeight, specs.length / 2], [-specs.width / 2 - 0.5, specs.eaveHeight, specs.length / 2]]} color="#3b82f6" />
+              <Text position={[-specs.width / 2 - 1.5, specs.eaveHeight / 2, specs.length / 2]} rotation={[0, -Math.PI / 2, 0]} fontSize={Math.max(1, Math.min(specs.eaveHeight * 0.15, 3))} color="#1e293b" anchorX="center" anchorY="bottom">
+                {dimensionUnit === 'ft' ? (specs.eaveHeight * 3.28084).toFixed(2) : specs.eaveHeight}{dimensionUnit === 'ft' ? 'ft' : 'm'} Height
+              </Text>
+            </group>
+          )}
+
+          {!isInside && <GroundContactShadow width={specs.width} length={specs.length} />}
+          <OrbitControls makeDefault enableZoom={true} enablePan={true} minPolarAngle={0} maxPolarAngle={isInside ? Math.PI : Math.PI / 2 - 0.05} target={[0, specs.eaveHeight / 2, 0]} />
+        </Canvas>
+      </WebGLErrorBoundary>
       <div className="absolute bottom-4 right-4 z-10 pointer-events-none opacity-60 bg-white/60 px-2 py-1 rounded">
         <p className="text-xs font-semibold text-slate-800">UPEB by M.G. INDUSTRIES<br/>9752556113</p>
       </div>
@@ -9637,40 +9523,121 @@ export default function App() {
   const totalEndWallSheets = numWallSheetsWidth * endWallSegments;
   const totalWallSheets = totalSideWallSheets + totalEndWallSheets;
 
-  let numAltWallSheets = 0;
-  if (specs.alternateWallColors) {
+  // Sheet-aligned louver & window openings and their cut cladding sheet lengths (bottom & top of each opening column)
+  const wallOpenings = useMemo(() => getWallOpeningsLayout(specs), [specs]);
+  const louverOpenings = useMemo(() => wallOpenings.filter((o) => o.type === 'louver'), [wallOpenings]);
+  const windowOpenings = useMemo(() => wallOpenings.filter((o) => o.type === 'window'), [wallOpenings]);
+  const louverCount = louverOpenings.length;
+  const windowCount = windowOpenings.length;
+
+  const isWallColAlt = (colIdx: number, totalCols: number, segIdx: number) => {
+    if (!specs.alternateWallColors) return false;
     const ratio = specs.alternateWallRatio || 2;
     const pattern = specs.alternateWallPattern || 'stripes';
-    
-    const countSides = (count: number) => {
+    if (pattern === 'checkerboard') return (colIdx + segIdx) % ratio === (ratio - 1);
+    if (pattern === 'bands') return (segIdx % ratio) === (ratio - 1);
+    if (pattern === 'edges') return colIdx === 0 || colIdx === totalCols - 1;
+    if (pattern === 'center') {
+      const mid = Math.floor(totalCols / 2);
+      const spread = Math.max(1, Math.floor(totalCols / (ratio * 2)));
+      return Math.abs(colIdx - mid) < spread;
+    }
+    return (colIdx % ratio) === (ratio - 1);
+  };
+
+  const computeOpeningCladdingStats = (openingsList: WallOpeningPlacement[]) => {
+    let bottomPcs = 0;
+    let bottomLenSum = 0;
+    let bottomMainPcs = 0;
+    let bottomAltPcs = 0;
+    let topPcs = 0;
+    let topLenSum = 0;
+    let topMainPcs = 0;
+    let topAltPcs = 0;
+
+    openingsList.forEach((o) => {
+      const totalCols = (o.wall === 'Left' || o.wall === 'Right') ? wallSheetsLength : wallSheetsWidth;
+      if (o.bottomSheetLen > 0.05) {
+        const segs = Math.ceil(o.bottomSheetLen / 6);
+        const pcLen = segs > 1 ? (o.bottomSheetLen + (segs - 1) * wallOverlap) / segs : o.bottomSheetLen;
+        for (let s = 0; s < segs; s++) {
+          bottomPcs++;
+          bottomLenSum += pcLen;
+          if (isWallColAlt(o.colIdx, totalCols, s)) bottomAltPcs++;
+          else bottomMainPcs++;
+        }
+      }
+      if (o.topSheetLen > 0.05) {
+        const segs = Math.ceil(o.topSheetLen / 6);
+        const pcLen = segs > 1 ? (o.topSheetLen + (segs - 1) * wallOverlap) / segs : o.topSheetLen;
+        for (let s = 0; s < segs; s++) {
+          topPcs++;
+          topLenSum += pcLen;
+          if (isWallColAlt(o.colIdx, totalCols, s)) topAltPcs++;
+          else topMainPcs++;
+        }
+      }
+    });
+
+    return {
+      bottomPcs,
+      bottomMainPcs,
+      bottomAltPcs,
+      avgBottomLen: bottomPcs > 0 ? bottomLenSum / bottomPcs : 0,
+      topPcs,
+      topMainPcs,
+      topAltPcs,
+      avgTopLen: topPcs > 0 ? topLenSum / topPcs : 0,
+    };
+  };
+
+  const louverCladdingStats = computeOpeningCladdingStats(louverOpenings);
+  const windowCladdingStats = computeOpeningCladdingStats(windowOpenings);
+
+  const sideOpeningCols = wallOpenings.filter((o) => o.wall === 'Left' || o.wall === 'Right');
+  const endOpeningCols = wallOpenings.filter((o) => o.wall === 'Front' || o.wall === 'Back');
+  const sideOpeningReplacedSheets = sideOpeningCols.length * sideWallSegments;
+  const endOpeningReplacedSheets = endOpeningCols.length * endWallSegments;
+  const sideOpeningReplacedAlt = sideOpeningCols.reduce((acc, o) => {
+    let c = 0;
+    for (let s = 0; s < sideWallSegments; s++) if (isWallColAlt(o.colIdx, wallSheetsLength, s)) c++;
+    return acc + c;
+  }, 0);
+  const endOpeningReplacedAlt = endOpeningCols.reduce((acc, o) => {
+    let c = 0;
+    for (let s = 0; s < endWallSegments; s++) if (isWallColAlt(o.colIdx, wallSheetsWidth, s)) c++;
+    return acc + c;
+  }, 0);
+
+  let numAltSideWallSheets = 0;
+  let numAltEndWallSheets = 0;
+  if (specs.alternateWallColors) {
+    const countWallAlt = (count: number, segs: number) => {
       let result = 0;
-      for (let s = 0; s < 2; s++) { // 2 sides (left/right or front/back)
+      for (let s = 0; s < 2; s++) {
         for (let i = 0; i < count; i++) {
-          for (let j = 0; j < wallSegments; j++) {
-             let isAlt = false;
-             if (pattern === 'checkerboard') {
-               isAlt = (i + j) % ratio === (ratio - 1);
-             } else if (pattern === 'bands') {
-               isAlt = (j % ratio) === (ratio - 1);
-             } else if (pattern === 'edges') {
-               isAlt = i === 0 || i === count - 1;
-             } else if (pattern === 'center') {
-               const mid = Math.floor(count / 2);
-               const spread = Math.max(1, Math.floor(count / (ratio * 2)));
-               isAlt = Math.abs(i - mid) < spread;
-             } else {
-               isAlt = (i % ratio) === (ratio - 1);
-             }
-             if (isAlt) result++;
+          for (let j = 0; j < segs; j++) {
+            if (isWallColAlt(i, count, j)) result++;
           }
         }
       }
       return result;
-    }
-    
-    numAltWallSheets = countSides(wallSheetsLength) + countSides(wallSheetsWidth);
+    };
+    numAltSideWallSheets = countWallAlt(wallSheetsLength, sideWallSegments);
+    numAltEndWallSheets = countWallAlt(wallSheetsWidth, endWallSegments);
   }
+  const numAltWallSheets = numAltSideWallSheets + numAltEndWallSheets;
   const numMainWallSheets = totalWallSheets - numAltWallSheets;
+
+  const standardSideWallSheets = Math.max(0, totalSideWallSheets - sideOpeningReplacedSheets);
+  const standardEndWallSheets = Math.max(0, totalEndWallSheets - endOpeningReplacedSheets);
+  const standardSideAltQty = Math.max(0, numAltSideWallSheets - sideOpeningReplacedAlt);
+  const standardSideMainQty = Math.max(0, standardSideWallSheets - standardSideAltQty);
+  const standardEndAltQty = Math.max(0, numAltEndWallSheets - endOpeningReplacedAlt);
+  const standardEndMainQty = Math.max(0, standardEndWallSheets - standardEndAltQty);
+  const standardTotalWallSheets = standardSideWallSheets + standardEndWallSheets;
+  const standardTotalAltWallSheets = standardSideAltQty + standardEndAltQty;
+  const standardTotalMainWallSheets = Math.max(0, standardTotalWallSheets - standardTotalAltWallSheets);
 
   const sideWallAreaPerSheet = wallEffWidth * effectiveSideSheetLen;
   const endWallAreaPerSheet = wallEffWidth * effectiveEndSheetLen;
@@ -9704,15 +9671,36 @@ export default function App() {
   const wallColorName = STANDARD_COLORS.find(c => c.hex === specs.wallColor)?.name || 'Custom';
   const altWallColorName = STANDARD_COLORS.find(c => c.hex === specs.alternateWallColor)?.name || 'Custom';
 
-  const wallLengthFormattedVal = specs.wallSheetLengthMode === 'standard' && specs.wallStockLengthFt
+  const fmtWallLen = (meters: number) => dimensionUnit === 'ft' ? `${(meters * 3.28084).toFixed(1)} ft` : `${meters.toFixed(2)} m`;
+  const openingLenDetails: string[] = [];
+  if (louverCount > 0) {
+    const parts: string[] = [];
+    if (louverCladdingStats.bottomPcs > 0) parts.push(`Bottom ${fmtWallLen(louverCladdingStats.avgBottomLen)} × ${louverCladdingStats.bottomPcs} pcs`);
+    if (louverCladdingStats.topPcs > 0) parts.push(`Top ${fmtWallLen(louverCladdingStats.avgTopLen)} × ${louverCladdingStats.topPcs} pcs`);
+    if (parts.length > 0) openingLenDetails.push(`Louver Cladding: ${parts.join(', ')}`);
+  }
+  if (windowCount > 0) {
+    const parts: string[] = [];
+    if (windowCladdingStats.bottomPcs > 0) parts.push(`Bottom ${fmtWallLen(windowCladdingStats.avgBottomLen)} × ${windowCladdingStats.bottomPcs} pcs`);
+    if (windowCladdingStats.topPcs > 0) parts.push(`Top ${fmtWallLen(windowCladdingStats.avgTopLen)} × ${windowCladdingStats.topPcs} pcs`);
+    if (parts.length > 0) openingLenDetails.push(`Window Cladding: ${parts.join(', ')}`);
+  }
+
+  const baseWallLengthVal = specs.wallSheetLengthMode === 'standard' && specs.wallStockLengthFt
     ? `Stock Commercial Length: ${specs.wallStockLengthFt} ft (${(specs.wallStockLengthFt * 0.3048).toFixed(2)}m)`
     : specs.wallSheetLengthMode === 'custom' && specs.wallCustomLengthFt
     ? `Custom Specified Cut Length: ${specs.wallCustomLengthFt} ft (${(specs.wallCustomLengthFt * 0.3048).toFixed(2)}m)`
     : `Sidewalls: ${dimensionUnit === 'ft' ? (effectiveSideSheetLen * 3.28084).toFixed(1) + ' ft' : effectiveSideSheetLen.toFixed(1) + ' m'} | Endwalls/Gables: ${dimensionUnit === 'ft' ? (effectiveEndSheetLen * 3.28084).toFixed(1) + ' ft' : effectiveEndSheetLen.toFixed(1) + ' m'}`;
 
+  const wallLengthFormattedVal = openingLenDetails.length > 0
+    ? `${baseWallLengthVal} | ${openingLenDetails.join(' | ')}`
+    : baseWallLengthVal;
+
+  const totalWallCutPcs = standardTotalWallSheets + louverCladdingStats.bottomPcs + louverCladdingStats.topPcs + windowCladdingStats.bottomPcs + windowCladdingStats.topPcs;
+
   const wallDetailedSpecs = [
     { label: 'Profile', value: specs.wallProfile === '7v Profile' ? '7v Profile (Trapezoidal)' : (specs.wallProfile === '6v Profile' ? '6v Profile (Trapezoidal)' : 'Trapezoidal Profile Sheet'), category: 'Specifications' },
-    { label: 'Quantity', value: specs.alternateWallColors ? `${totalWallSheets} individual sheets total (${numMainWallSheets} Primary, ${numAltWallSheets} Alternate)` : `${totalWallSheets} individual sheets required (Total area ~${dimensionUnit === 'ft' ? (parseFloat(wallArea) * 10.7639).toFixed(0) : wallArea} ${dimensionUnit === 'ft' ? 'sq.ft' : 'm²'})`, category: 'Specifications' },
+    { label: 'Quantity', value: specs.alternateWallColors ? `${totalWallCutPcs} individual sheets total (${numMainWallSheets} Primary base, ${numAltWallSheets} Alternate base)` : `${totalWallCutPcs} individual sheets required (Total area ~${dimensionUnit === 'ft' ? (parseFloat(wallArea) * 10.7639).toFixed(0) : wallArea} ${dimensionUnit === 'ft' ? 'sq.ft' : 'm²'})`, category: 'Specifications' },
     { label: 'Sheet Dimensions & Lengths', value: wallLengthFormattedVal, category: 'Specifications' },
     { label: 'Width', value: specs.wallProfile === '7v Profile' ? 'Covered width: 1188mm / Total width: 1253mm / Required coil width: 1450mm' : (specs.wallProfile === '6v Profile' ? 'Covered width: 990mm / Total width: 1055mm / Required coil width: 1250mm' : '1060 mm (Effective Cover Width 1000 mm)'), category: 'Specifications' },
     { label: 'Thickness', value: specs.highWindVelocity || specs.snowLoad ? '0.60 mm / 0.65 mm (Reinforced thick gauge)' : '0.47 mm / 0.50 mm (Color Coated Galvalume)', category: 'Specifications' },
@@ -9953,9 +9941,7 @@ export default function App() {
     },
   ];
 
-  const { louverCount, windowCount } = useMemo(() => {
-    return calculateLouverAndWindowCounts(specs);
-  }, [specs]);
+  // louverCount and windowCount are derived directly from wallOpenings above
 
   const totalPrimaryCost = specs.hasPrimarySteel !== false ? (primaryUnitCost + fabLaborCost + erectLaborCost) * primaryTons : 0;
   const totalSecondaryCost = specs.hasSecondarySteel !== false ? (secondaryUnitCost + secondaryFabLaborCost + secondaryErectLaborCost) * secondaryTons : 0;
@@ -10475,7 +10461,10 @@ export default function App() {
     }
     if (specs.hasWalls !== false) {
       const mainColName = getColorName(specs.wallColor, '#0089b6');
+      const altColName = getColorName(specs.alternateWallColor, '#d3d3d3');
       const isCustomOrStock = specs.wallSheetLengthMode === 'standard' || specs.wallSheetLengthMode === 'custom';
+      const fmtSheetLen = (lenMeters: number) =>
+        dimensionUnit === 'ft' ? `${(lenMeters * 3.28084).toFixed(1)}ft` : `${lenMeters.toFixed(2)}m`;
 
       if (isCustomOrStock) {
         const selectedLenMeters = effectiveSideSheetLen;
@@ -10485,14 +10474,16 @@ export default function App() {
           : `Wall Cladding (Custom ${wFormattedLength}${dimensionUnit === 'ft' ? 'ft' : 'm'} pcs) - ${mainColName}`;
         
         if (specs.alternateWallColors) {
-          const altColName = getColorName(specs.alternateWallColor, '#d3d3d3');
-          const wRowMain = formatRow('wall_cladding_main', `${labelText} (Primary)`, 'units', numMainWallSheets, Math.round(costPerWallSheet));
-          if (wRowMain) sheetingRows.push(wRowMain);
-          
-          const wRowAlt = formatRow('wall_cladding_alt', `${labelText} (Alternate)`, 'units', numAltWallSheets, Math.round(costPerWallSheet));
-          if (wRowAlt) sheetingRows.push(wRowAlt);
-        } else {
-          const wRow = formatRow('wall_cladding', labelText, 'units', totalWallSheets, Math.round(costPerWallSheet));
+          if (standardTotalMainWallSheets > 0) {
+            const wRowMain = formatRow('wall_cladding_main', `${labelText} (Primary)`, 'units', standardTotalMainWallSheets, Math.round(costPerWallSheet));
+            if (wRowMain) sheetingRows.push(wRowMain);
+          }
+          if (standardTotalAltWallSheets > 0) {
+            const wRowAlt = formatRow('wall_cladding_alt', `${labelText} (Alternate)`, 'units', standardTotalAltWallSheets, Math.round(costPerWallSheet));
+            if (wRowAlt) sheetingRows.push(wRowAlt);
+          }
+        } else if (standardTotalWallSheets > 0) {
+          const wRow = formatRow('wall_cladding', labelText, 'units', standardTotalWallSheets, Math.round(costPerWallSheet));
           if (wRow) sheetingRows.push(wRow);
         }
       } else {
@@ -10506,30 +10497,81 @@ export default function App() {
         const endCostPerSheet = endSheetArea * wallUnitCost;
 
         if (specs.alternateWallColors) {
-          const altColName = getColorName(specs.alternateWallColor, '#d3d3d3');
-          const sideMainQty = Math.round(totalSideWallSheets * (numMainWallSheets / (totalWallSheets || 1)));
-          const sideAltQty = totalSideWallSheets - sideMainQty;
-          const endMainQty = Math.round(totalEndWallSheets * (numMainWallSheets / (totalWallSheets || 1)));
-          const endAltQty = totalEndWallSheets - endMainQty;
-
-          const sideMainRow = formatRow('wall_cladding_side_main', `Sidewall Cladding - ${mainColName} (${sideFormattedLength}${dimensionUnit === 'ft' ? 'ft' : 'm'} pcs)`, 'units', sideMainQty, Math.round(sideCostPerSheet));
-          if (sideMainRow) sheetingRows.push(sideMainRow);
-
-          const sideAltRow = formatRow('wall_cladding_side_alt', `Sidewall Cladding - ${altColName} (${sideFormattedLength}${dimensionUnit === 'ft' ? 'ft' : 'm'} pcs)`, 'units', sideAltQty, Math.round(sideCostPerSheet));
-          if (sideAltRow) sheetingRows.push(sideAltRow);
-
-          const endMainRow = formatRow('wall_cladding_end_main', `Endwall / Gable Cladding - ${mainColName} (${endFormattedLength}${dimensionUnit === 'ft' ? 'ft' : 'm'} pcs)`, 'units', endMainQty, Math.round(endCostPerSheet));
-          if (endMainRow) sheetingRows.push(endMainRow);
-
-          const endAltRow = formatRow('wall_cladding_end_alt', `Endwall / Gable Cladding - ${altColName} (${endFormattedLength}${dimensionUnit === 'ft' ? 'ft' : 'm'} pcs)`, 'units', endAltQty, Math.round(endCostPerSheet));
-          if (endAltRow) sheetingRows.push(endAltRow);
+          if (standardSideMainQty > 0) {
+            const sideMainRow = formatRow('wall_cladding_side_main', `Sidewall Cladding - ${mainColName} (${sideFormattedLength}${dimensionUnit === 'ft' ? 'ft' : 'm'} pcs)`, 'units', standardSideMainQty, Math.round(sideCostPerSheet));
+            if (sideMainRow) sheetingRows.push(sideMainRow);
+          }
+          if (standardSideAltQty > 0) {
+            const sideAltRow = formatRow('wall_cladding_side_alt', `Sidewall Cladding - ${altColName} (${sideFormattedLength}${dimensionUnit === 'ft' ? 'ft' : 'm'} pcs)`, 'units', standardSideAltQty, Math.round(sideCostPerSheet));
+            if (sideAltRow) sheetingRows.push(sideAltRow);
+          }
+          if (standardEndMainQty > 0) {
+            const endMainRow = formatRow('wall_cladding_end_main', `Endwall / Gable Cladding - ${mainColName} (${endFormattedLength}${dimensionUnit === 'ft' ? 'ft' : 'm'} pcs)`, 'units', standardEndMainQty, Math.round(endCostPerSheet));
+            if (endMainRow) sheetingRows.push(endMainRow);
+          }
+          if (standardEndAltQty > 0) {
+            const endAltRow = formatRow('wall_cladding_end_alt', `Endwall / Gable Cladding - ${altColName} (${endFormattedLength}${dimensionUnit === 'ft' ? 'ft' : 'm'} pcs)`, 'units', standardEndAltQty, Math.round(endCostPerSheet));
+            if (endAltRow) sheetingRows.push(endAltRow);
+          }
         } else {
-          const sideRow = formatRow('wall_cladding_side', `Sidewall Cladding - ${mainColName} (${sideFormattedLength}${dimensionUnit === 'ft' ? 'ft' : 'm'} pcs)`, 'units', totalSideWallSheets, Math.round(sideCostPerSheet));
-          if (sideRow) sheetingRows.push(sideRow);
-
-          const endRow = formatRow('wall_cladding_end', `Endwall / Gable Cladding - ${endFormattedLength}${dimensionUnit === 'ft' ? 'ft' : 'm'} pcs)`, 'units', totalEndWallSheets, Math.round(endCostPerSheet));
-          if (endRow) sheetingRows.push(endRow);
+          if (standardSideWallSheets > 0) {
+            const sideRow = formatRow('wall_cladding_side', `Sidewall Cladding - ${mainColName} (${sideFormattedLength}${dimensionUnit === 'ft' ? 'ft' : 'm'} pcs)`, 'units', standardSideWallSheets, Math.round(sideCostPerSheet));
+            if (sideRow) sheetingRows.push(sideRow);
+          }
+          if (standardEndWallSheets > 0) {
+            const endRow = formatRow('wall_cladding_end', `Endwall / Gable Cladding - ${mainColName} (${endFormattedLength}${dimensionUnit === 'ft' ? 'ft' : 'm'} pcs)`, 'units', standardEndWallSheets, Math.round(endCostPerSheet));
+            if (endRow) sheetingRows.push(endRow);
+          }
         }
+      }
+
+      // Helper to append sheet-aligned cut cladding rows for Louver & Window columns (Bottom & Top sheets)
+      const pushOpeningCladdingRows = (
+        prefixKey: string,
+        labelTitle: string,
+        stats: typeof louverCladdingStats
+      ) => {
+        if (stats.bottomPcs > 0) {
+          const bLenStr = fmtSheetLen(stats.avgBottomLen);
+          const bUnitCost = Math.round(wallEffWidth * stats.avgBottomLen * wallUnitCost);
+          if (specs.alternateWallColors) {
+            if (stats.bottomMainPcs > 0) {
+              const r = formatRow(`${prefixKey}_bot_main`, `${labelTitle} (Bottom) - ${mainColName} (${bLenStr} pcs)`, 'units', stats.bottomMainPcs, bUnitCost);
+              if (r) sheetingRows.push(r);
+            }
+            if (stats.bottomAltPcs > 0) {
+              const r = formatRow(`${prefixKey}_bot_alt`, `${labelTitle} (Bottom) - ${altColName} (${bLenStr} pcs)`, 'units', stats.bottomAltPcs, bUnitCost);
+              if (r) sheetingRows.push(r);
+            }
+          } else {
+            const r = formatRow(`${prefixKey}_bot`, `${labelTitle} (Bottom) - ${mainColName} (${bLenStr} pcs)`, 'units', stats.bottomPcs, bUnitCost);
+            if (r) sheetingRows.push(r);
+          }
+        }
+        if (stats.topPcs > 0) {
+          const tLenStr = fmtSheetLen(stats.avgTopLen);
+          const tUnitCost = Math.round(wallEffWidth * stats.avgTopLen * wallUnitCost);
+          if (specs.alternateWallColors) {
+            if (stats.topMainPcs > 0) {
+              const r = formatRow(`${prefixKey}_top_main`, `${labelTitle} (Top) - ${mainColName} (${tLenStr} pcs)`, 'units', stats.topMainPcs, tUnitCost);
+              if (r) sheetingRows.push(r);
+            }
+            if (stats.topAltPcs > 0) {
+              const r = formatRow(`${prefixKey}_top_alt`, `${labelTitle} (Top) - ${altColName} (${tLenStr} pcs)`, 'units', stats.topAltPcs, tUnitCost);
+              if (r) sheetingRows.push(r);
+            }
+          } else {
+            const r = formatRow(`${prefixKey}_top`, `${labelTitle} (Top) - ${mainColName} (${tLenStr} pcs)`, 'units', stats.topPcs, tUnitCost);
+            if (r) sheetingRows.push(r);
+          }
+        }
+      };
+
+      if (louverCount > 0) {
+        pushOpeningCladdingRows('wall_cladding_louver', 'Louver Cladding Sheeting', louverCladdingStats);
+      }
+      if (windowCount > 0) {
+        pushOpeningCladdingRows('wall_cladding_window', 'Window Cladding Sheeting', windowCladdingStats);
       }
     }
     if (sheetingRows.length > 0) {
@@ -10547,6 +10589,13 @@ export default function App() {
         if (!meters || meters <= 0) return dimensionUnit === 'ft' ? '0ft pcs' : '0m pcs';
         return dimensionUnit === 'ft' ? `${(meters * 3.28084).toFixed(1)}ft pcs` : `${meters.toFixed(1)}m pcs`;
     };
+    const formatOpeningSize = (wMeters: number, hMeters: number) =>
+        dimensionUnit === 'ft'
+          ? `${(wMeters * 3.28084).toFixed(1)}ft × ${(hMeters * 3.28084).toFixed(1)}ft`
+          : `${wMeters.toFixed(2)}m × ${hMeters.toFixed(2)}m`;
+    const girtSpacingBom = specs.highWindVelocity || specs.snowLoad ? 1.0 : 1.5;
+    const { wh: bomWinH, louverH: bomLouverH } = getOpeningVerticalPlacement(specs.eaveHeight, girtSpacingBom);
+
     if (specs.hasRoof !== false) {
         if (specs.hasRidgeCap !== false && specs.roofType !== 'Single Slope') {
             const seg = calcAcc([{len: specs.length, runs: 1}], 350);
@@ -10579,7 +10628,7 @@ export default function App() {
         const seg = calcAcc([{len: specs.width, runs: 2}, {len: specs.length, runs: 2}], 200);
         accRows.push(override("endFlashing", "Bottom Trim", formatAccUnit(seg.cutLength), seg.count, seg.piecePrice));
     }
-    if (specs.hasLouvers !== false && specs.hasWalls !== false && louverCount > 0) accRows.push(override("louvers", "Louvers", "units", louverCount, 2500));
+    if (specs.hasLouvers !== false && specs.hasWalls !== false && louverCount > 0) accRows.push(override("louvers", `Louvers (${formatOpeningSize(wallEffWidth, bomLouverH)})`, "units", louverCount, 2500));
     if (specs.hasInsulation !== false) {
       if (specs.hasRoof !== false) accRows.push(override("insulationRoof", "Air Bubble Insulation (Roof)", "sqm", Math.ceil(specs.width * specs.length * 1.1), 120));
       if (specs.hasWalls !== false) accRows.push(override("insulationWall", "Air Bubble Insulation (Wall)", "sqm", Math.ceil(calculatedWallArea * 1.1), 120));
@@ -10589,7 +10638,7 @@ export default function App() {
     }
     if (specs.hasSilicon !== false) accRows.push(override("silicon", "Silicon Sealant", "tubes", Math.ceil(specs.length * specs.width * 0.1), 250));
     if (specs.hasProfileGate !== false && specs.hasWalls !== false) accRows.push(override("profileGate", "Profile Gate (Sliding)", "unit", 1, 45000));
-    if (specs.hasWindows !== false && specs.hasWalls !== false && windowCount > 0) accRows.push(override("windows", "Aluminum Windows", "units", windowCount, 6500));
+    if (specs.hasWindows !== false && specs.hasWalls !== false && windowCount > 0) accRows.push(override("windows", `Aluminum Windows (${formatOpeningSize(wallEffWidth, bomWinH)})`, "units", windowCount, 6500));
     if (specs.hasCrimpedSheets !== false && specs.hasWalls !== false) {
         const seg = calcAcc([{len: specs.width, runs: 2}], 500);
         accRows.push(override("crimpedSheets", "Crimped Sheets", formatAccUnit(seg.cutLength), seg.count, seg.piecePrice));
@@ -10743,7 +10792,7 @@ export default function App() {
     }
     
     return { sections, totalCost };
-  }, [specs, primaryTons, secondaryTons, accessories, totalPurlins, totalGirts, primaryUnitCost, secondaryUnitCost, roofAreaNum, wallAreaNum, roofUnitCost, wallUnitCost, columnLinearMeasurement, rafterLinearMeasurement, hardwareUnitCostPerKg]);
+  }, [specs, dimensionUnit, primaryTons, secondaryTons, accessories, totalPurlins, totalGirts, primaryUnitCost, secondaryUnitCost, roofAreaNum, wallAreaNum, roofUnitCost, wallUnitCost, columnLinearMeasurement, rafterLinearMeasurement, hardwareUnitCostPerKg]);
 
   const handleExportMaterialsPDF = () => {
     const doc = new jsPDF();
@@ -12338,11 +12387,8 @@ export default function App() {
                 </div>
               </div>
               <div className="relative">
-                {visualizerTab === '3d-model' && (
-                  <Building3DVisualizer specs={specs} dimensionUnit={dimensionUnit} panelColors={panelColors} setPanelColors={setPanelColors} framingOnly={false} weatherType={weatherType} />
-                )}
-                {visualizerTab === '3d-frame' && (
-                  <Building3DVisualizer specs={specs} dimensionUnit={dimensionUnit} panelColors={panelColors} setPanelColors={setPanelColors} framingOnly={true} weatherType={weatherType} />
+                {(visualizerTab === '3d-model' || visualizerTab === '3d-frame') && (
+                  <Building3DVisualizer specs={specs} dimensionUnit={dimensionUnit} panelColors={panelColors} setPanelColors={setPanelColors} framingOnly={visualizerTab === '3d-frame'} weatherType={weatherType} />
                 )}
                 {visualizerTab === 'front-elevation' && (
                   <BuildingVisualizer specs={specs} dimensionUnit={dimensionUnit} view="front" />
